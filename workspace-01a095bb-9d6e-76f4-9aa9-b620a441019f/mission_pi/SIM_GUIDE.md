@@ -332,6 +332,17 @@ echo "export GZ_SIM_RESOURCE_PATH=$PWD/sim/models:\${GZ_SIM_RESOURCE_PATH}" >> ~
 source ~/.bashrc
 ```
 
+ROS 2 on this machine? Its `setup.bash` overwrites `GZ_CONFIG_PATH`
+with vendor-only paths, which hides `gz sim` from the `gz` CLI even
+though `gz-sim8` is installed (symptom: `gz help` lists no `sim`
+command). Append AFTER the ROS source line in `~/.bashrc`:
+
+```bash
+export GZ_CONFIG_PATH=/usr/share/gz:$GZ_CONFIG_PATH
+```
+
+then open a fresh terminal and check `gz sim --versions` → 8.x.
+
 ### 10.2 Run day — four terminals + MP + UI
 
 Terminal A — the world (Linux, ~30 s to load):
