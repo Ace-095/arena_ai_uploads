@@ -323,11 +323,37 @@ class FCLink:
             mavutil.mavlink.MAV_MISSION_TYPE_FENCE, timeout)
         return [(m.x / 1e7, m.y / 1e7) for m in items]
 
+    def find_sprayer_seqs(self, plan, cmds=(216, 222, 42600)):
+        """All mission seqs whose command is a sprayer/trigger command.
+
+        216 = DO_SPRAYER; 222/42600 are the fallbacks the field-tested
+        ftest references accept (MP sprayer widgets vary).
+        """
+        want = set(cmds)
+        return [it["seq"] for it in plan if it["command"] in want]
+
     def find_sprayer_seq(self, plan):
-        for it in plan:
-            if it["command"] == DO_SPRAYER:
-                return it["seq"]
-        return None
+        seqs = self.find_sprayer_seqs(plan)
+        return min(seqs) if seqs else None
+
+    def get_mission_item(self, seq, mtype=0, timeout=3.0):
+        """Fetch one mission item (peek-ahead trigger checks). Safe
+        mid-mission — does not disturb mission state."""
+        _require_pymavlink()
+        self._send(self.conn.mav.mission_request_int_send,
+                   self.target_system, self.target_component, int(seq), mtype)
+        return self.wait_for(
+            ["MISSION_ITEM_INT"],
+            lambda m: m.mission_type == mtype and m.seq == int(seq), timeout)
+
+    def set_message_interval(self, msgid, hz):
+        """Best-effort stream rate for msgid (0/None restores default)."""
+        us = int(1e6 / hz) if hz and hz > 0 else -1
+        try:
+            self._cmd_long(mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+                           float(msgid), float(us), ack_timeout=1.5)
+        except FCError:
+            pass
 
     def set_mode(self, mode, timeout=5.0):
         num = COPTER_MODES.get(str(mode).upper(), mode) if isinstance(mode, str) else mode

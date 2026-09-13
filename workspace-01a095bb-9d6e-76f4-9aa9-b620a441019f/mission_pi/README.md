@@ -27,7 +27,7 @@ AUTO mission ──► 15 m over home ──► DO_SPRAYER fires ──► Pi ta
 | Pi 5 ↔ Pixhawk | USB-A ↔ USB (telem2 coverts to `/dev/ttyACM0`) | FC auto-detect probes `by-id`, `ttyACM*`, `ttyUSB*` @ 115200/57600/921600 |
 | AI HAT+ 26 TOPS | PCIe ribbon, `hailo-all` stack | `hailortcli scan` must see it; needs `dtparam=pciex1_gen=2` |
 | Pi Cam 3 (imx708) | CSI 0 or 1, facing FORWARD | role assigned by sensor, not port |
-| IMX477 HQ (bottom) | other CSI, facing DOWN | HQ **lens FOV must be set** in config (`bottom.hfov_deg`) — approach geometry depends on it |
+| Waveshare IMX477 IR-CUT B (bottom) | other CSI, facing DOWN | 113° diag (~100° HFOV), 2.7 mm f/2.8, FIXED focus — set `bottom.hfov_deg` (calibrate!); day IR-CUT mode |
 | Router/LTE | Pi + laptop join the same field LAN | Pi serves `http://<pi-ip>:8000`; laptop pastes that as the Pi link |
 
 Why router/LTE: the Pi streams + pushes events to whatever can reach
@@ -36,14 +36,16 @@ uplink on the router is only needed if someone remote must watch too).
 
 ## The 15 m detection math (why the pipeline looks like this)
 
-Pi Cam 3, 66° HFOV, 12 MP (4608 wide): at 15 m the ground footprint is
-~19.5 m wide → **4.2 mm/px**. An A3 QR (297 mm side) is **~70 px** in
-the frame, **~10 px** after a naive 640 resize. 10 px is below what any
-detector can be trusted with — so:
+Bottom lens (Waveshare IMX477 B, ~100° HFOV from the 113° diagonal,
+4056 px wide): at 15 m the footprint is **~36 m wide → 8.9 mm/px**. An
+A3 QR (297 mm side) is **~34 px** in the frame, **~5 px** after a naive
+640 resize. 5 px is hopeless — so:
 
-1. **Bottom cam runs YOLO on 2×2 tiles of the full-res frame**: the QR
-   is ~22+ px on the 640 network input there. Comfortably detectable
-   for a fine-tuned 1-class YOLOv8n.
+1. **Bottom cam runs YOLO on 3×3 tiles of the frame**: the QR is ~15 px
+   on the 640 network input there. Detectable for a fine-tuned 1-class
+   YOLOv8n — and the 36 m footprint means a 50×50 m fence needs only a
+   few grid rows. (2028×1520 binned @40 fps + 3×3 is the fps/range sweet
+   spot; 4056×3040@10 full-res buys decode margin at 15 m.)
 2. **Detect → crop full-res → upscale → decode**: YOLO proposes the box,
    pyzbar/cv2 decode the zoomed crop (plus full-frame + tiled attempts
    every Nth frame as backup).
@@ -58,9 +60,11 @@ bottom cam takes over). The 26 TOPS HAT runs both streams without
 breaking a sweat (YOLOv8n-640 ≈ milliseconds); without the HAT the
 classical fallback still works at short range.
 
-Bottom HQ lens: measure your lens's real HFOV and set
-`cameras.bottom.hfov_deg` (6 mm ≈ 63°, 16 mm ≈ 21°) plus
-`rotation_deg` so "image up" == nose direction.
+Bottom lens truth (per `cam.txt` on `main:uploads/`): the Waveshare B is
+fixed-focus, f/2.8, 113° diagonal with <1.5% distortion — no PDAF, so
+verify 15 m sharpness with `tools/cam_probe.py` snaps before trusting
+far decodes, and leave the IR-CUT in day mode (no illuminator onboard).
+Set `rotation_deg` so "image up" == nose direction.
 
 ## Install (Pi 5, Pi OS)
 
@@ -97,11 +101,14 @@ link → snapshot → trigger → GUIDED against the simulator.
 * **Snapshot at boot** (while still AUTO): `HOME_POSITION` + fence
   polygon (`mission_type=FENCE` download) + plan scan for `DO_SPRAYER`
   (216). No fence (< 3 pts) → FAILSAFE, never takes over.
-* **Trigger**: `MISSION_CURRENT.seq >= sprayer_seq` (or manual
-  `POST /api/mission/takeover`). NOTE: the `ftest_claude3.txt` /
-  `cam.txt` attachments never arrived in the workspace — if your guided
-  file keys the takeover off something else (relay pin, exact seq
-  match, STATUSTEXT), re-send it and the trigger will be aligned.
+* **Trigger** (aligned with the ftest refs on `main:uploads/`): plan
+  scan for sprayer cmds {216, 222, 42600}; fire when `MISSION_CURRENT`
+  reaches/passes the first one, when the current item's command matches
+  (DO items emit no ITEM_REACHED), optionally when the NEXT item matches
+  (`trigger_peek_ahead`, claude3 style — may pre-empt 15 m), or on
+  sprayer STATUSTEXT — all gated on AUTO (or manual takeover).
+* **Takeover**: GUIDED via `DO_SET_MODE` (ACK + heartbeat mode verify),
+  then climb/hold to sweep altitude before the yaw sweep starts.
 * **Yaw sweep**: 12 × 30° relative steps with settle pauses — sharp
   frames detect; motion-blurred ones don't.
 * **Grid**: serpentine over the fence bbox clipped to the polygon, row

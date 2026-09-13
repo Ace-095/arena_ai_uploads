@@ -24,7 +24,7 @@ class Detector(Detector):          # or: def create_detector(): ...
         ...                        # coords in FULL-frame pixels, never raises
 ```
 
-Budget to respect: 2 cameras × (bottom tiled 2x2 + front single) ≈
+Budget to respect: 2 cameras × (bottom tiled 3x3 + front single) ≈
 5 inferences/frame-cycle at ~10 Hz → keep single inference under ~15 ms
 on the HAT, or narrow the tile grid in config. If the fine-tuned YOLO
 holds up, this slot stays empty by design.

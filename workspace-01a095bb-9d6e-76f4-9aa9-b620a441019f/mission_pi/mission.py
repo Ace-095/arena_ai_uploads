@@ -1,8 +1,8 @@
 """QR-hunt mission: DO_SPRAYER trigger -> GUIDED takeover -> search -> decode.
 
 Flow (drone is at ~15 m over home in AUTO when we take over):
-  WAIT_TRIGGER  watch MISSION_CURRENT until the DO_SPRAYER item (found by
-                reading the plan at boot) executes  [or POST /takeover]
+  WAIT_TRIGGER  plan scan (sprayer cmds 216/222/42600) + MISSION_CURRENT;
+                peek-ahead item fetch + STATUSTEXT backup [or POST /takeover]
   TAKEOVER      set GUIDED, verify; snapshot already holds home + fence
   SWEEP_YAW     12 stepped 30° yaws with settle pauses (sharp frames beat
                 motion blur); any fresh bbox cue jumps to TRACK
@@ -48,8 +48,13 @@ class Mission:
         self.min_batt_pct = float(m.get("min_batt_pct", 25))
         self.post_action = str(m.get("post_action", "RTL")).upper()
         self.arrive_m = float(m.get("arrive_m", 2.0))
+        self.trigger_cmds = set(m.get("trigger_cmds", [216, 222, 42600]))
+        self.trigger_peek_ahead = bool(m.get("trigger_peek_ahead", False))
+        self.trigger_require_auto = bool(m.get("trigger_require_auto", True))
         d = cfg.get("detector", {})
         self.tile_bottom = bool(d.get("tile_bottom", True))
+        tg = d.get("tile_grid", [3, 3])
+        self.tile_rows, self.tile_cols = int(tg[0]), int(tg[1])
         self.full_decode_every = int(d.get("full_decode_every_n", 5))
         self.cue_frames = int(d.get("cue_frames", 2))
 
@@ -58,7 +63,7 @@ class Mission:
         self.home = None
         self.fence = []
         self.plan = []
-        self.sprayer_seq = None
+        self.sprayer_seqs = []
         self.payload = None
         self._cue = None          # (cam, x, y, w, h, ts)
         self._cue_hits = 0
@@ -94,7 +99,7 @@ class Mission:
                     "payload": self.payload, "tracking": cs["tracking"],
                     "streak": "%d/%d" % (cs["streak"], cs["required"]),
                     "home": self.home, "fence_n": len(self.fence),
-                    "sprayer_seq": self.sprayer_seq,
+                    "sprayer_seqs": list(self.sprayer_seqs),
                     "cams": self.rig.status(), "link": self.fc.link_ok(),
                     "stats": dict(self.stats), "ts": time.time()}
 
@@ -125,7 +130,8 @@ class Mission:
     def _worker(self, cam):
         from decoder import decode_frame
         from detector import detect_tiles
-        tiled = self.tile_bottom and cam.facing == "bottom"
+        tiled = (self.tile_bottom and cam.facing == "bottom"
+                 and self.detector.name != "classical")
         n = 0
         last_count = -1
         while not self._stop.is_set():
@@ -137,7 +143,8 @@ class Mission:
             n += 1
             try:
                 if tiled:
-                    boxes = detect_tiles(self.detector, frame)
+                    boxes = detect_tiles(self.detector, frame,
+                                         rows=self.tile_rows, cols=self.tile_cols)
                 else:
                     boxes = self.detector.detect(frame)
             except Exception as e:
@@ -268,13 +275,23 @@ class Mission:
         w, h = geo.polygon_size_m(self.fence)
         self._log("INFO", "search area: %d fence verts, ~%.0f x %.0m" % (len(self.fence), w, h))
         try:
+            self.fc.set_message_interval(33, 5.0)    # GLOBAL_POSITION_INT
+            self.fc.set_message_interval(147, 1.0)   # BATTERY_STATUS
+            self.fc.set_message_interval(42, 2.0)    # MISSION_CURRENT
+        except Exception:
+            pass
+        try:
             self.plan = self.fc.read_plan(timeout=8.0)
-            self.sprayer_seq = self.fc.find_sprayer_seq(self.plan)
+            self.sprayer_seqs = self.fc.find_sprayer_seqs(self.plan, self.trigger_cmds)
         except Exception as e:
             self._log("WARN", "plan read failed: %s" % e)
-        if self.sprayer_seq is None:
-            self.sprayer_seq = self.cfg.get("mission", {}).get("trigger_seq")
-            self._log("WARN", "no DO_SPRAYER in plan — trigger_seq=%s" % (self.sprayer_seq,))
+        if not self.sprayer_seqs:
+            fb = self.cfg.get("mission", {}).get("trigger_seq")
+            self.sprayer_seqs = [fb] if fb is not None else []
+            self._log("WARN", "no sprayer cmd %s in plan — trigger_seq=%s" % (
+                sorted(self.trigger_cmds), fb))
+        else:
+            self._log("INFO", "sprayer seqs: %s" % (self.sprayer_seqs,))
         # start detection workers + stream overlays
         for cam in self.rig.cams.values():
             t = threading.Thread(target=self._worker, args=(cam,),
@@ -282,7 +299,7 @@ class Mission:
             t.start()
             self._workers.append(t)
         # WAIT_TRIGGER
-        self._set_phase("WAIT_TRIGGER", "waiting for DO_SPRAYER seq %s" % (self.sprayer_seq,))
+        self._set_phase("WAIT_TRIGGER", "waiting for sprayer seqs %s" % (self.sprayer_seqs,))
         if not self._wait_trigger():
             return
         # TAKEOVER
@@ -292,12 +309,21 @@ class Mission:
         except Exception as e:
             self._set_phase("FAILSAFE", "GUIDED refused: %s" % e)
             return
-        # hold position at takeover point
+        t1 = time.time()
+        while time.time() - t1 < 6.0 and self.fc.mode != "GUIDED":
+            time.sleep(0.5)
+        if self.fc.mode != "GUIDED":
+            self._set_phase("FAILSAFE", "GUIDED not confirmed (mode=%s)" % self.fc.mode)
+            return
+        # hold + normalize to sweep altitude (takeover may precede 15 m)
         try:
             pos = self.fc.get_position()
-            self.fc.goto_global(pos["lat"], pos["lon"], max(pos["alt_rel"], 3.0))
+            self._goto_hold(pos["lat"], pos["lon"], self.sweep_alt, 25.0, arrive_m=3.0)
         except Exception as e:
             log.warning("hold failed: %r", e)
+        if self._abort.is_set():
+            self._aborted()
+            return
         # SEARCH
         if not self._sweep_yaw():
             return
@@ -307,10 +333,19 @@ class Mission:
         self._finish(found=False)
 
     def _wait_trigger(self):
-        if self.sprayer_seq is None:
+        """Multi-cue trigger (aligned with the ftest references):
+        1. MISSION_CURRENT reaches/passes a plan-scanned sprayer seq.
+        2. Current item's command is a sprayer cmd (DO items don't emit
+           ITEM_REACHED, so CURRENT + fetch is the reliable path).
+        3. Optional peek-ahead: NEXT item is a sprayer cmd (claude3 style).
+        4. STATUSTEXT sprayer backup. All gated on AUTO unless configured
+           otherwise; manual POST /takeover always works."""
+        first = min(self.sprayer_seqs) if self.sprayer_seqs else None
+        if first is None:
             self._log("WARN", "no trigger seq — waiting for manual takeover only")
         t0 = time.time()
-        q = self.fc.subscribe(["MISSION_CURRENT", "MISSION_ITEM_REACHED"])
+        q = self.fc.subscribe(["MISSION_CURRENT", "MISSION_ITEM_REACHED", "STATUSTEXT"])
+        last_seq = None
         try:
             while time.time() - t0 < self.trigger_timeout_s:
                 if self._abort.is_set():
@@ -326,10 +361,37 @@ class Mission:
                     m = q.get(timeout=1.0)
                 except Exception:
                     continue
+                if m.get_type() == "STATUSTEXT":
+                    raw = m.text
+                    txt = raw.decode("utf-8", "ignore") if isinstance(raw, bytes) else str(raw)
+                    auto = (not self.trigger_require_auto) or self.fc.mode == "AUTO"
+                    if "sprayer" in txt.lower() and auto:
+                        self._log("WARN", "trigger: sprayer STATUSTEXT %r" % txt.strip()[:60])
+                        return True
+                    continue
                 seq = getattr(m, "seq", None)
-                if seq is not None and self.sprayer_seq is not None and seq >= self.sprayer_seq:
-                    self._log("WARN", "trigger: mission seq %d >= sprayer %d" % (seq, self.sprayer_seq))
+                if seq is None:
+                    continue
+                if m.get_type() == "MISSION_CURRENT" and seq != last_seq:
+                    self._log("INFO", "mission current: %d" % seq)
+                auto = (not self.trigger_require_auto) or self.fc.mode == "AUTO"
+                if first is not None and seq >= first and auto:
+                    self._log("WARN", "trigger: mission seq %d >= sprayer %d" % (seq, first))
                     return True
+                if seq != last_seq:
+                    last_seq = seq
+                    if not auto:
+                        continue
+                    probe = [seq] + ([seq + 1] if self.trigger_peek_ahead else [])
+                    for pr in probe:
+                        try:
+                            it = self.fc.get_mission_item(pr, timeout=1.5)
+                        except Exception:
+                            continue
+                        if it is not None and it.command in self.trigger_cmds:
+                            self._log("WARN", "trigger: item %d is sprayer cmd %d%s" % (
+                                pr, it.command, " (peek-ahead)" if pr != seq else ""))
+                            return True
             self._set_phase("FAILSAFE", "trigger timeout")
             return False
         finally:

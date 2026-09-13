@@ -9,10 +9,11 @@ Kinds (config `detector.kind`):
              `Detector` subclass (see models/README.md contract).
   none       Disable stage 1 (decode-only pipeline).
 
-The 15 m problem: an A3 QR is ~70 px in a 12 MP frame, ~10 px after a
-naive 640 resize — too small to trust. The mission therefore runs the
-YOLO stage on 2x2 TILES of the full-res bottom frame (see detect_tiles),
-where the QR is ~22+ px on the network input: comfortably detectable.
+The 15 m problem: with the 113-deg bottom lens an A3 QR is ~34 px in
+the frame, ~5 px after a naive 640 resize — hopeless. The mission
+therefore runs the YOLO stage on 3x3 TILES of the bottom frame (see
+detect_tiles), where the QR is ~15 px on the network input: detectable
+for a fine-tuned 1-class YOLOv8n.
 """
 import importlib
 import logging
@@ -217,7 +218,7 @@ class HailoYolo8Detector(Detector):
 # --------------------------------------------------------------------------
 # Tiled inference (the 15 m answer) + factory
 # --------------------------------------------------------------------------
-def detect_tiles(detector, frame_bgr, rows=2, cols=2, overlap=0.25, iou_thr=0.5):
+def detect_tiles(detector, frame_bgr, rows=3, cols=3, overlap=0.25, iou_thr=0.5):
     """Run `detector` on rows×cols overlapping tiles, merge to frame coords."""
     h, w = frame_bgr.shape[:2]
     if rows <= 1 and cols <= 1:

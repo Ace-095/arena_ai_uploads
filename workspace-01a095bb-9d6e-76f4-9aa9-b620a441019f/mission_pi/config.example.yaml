@@ -4,10 +4,14 @@ server:
 
 cameras:
   front:  { size: [1920, 1080], hfov_deg: 66.0, rotation_deg: 0, jpeg_quality: 80 }
-  bottom: { size: [2028, 1520], hfov_deg: 63.0, rotation_deg: 0, jpeg_quality: 80 }
-  # bottom hfov depends on YOUR HQ lens — measure and set it (affects approach
-  # geometry!). 6mm lens ~63 deg, 16mm lens ~21 deg. Rotation: physical mount
-  # twist of the bottom cam (0/90/180/270) so "image up" == nose direction.
+  bottom: { size: [2028, 1520], hfov_deg: 100.0, rotation_deg: 0, jpeg_quality: 80 }
+  # bottom = Waveshare IMX477 IR-CUT B: 113 deg DIAGONAL, ~100 deg HFOV
+  # (rectilinear approx on 4:3 — calibrate yours; approach geometry + grid
+  # spacing scale with it!). 2028x1520@40 binned is the fps/range sweet spot
+  # with 3x3 tiles; 4056x3040@10 full-res buys decode margin at 15 m.
+  # Fixed focus (no AF) — verify 15 m sharpness with tools/cam_probe.py.
+  # IR-CUT: leave in day mode for competition (IR needs an illuminator).
+  # rotation_deg: physical mount twist (0/90/180/270) so image-up == nose.
   single_cam_role: bottom   # if only one CSI cam is found, treat it as this
 
 detector:
@@ -16,7 +20,8 @@ detector:
   input_size: 640
   conf_thr: 0.35
   iou_thr: 0.5
-  tile_bottom: true         # 2x2 tiled inference on bottom cam (the 15 m answer)
+  tile_bottom: true         # tiled inference on bottom cam (the 15 m answer)
+  tile_grid: [3, 3]         # rows x cols (113-deg lens needs 3x3; hailo/custom only)
   full_decode_every_n: 5    # full-frame decode attempt every Nth frame
   cue_frames: 2             # consecutive bbox frames to raise a flight cue
   custom_module: myqr.det   # kind=custom only: module with Detector/create_detector
@@ -37,7 +42,11 @@ mission:
   min_batt_pct: 25
   arrive_m: 2.0
   post_action: RTL          # RTL | AUTO (resume mission) | LOITER | LAND
-  trigger_seq: null         # fallback if the plan has no DO_SPRAYER item
+  trigger_seq: null         # fallback if the plan has no sprayer item
+  trigger_cmds: [216, 222, 42600]  # DO_SPRAYER + ftest fallbacks
+  trigger_require_auto: true       # take over only out of AUTO
+  trigger_peek_ahead: false        # true = fire when NEXT item is sprayer
+                                   # (ftest/claude3 style; may pre-empt 15 m)
 
 relay:
   interval_s: 2.0           # STATUSTEXT QR:<payload> resend cadence to MP

@@ -6,9 +6,9 @@ from a drone), pastes 1-3 per image on procedural ground backgrounds
 (+ optional real --bg-dir), and applies the degradations that actually
 happen at 15 m: small scale, motion blur, exposure/brightness swings.
 
-Scale truth (Pi Cam 3, 66 deg HFOV): an A3 QR (297 mm side) is ~70 px in
-a 12 MP frame at 15 m, ~10 px after a naive 640 resize, ~22 px inside a
-2x2 tile. So the default --px range (10-140) brackets tiled detect duty.
+Scale truth (bottom IMX477 B, ~100 deg HFOV): an A3 QR (297 mm side) is
+~34 px in the frame at 15 m, ~5 px after a naive 640 resize, ~15 px inside
+a 3x3 tile. So the default --px range (8-140) brackets tiled detect duty.
 """
 import argparse
 import os
@@ -138,7 +138,7 @@ def main():
     ap.add_argument("--n-train", type=int, default=3000)
     ap.add_argument("--n-val", type=int, default=400)
     ap.add_argument("--img", type=int, default=640)
-    ap.add_argument("--px-min", type=int, default=10)
+    ap.add_argument("--px-min", type=int, default=8)
     ap.add_argument("--px-max", type=int, default=140)
     ap.add_argument("--chars", type=int, default=6)
     ap.add_argument("--seed", type=int, default=7)
