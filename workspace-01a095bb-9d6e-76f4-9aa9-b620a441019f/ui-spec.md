@@ -222,7 +222,7 @@ Windows 11 laptop (zero pip installs). It:
 
 The laptop has no radio of its own, so v1's "Pi owns MAVLink over USB" path is
 replaced: **Mission Planner owns the telemetry link and forwards MAVLink over
-UDP (Write access) to the bridge**, which acts as a GCS (sysid 255) and serves
+UDP (Write access) to the bridge**, which acts as a GCS (sysid 254) and serves
 the UI over SSE.
 
 - **D1 SUPERSEDED.** Fence path is now UI → bridge → MP → FC over MAVLink

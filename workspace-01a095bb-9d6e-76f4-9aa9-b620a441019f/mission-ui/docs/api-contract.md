@@ -18,7 +18,7 @@ Pi 5 (search FSM, cameras, QR) <==WS receive-only==> UI (mission brain panel)
 - **FC** (Pixhawk + ArduCopter): flight truth. Inclusion fence, plan, DO_SPRAYER.
 - **MP** (Mission Planner, laptop): the head — arming, home, plan upload,
   DO_SPRAYER trigger. Forwards MAVLink to the bridge (UDP, **Write access**).
-- **BRIDGE** (this repo, laptop): GCS client (sysid 255) on UDP `:14551`, UI
+- **BRIDGE** (this repo, laptop): GCS client (sysid 254) on UDP `:14551`, UI
   host, MP-log tail, MBTiles server. Owns telemetry / fence / plan / console
   data for the UI.
 - **PI** (Pi 5): mission brain — search FSM, dual cameras, QR decode. The UI's
@@ -34,7 +34,7 @@ Pi 5 (search FSM, cameras, QR) <==WS receive-only==> UI (mission brain panel)
 | Pi REST | `http://<pi>:8000/...` | UI → Pi (camera tuning only) + status reads |
 | Bridge REST | same origin `/api/mp/*`, `/tiles/*` | UI ↔ bridge |
 | Bridge SSE | same origin `/api/mp/stream` | bridge → UI (all channels) |
-| MAVLink | UDP `:14551`, GCS sysid 255 | bridge ↔ MP ↔ FC |
+| MAVLink | UDP `:14551`, GCS sysid 254 | bridge ↔ MP ↔ FC |
 
 v1's Pi `telemetry` / `fence` WS channels are **gone** — flight truth is
 bridge-owned now. The UI ignores them if a stale Pi still sends them.
@@ -116,7 +116,7 @@ if known).
 
 ## MAVLink bridge (bridge ↔ MP ↔ FC)
 
-- Transport: UDP `:14551` (rebindable), GCS sysid 255, one frame per datagram,
+- Transport: UDP `:14551` (rebindable), GCS sysid 254, one frame per datagram,
   replies to last-seen sender. No signing. Heartbeat 1 Hz.
 - IN: `HEARTBEAT` (mode/armed, liveness 2.5 s), `GLOBAL_POSITION_INT`,
   `ATTITUDE`, `GPS_RAW_INT`, `BATTERY_STATUS`/`SYS_STATUS`, `MISSION_CURRENT`,

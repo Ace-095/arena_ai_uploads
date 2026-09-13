@@ -12,7 +12,7 @@ Topology (all inside the bridge process, on loopback):
 
     mock FC  ◄──UDP 127.0.0.1:14560──►  mav_client GCS (bound :14551)
       ▲                                      ▲
-      │ STATUSTEXT (sysid 42, "the Pi")      │ everything else (sysid 255)
+      │ STATUSTEXT (sysid 42, "the Pi")      │ everything else (sysid 254)
       └── inject_pi_statustext() ──┘         └── mp_client via MP forwarding
 
 The vehicle's dynamic state (position/alt/mode/battery) is read from a

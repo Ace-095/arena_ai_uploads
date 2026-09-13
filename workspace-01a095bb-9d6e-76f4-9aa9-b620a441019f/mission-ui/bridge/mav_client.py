@@ -101,7 +101,7 @@ class MavError(Exception):
 
 
 class MavClient:
-    def __init__(self, hub, port=14551, sysid=255, compid=1,
+    def __init__(self, hub, port=14551, sysid=254, compid=1,
                  fence_action=1, verbose=False):
         self.hub = hub
         self.port = port
@@ -135,6 +135,7 @@ class MavClient:
         self.plan = None              # {items, do_sprayer_seq, synced}
 
         self.rx_msgs = 0
+        self.tx_msgs = 0
         self.rx_rate = 0.0
         self._rx_window = 0
         self._rx_window_t = time.time()
@@ -188,6 +189,7 @@ class MavClient:
                            "127.0.0.1:%d + Write access)" % (self.port, self.port))
         try:
             self.sock.sendto(frame, self.sender)
+            self.tx_msgs += 1
             return True
         except OSError:
             return False
@@ -199,6 +201,7 @@ class MavClient:
         try:
             self.sock.sendto(M.build_frame(msgid, self.sysid, self.compid,
                                            self._next_seq(), values), self.sender)
+            self.tx_msgs += 1
         except OSError:
             pass
 
@@ -270,6 +273,8 @@ class MavClient:
                 self.port = self._rebind_port
                 self._rebind_port = None
                 self.connected = False
+                self.sender = None
+                self.veh_sysid = None
                 try:
                     self.sock = self._open_socket()
                     self.hub.emit_threadsafe("log", {"level": "INFO", "msg": "MAVLink listener re-bound to port %d" % self.port})
@@ -442,6 +447,8 @@ class MavClient:
             "connected": self.connected,
             "port": self.port,
             "gcs_sysid": self.sysid,
+            "sender": ("%s:%d" % self.sender) if self.sender else None,
+            "tx_msgs": self.tx_msgs,
             "vehicle_sysid": self.veh_sysid,
             "vehicle_type": self.veh_type,
             "mode": self.mode, "mode_num": self.mode_num,
@@ -815,4 +822,9 @@ class MavClient:
             time.sleep(1.0)
 
     def rebind(self, port):
-        self._rebind_port = int(port)
+        port = int(port)
+        if port == self.port and self._rebind_port is None:
+            self.hub.emit_threadsafe("log", {"level": "INFO",
+                "msg": "MAVLink listener already on port %d (no-op)" % port})
+            return
+        self._rebind_port = port

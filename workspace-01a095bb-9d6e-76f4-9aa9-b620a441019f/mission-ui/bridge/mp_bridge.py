@@ -1234,7 +1234,7 @@ def main():
     ap.add_argument("--mock", action="store_true", help="run simulated Pi + mock FC (full contract demo)")
     ap.add_argument("--selftest", action="store_true", help="run codec + protocol self-tests and exit")
     ap.add_argument("--mav-port", type=int, default=14551, help="UDP port to listen on for the MP MAVLink forward")
-    ap.add_argument("--mav-sysid", type=int, default=255, help="GCS system id for the bridge")
+    ap.add_argument("--mav-sysid", type=int, default=254, help="GCS system id for the bridge (254: MP itself is 255)")
     ap.add_argument("--fence-action", type=int, default=1, help="FENCE_ACTION param (1=RTL)")
     ap.add_argument("--mock-fc-port", type=int, default=14560, help="mock FC UDP port (mock mode)")
     ap.add_argument("--origin", default="%f,%f" % MOCK_ORIGIN, help="mock demo origin lat,lon (NOT a venue)")

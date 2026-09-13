@@ -80,6 +80,7 @@ function renderMav(d) {
   $('mavMode').textContent = (d.mode || '—') + (d.armed ? ' · ARMED' : '') +
     (d.hb_age_s != null ? ' · hb ' + d.hb_age_s + 's ago' : '');
   $('mavRx').textContent = d.rx_rate + ' msg/s · ' + fmtInt(d.rx_msgs) + ' total · :' + d.port;
+  $('mavSender').textContent = (d.sender || 'no forwarder yet') + (d.tx_msgs != null ? ' · tx ' + fmtInt(d.tx_msgs) : '');
   renderPlan(S.plan || d.plan);
   renderArmable();
 }
