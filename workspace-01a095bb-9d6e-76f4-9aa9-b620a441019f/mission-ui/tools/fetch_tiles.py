@@ -65,17 +65,24 @@ def fetch_tiles(bbox, zoom_min, zoom_max, output_file,
                     skipped += 1
                     continue
                 url = tile_url_template.format(z=z, x=x, y=y)
-                req = urllib.request.Request(url, headers={"User-Agent": user_agent})
-                try:
-                    with urllib.request.urlopen(req, timeout=15) as resp:
-                        tile_data = resp.read()
-                    cur.execute("INSERT OR REPLACE INTO tiles (zoom_level, tile_column, tile_row, tile_data) VALUES (?, ?, ?, ?)",
-                                (z, x, tms_y, tile_data))
-                    conn.commit()
-                    downloaded += 1
-                    time.sleep(delay_s)
-                except Exception as e:
-                    print("  FAIL z=%d x=%d y=%d: %s" % (z, x, y, e))
+                tile_data, err = None, None
+                for attempt in range(3):  # OSM throttles/drops: retry, then re-run resumes gaps
+                    try:
+                        req = urllib.request.Request(url, headers={"User-Agent": user_agent})
+                        with urllib.request.urlopen(req, timeout=15) as resp:
+                            tile_data = resp.read()
+                        break
+                    except Exception as e:
+                        err = e
+                        time.sleep(delay_s * (attempt + 1))
+                if tile_data is None:
+                    print("  FAIL z=%d x=%d y=%d: %s" % (z, x, y, err))
+                    continue
+                cur.execute("INSERT OR REPLACE INTO tiles (zoom_level, tile_column, tile_row, tile_data) VALUES (?, ?, ?, ?)",
+                            (z, x, tms_y, tile_data))
+                conn.commit()
+                downloaded += 1
+                time.sleep(delay_s)
     conn.close()
     print("Done. downloaded=%d skipped=%d -> %s" % (downloaded, skipped, output_file))
     return downloaded

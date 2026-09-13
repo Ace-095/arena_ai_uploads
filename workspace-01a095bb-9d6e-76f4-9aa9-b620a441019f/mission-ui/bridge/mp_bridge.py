@@ -304,6 +304,8 @@ class TileStore:
             cur = self.conn.cursor()
             zmin, zmax = cur.execute("SELECT MIN(zoom_level), MAX(zoom_level) FROM tiles").fetchone()
             count = cur.execute("SELECT COUNT(*) FROM tiles").fetchone()[0]
+            if not count:
+                return {"available": False, "path": self.path, "count": 0}
             bounds = None
             try:
                 bounds = cur.execute("SELECT value FROM metadata WHERE name='bounds'").fetchone()[0]
