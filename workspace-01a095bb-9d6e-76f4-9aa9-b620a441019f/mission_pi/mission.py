@@ -258,6 +258,12 @@ class Mission:
             time.sleep(0.5)
         # SNAPSHOT (while still in AUTO — home + fence + plan + sprayer)
         self._set_phase("SNAPSHOT", "reading home / fence / plan")
+        # streams FIRST: Telem-class ports are heartbeat-only until rates
+        # are set — home/plan/trigger all depend on these.
+        try:
+            self.fc.start_streams()
+        except Exception:
+            pass
         try:
             self.home = self.fc.get_home(timeout=5.0)
             self._log("INFO", "home: %.7f, %.7f" % (self.home[0], self.home[1]))
@@ -278,12 +284,6 @@ class Mission:
             w, h = geo.polygon_size_m(self.fence)
             self._log("INFO", "search area: %d fence verts, ~%.0f x %.0f m" % (
                 len(self.fence), w, h))
-        try:
-            self.fc.set_message_interval(33, 5.0)    # GLOBAL_POSITION_INT
-            self.fc.set_message_interval(147, 1.0)   # BATTERY_STATUS
-            self.fc.set_message_interval(42, 2.0)    # MISSION_CURRENT
-        except Exception:
-            pass
         try:
             self.plan = self.fc.read_plan(timeout=8.0)
             self.sprayer_seqs = self.fc.find_sprayer_seqs(self.plan, self.trigger_cmds)

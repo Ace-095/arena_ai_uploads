@@ -372,6 +372,18 @@ class FCLink:
         except FCError:
             pass
 
+    #: Streams the mission needs. Telem-class ports (SITL serial1/5762
+    #: included) stream NOTHING by default — heartbeat-only until a GCS
+    #: sets rates (MP does this on every connect). So we set our own.
+    STREAM_DEFAULTS = ((242, 1.0),    # HOME_POSITION
+                       (33, 5.0),     # GLOBAL_POSITION_INT
+                       (147, 1.0),    # BATTERY_STATUS
+                       (42, 2.0))     # MISSION_CURRENT
+
+    def start_streams(self, specs=None):
+        for msgid, hz in (specs or self.STREAM_DEFAULTS):
+            self.set_message_interval(msgid, hz)
+
     def set_mode(self, mode, timeout=5.0):
         num = COPTER_MODES.get(str(mode).upper(), mode) if isinstance(mode, str) else mode
         t0 = time.time()
