@@ -29,7 +29,7 @@ NOT proved on the bench:
 ```
 Windows laptop (Mission Planner)  <--WiFi/LAN-->  Linux laptop (Pop!_OS)
   TCP <linux-ip>:5760  ──────────────►  SITL serial0 (GCS port)
-                                         SITL serial1 ──► tcp:127.0.0.1:5763
+                                         SITL serial1 ──► tcp:127.0.0.1:5762
                                                             ▲
                                          mission_pi ────────┘ (FC link)
                                          mission_pi ◄── /dev/video0 (webcam
@@ -39,9 +39,10 @@ Windows laptop (Mission Planner)  <--WiFi/LAN-->  Linux laptop (Pop!_OS)
 
 Why two SITL ports: `--no-mavproxy` SITL listens on TCP **5760** for
 one GCS ([docs](https://ardupilot.org/dev/docs/using-sitl-for-ardupilot-testing.html)),
-so Mission Planner takes 5760 and we open a second MAVLink port for
-the Pi code with `-A "--serial1=tcp:5763"` (any of the 8 SITL UARTs
-can be overridden this way; serial2 is the sim GPS — don't touch it).
+so Mission Planner takes 5760 — and SITL's serial1 already listens on
+TCP **5762** as a spare MAVLink port, which is where `mission_pi`
+connects. No port overrides needed (do NOT move serial1 to 5763:
+serial2 already lives there and SITL exits on the collision).
 No MAVProxy anywhere in this guide.
 
 Find your Linux LAN IP once: `hostname -I` (e.g. `192.168.1.42` —
@@ -142,14 +143,13 @@ Terminal 1 (Linux):
 
 ```bash
 cd ~/ardupilot
-Tools/autotest/sim_vehicle.py -v ArduCopter -f quad --no-mavproxy \
-    -A "--serial1=tcp:5763"
+Tools/autotest/sim_vehicle.py -v ArduCopter -f quad --no-mavproxy
 # wait for: "SERIAL0 on TCP port 5760" ... "Waiting for connection"
 ```
 
 Normal at this point: **no SERIAL1 line yet**. Serial0 blocks the boot
 at "Waiting for connection" until the first client connects to 5760 —
-only then does `SERIAL1 on TCP port 5763` (mission_pi's port) appear.
+only then does `SERIAL1 on TCP port 5762` (mission_pi's port) appear.
 So connect MP first, mission_pi second.`
 
 On Windows Mission Planner (same WiFi):
@@ -164,7 +164,7 @@ check the IP. If `sudo ufw status` says active, open our three ports:
 
 ```bash
 sudo ufw allow 5760/tcp   # MP -> SITL
-sudo ufw allow 5763/tcp   # mission_pi -> SITL
+sudo ufw allow 5762/tcp   # mission_pi -> SITL
 sudo ufw allow 8000/tcp   # UI browser -> mission_pi
 ```
 
@@ -188,7 +188,7 @@ Terminal 2 (Linux) — prove `mission_pi` sees the same vehicle:
 ```bash
 cd mission_pi && source .venv/bin/activate
 python main.py --check --config config.laptop.yaml
-# want: [fc] OK: tcp:127.0.0.1:5763 ... [cam] cam2: kind=usb ...
+# want: [fc] OK: tcp:127.0.0.1:5762 ... [cam] cam2: kind=usb ...
 ```
 
 ## 8. Run day, part 3 — fly the loop
@@ -197,7 +197,7 @@ Terminal 2 (Linux), SITL still up, MP still connected:
 
 ```bash
 python main.py --config config.laptop.yaml
-# FC link: tcp:127.0.0.1:5763 ... detector: classical
+# FC link: tcp:127.0.0.1:5762 ... detector: classical
 # BOOTSTRAP -> SNAPSHOT (home/fence/plan, sprayer seqs: [3]) -> WAIT_TRIGGER
 ```
 
@@ -241,8 +241,8 @@ Kill everything with Ctrl-C (Terminal 1 SITL, Terminal 2 mission).
 |---|---|
 | `waf`/prereqs fail | Re-run `install-prereqs-ubuntu.sh -y`, fresh terminal, retry; needs ~5 GB disk |
 | MP "connection failed" on 5760 | SITL listens on all interfaces (verified in source) — it's network/typing: Linux `ss -ltn \| grep 5760` must show LISTEN; `hostname -I` for the WiFi IP (not 127.0.0.1); Windows `ping <ip>` then PowerShell `Test-NetConnection <ip> -Port 5760`; `sudo ufw allow 5760/tcp` if ufw is active; in MP put IP and port in SEPARATE fields |
-| SITL console lacks "Serial port 1 on TCP port 5763" | Quote `-A "--serial1=tcp:5763"` exactly; fallback: `-A "--serial1=udpclient:127.0.0.1:14555"` + `fc.conn: "udpin:0.0.0.0:14555"` |
-| `[fc] FAIL: no heartbeat` on 5763 | SITL up? (Terminal 1). Port shared/IPC clash: nothing else may hold 5763 |
+| SITL console lacks "SERIAL1 on TCP port 5762" | It appears only AFTER the first 5760 client connects — connect MP first. Fallback: `-A "--serial1=udpclient:127.0.0.1:14555"` + `fc.conn: "udpin:0.0.0.0:14555"` |
+| `[fc] FAIL: no heartbeat` on 5762 | SITL up? (Terminal 1). Port shared/IPC clash: nothing else may hold 5762 |
 | `[cam] none assigned` | `ls /dev/video*`; close apps holding the cam; `device: 1`; video-group perms (§2); `--verbose` |
 | `cv2` import error (libGL) | `sudo apt install libgl1` |
 | `pyzbar` import error | `sudo apt install libzbar0` (decode still works via OpenCV alone, slower) |
@@ -290,7 +290,7 @@ no-MAVProxy two-port trick as §6:
 ```bash
 cd ~/ardupilot
 Tools/autotest/sim_vehicle.py -v ArduCopter -f gazebo-iris --model JSON \
-    --no-mavproxy -A "--serial1=tcp:5763"
+    --no-mavproxy
 ```
 
 Then repeat §6(MP on 5760)-§8 unchanged: same mission, same

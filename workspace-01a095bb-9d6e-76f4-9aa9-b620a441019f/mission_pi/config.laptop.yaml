@@ -3,14 +3,14 @@
 #
 # Topology for bench runs:
 #   SITL (this laptop) : MP on Windows takes TCP 5760,
-#                        mission_pi takes TCP 5763 (SITL --serial1).
+#                        mission_pi takes TCP 5762 (SITL serial1 default).
 #   Webcam             : /dev/video0, pointed at the printed A3 QR panel.
 #   UI                 : http://<this-laptop-ip>:8000
 
 server: { host: 0.0.0.0, port: 8000 }
 
 fc:
-  conn: "tcp:127.0.0.1:5763"   # SITL 2nd port (--device CLI flag overrides)
+  conn: "tcp:127.0.0.1:5762"   # SITL serial1 spare MAVLink port
 
 cameras:
   # Only ONE camera on a laptop: declare just it. The mission uses
