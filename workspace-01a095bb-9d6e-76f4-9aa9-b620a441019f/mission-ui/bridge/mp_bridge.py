@@ -996,21 +996,24 @@ class Server:
                 return self.json({"detail": "mode set failed: %s" % e}, 503)
             rname = COMMAND_ACK_RESULT.get(res, "?")
             ack_src = self.mav._last_ack_src.get("COMMAND_ACK", "?")
-            await self.hub.emit("log", {"level": "WARN", "msg": "UI sent mode %s via MAVLink (via MP) — result=%d (%s, from sysid %s)" % (mode, res, rname, ack_src)})
+            ack_comp = self.mav._last_ack_comp.get("COMMAND_ACK", "?")
+            await self.hub.emit("log", {"level": "WARN", "msg": "UI sent mode %s via MAVLink (via MP) — result=%d (%s, from sysid %s comp %s)" % (mode, res, rname, ack_src, ack_comp)})
             home = None
             if mode == "RTL" and res != 0:
-                # ArduPilot denies RTL iff home is unset — ask the FC directly
-                # so the log states the cause instead of guessing it.
+                # ArduPilot prints the real reason as STATUSTEXT
+                # ("Mode change to RTL failed: <reason>") — ask the FC for
+                # home too so the log states what is known either way.
                 try:
                     home = await asyncio.to_thread(self.mav.get_home, 1.5)
                 except Exception:
                     home = None
                 if home is None:
-                    await self.hub.emit("log", {"level": "ERROR", "msg": "RTL %s (from sysid %s) — HOME IS UNSET on the FC (no HOME_POSITION). Fix: GPS 3D lock, then disarm + re-arm (or MP: right-click map -> Set Home Point -> vehicle location), then press RTL again." % (rname, ack_src)})
+                    await self.hub.emit("log", {"level": "ERROR", "msg": "RTL %s (from sysid %s comp %s) — HOME IS UNSET on the FC (no HOME_POSITION). Also read MP Messages for 'Mode change to RTL failed: <reason>'. Fix: GPS 3D lock, then disarm + re-arm (or MP: right-click map -> Set Home Point -> vehicle location), then press RTL again." % (rname, ack_src, ack_comp)})
                 else:
-                    await self.hub.emit("log", {"level": "WARN", "msg": "RTL %s but home IS set (%.5f, %.5f) — denial came from sysid %s, not the home check; report this line." % (rname, home[0], home[1], ack_src)})
+                    await self.hub.emit("log", {"level": "WARN", "msg": "RTL %s but home reads SET (%.5f, %.5f) — denial came from sysid %s comp %s. Read MP Messages (or the UI console mirror) for 'Mode change to RTL failed: <reason>' at this timestamp — that line IS the cause; report it." % (rname, home[0], home[1], ack_src, ack_comp)})
             return self.json({"status": "ok" if res == 0 else "rejected", "mode": mode,
                               "result": res, "result_name": rname, "from_sysid": ack_src,
+                              "from_compid": ack_comp,
                               "home_set": (home is not None) if mode == "RTL" and res != 0 else None,
                               "home": home})
         if p == "/api/mp/param" and method == "POST":
