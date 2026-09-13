@@ -31,10 +31,9 @@ cameras:
   #   Wrong HFOV only skews approach geometry on the bench — the printed
   #   QR is found by pixels, not by geometry.
   #
-  # Gazebo closed-loop (later): point bottom at the RTP stream instead —
-  #   bottom: { kind: url, backend: gstreamer, size: [1280, 720],
-  #             hfov_deg: 90.0, device: "udpsrc port=5600 caps=... ! ... ! appsink" }
-  #   see SIM_GUIDE.md section 10. File playback for vision tests:
+  # Gazebo closed-loop: use config.gazebo.yaml instead (2 sim cameras
+  #   over MJPEG from tools/gz_cam_bridge.py — SIM_GUIDE.md section 10).
+  #   File playback for vision tests:
   #   bottom: { kind: file, path: bench_frames/, size: [1280, 720], fps: 5 }
 
 detector:

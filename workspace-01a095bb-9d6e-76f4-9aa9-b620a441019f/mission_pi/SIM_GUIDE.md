@@ -273,12 +273,30 @@ Kill everything with Ctrl-C (Terminal 1 SITL, Terminal 2 mission).
 | GUIDED refused | Check MP Messages for the refusal reason; SITL GPS is fine — usually a pre-arm state; re-arm |
 | QR never decodes | Bigger in frame (move closer), more light, hold still; snap + `python tools/qr_bench.py snaps/cam2.jpg` to iterate offline |
 | PreArm failures in SITL | Read MP Messages; common: wait 10 s for EKF; SITL compass/GPS are pre-baked, no cal needed |
+| gz sim can't find `iris_dualcam` | `GZ_SIM_RESOURCE_PATH` missing `sim/models` (§10.1 export + `source ~/.bashrc` + NEW terminal); `model://iris_with_standoffs` missing = ardupilot_gazebo models path absent |
+| bridge `subscribe FAIL` / no frames | Gazebo not up yet (start order: A → C); else `gz topic -l \| grep -i image` must list both `/iris/*` topics — if absent the Sensors plugin didn't load (ogre2 ok?) |
+| bridge runs but panes dark | `/health` ages climbing = Gazebo rendering stalled (GPU/driver — try `gz sim -s` headless, still renders offscreen); ages fresh but black frames = camera inside the body mesh (mount pose) |
+| mission_pi cam1/cam2 503 on gazebo config | Browser-test the MJPEG URLs first (dark = bridge/Gazebo side; live = cv2 ffmpeg http reader — reinstall `opencv-python`) |
+| QR never found in Gazebo | Confirm the panel is IN the flown box (world pose vs home box/fence); confirm size story §10.3 (A3 + classical = expected fail); fly lower once (`sweep_alt_m: 10`) to prove detection, then diagnose altitude |
+| Sim runs slower than realtime | Normal on iGPU with 2 cameras: headless `-s`, `<update_rate>10</update_rate>`, close the Gazebo GUI render loop; mission timeouts are wall-clock so slowness only stretches the run |
 
-## 10. Gazebo phase (later — same setup, physics + visuals)
+## 10. Gazebo phase (closed loop — sim physics + sim cameras + UI)
 
 Needs a real GPU or a strong iGPU (ogre2) and ~5 GB more disk.
-Everything in §1-§9 stays identical; only Terminal 1 changes, plus an
-optional QR panel in the world.
+Everything in §1-§9 stays identical in spirit; the differences:
+
+- the iris flies in Gazebo (`sim/worlds/mission_world.sdf`) instead of
+  bare SITL, driven by the same MP mission + sprayer trigger;
+- TWO sim cameras (front + bottom, fixed mounts on `iris_dualcam`)
+  replace the laptop webcam, served to `mission_pi` as MJPEG by
+  `tools/gz_cam_bridge.py` — the UI shows both tiles, like two webcams;
+- the QR target lives in the world (`qr_panel_big`, 2x-A3 for first
+  runs so the classical detector can actually decode it).
+
+Data path: Gazebo sensors → gz-transport topics → bridge :8099 →
+`mission_pi` (`config.gazebo.yaml`) → UI tiles + search FSM. No ROS,
+no GStreamer, no model surgery by hand — the model/world files ship in
+`sim/`.
 
 ### 10.1 Install Gazebo Harmonic + the ArduPilot plugin (one time)
 
@@ -299,66 +317,121 @@ echo 'export GZ_SIM_RESOURCE_PATH=$HOME/ardupilot_gazebo/models:$HOME/ardupilot_
 source ~/.bashrc
 ```
 
-### 10.2 Run the world + SITL
-
-Terminal A (Linux):
+Camera-bridge deps (one time) + our models on the resource path +
+both QR textures (same PNG content, two model homes):
 
 ```bash
-gz sim -v4 -r iris_runway.sdf
+sudo apt install python3-gz-transport13 python3-gz-msgs10 python3-pil
+cd mission_pi
+source .venv/bin/activate && pip install qrcode pillow   # texture gen only
+python tools/make_qr_panel.py --text MISSION-QR-001 \
+    --out sim/models/qr_panel_big/materials/textures/qr.png
+python tools/make_qr_panel.py --text MISSION-QR-001 \
+    --out sim/models/qr_panel_a3/materials/textures/qr.png
+echo "export GZ_SIM_RESOURCE_PATH=$PWD/sim/models:\${GZ_SIM_RESOURCE_PATH}" >> ~/.bashrc
+source ~/.bashrc
 ```
 
-Terminal B (Linux) — note `--model JSON` + frame `gazebo-iris`, same
-no-MAVProxy two-port trick as §6:
+### 10.2 Run day — four terminals + MP + UI
+
+Terminal A — the world (Linux, ~30 s to load):
+
+```bash
+cd mission_pi
+gz sim -v4 -r sim/worlds/mission_world.sdf
+# want: iris on the ground at the origin, white QR panel ~8 m away on +X.
+# weak GPU? add -s (server only, no GUI window): sensors still publish.
+```
+
+Terminal B — SITL on the iris (Linux). Note `--model JSON` + frame
+`gazebo-iris`; same no-MAVProxy two-port trick as §6:
 
 ```bash
 cd ~/ardupilot
 Tools/autotest/sim_vehicle.py -v ArduCopter -f gazebo-iris --model JSON \
     --no-mavproxy
+# want: "Waiting for connection" + (after MP joins) the serial1 line.
 ```
 
-Then repeat §6(MP on 5760)-§8 unchanged: same mission, same
-`config.laptop.yaml`, webcam on the printed panel. The iris now flies
-in Gazebo with real physics while the full QR loop runs. (SITL talks
-to Gazebo over JSON on localhost — no extra config.)
-
-### 10.3 Put the QR panel in the world (for the human eye)
+Terminal C — the camera bridge (Linux, SYSTEM python3 — the gz
+bindings live outside the venv, so do NOT activate it here):
 
 ```bash
 cd mission_pi
-python tools/make_qr_panel.py --text MISSION-QR-001 \
-    --out sim/gazebo_qr_panel/materials/textures/qr.png
-echo 'export GZ_SIM_RESOURCE_PATH=$HOME/arena_ai_uploads/workspace-*/mission_pi/sim:${GZ_SIM_RESOURCE_PATH}' >> ~/.bashrc
-# fix the * to your real middle dir name, then:
-source ~/.bashrc
+python3 tools/gz_cam_bridge.py --port 8099
+# want: subscribe /iris/front/image -> OK, /iris/bottom/image -> OK,
+#        then "front: N frames age=0.0x" log lines.
 ```
 
-Then either drag `qr_panel_a3` from the Insert tab onto the runway
-(~8-10 m from the iris), or bake it into a world copy — exact block
-in `sim/WORLD_SNIPPET.sdf.txt`:
+Check the pictures BEFORE starting the mission (saves a wasted flight):
 
 ```bash
-cp ~/ardupilot_gazebo/worlds/iris_runway.sdf ~/mission_world.sdf
-# paste the <include> block inside <world>, then:
-gz sim -v4 -r ~/mission_world.sdf
+curl -s http://127.0.0.1:8099/health   # both ages < 1 s, sizes [1280, 720]
+# and in a browser:  http://127.0.0.1:8099/
+#   front pane = horizon/runway, bottom pane = ground + (after takeoff) panel.
 ```
 
-### 10.4 (Optional, advanced) Closed-loop Gazebo camera
+Terminal D — mission_pi on the sim cameras:
 
-Instead of the webcam, `mission_pi` can drink the simulated down-cam
-as an RTP/H.264 stream: add a camera + `GstCameraPlugin` (UDP 5600)
-to the iris model per the plugin README's "Streaming camera video"
-section, enable streaming on its topic, and point the bench cam at it:
-
-```yaml
-cameras:
-  bottom: { kind: url, backend: gstreamer, size: [1280, 720], hfov_deg: 90.0,
-    device: "udpsrc port=5600 caps=application/x-rtp,media=(string)video,clock-rate=(int)90000,encoding-name=(string)H264 ! rtph264depay ! avdec_h264 ! videoconvert ! appsink" }
+```bash
+cd mission_pi && source .venv/bin/activate
+python main.py --check --config config.gazebo.yaml
+# want: [fc] OK ... [cam] cam1: kind=url ... [cam] cam2: kind=url ...
+python main.py --config config.gazebo.yaml
 ```
 
-This is genuinely the full closed loop (sim pixels → sim motion), but
-model surgery + gstreamer plumbing is fiddly — do §10.2 first, treat
-this as a stretch goal. If the stream stutters, suspect CPU (software
-H.264 decode) before suspecting `mission_pi`.
+Then MP (connect 5760, Write WPs with the sprayer plan, Arm + Auto)
+and the UI (bridge up, page open, paste `http://<laptop-ip>:8000`,
+connect) exactly like §6-§8. The UI probe finds TWO cameras, so both
+tiles light up. From the trigger on, the loop is fully closed: sim
+pixels steer sim motion, and `QR:MISSION-QR-001` lands in MP Messages.
+
+### 10.3 The QR target (shipped in the world — nothing to drag)
+
+`mission_world.sdf` already includes the target at (8, 0) — inside the
+40x40 m home search box the mission flies without a fence. Two sizes
+ship; be honest about which one you are running:
+
+- `qr_panel_big` (594x840 mm, 2x-A3 linear) — DEFAULT. The classical
+  bench detector needs the code ~80+ px to decode; from 15 m this is
+  ~53 px (cue) growing past 100 px down the approach stair. First
+  closed-loop success runs on this panel.
+- `qr_panel_a3` (true 297x420 mm) — ~26 px from 15 m. The classical
+  detector will NOT reliably close the loop on it; it is the YOLO
+  model's graduation exam (see §11). Swap it in by uncommenting the
+  second `<include>` in `sim/worlds/mission_world.sdf`.
+
+Both textures were generated in §10.1. If the panel renders BLACK in
+Gazebo, the PNG is missing — re-run the two `make_qr_panel.py` lines.
+To move the target, edit the `<pose>` in the world's `<include>` block
+(x y z roll pitch yaw, metres) — keep it inside the search box and on
+flat ground (z = 0).
+
+### 10.4 How the video path works (and its knobs)
+
+- The iris carries two FIXED mounts (`front_cam_link` pitched 20° down,
+  `bottom_cam_link` straight down), each with a 1280x720 R8G8B8 camera
+  at 15 Hz publishing `/iris/front/image` + `/iris/bottom/image`
+  (explicit `<topic>` tags in `sim/models/iris_dualcam/model.sdf`, so
+  topic names never depend on world/model renames).
+- `tools/gz_cam_bridge.py` subscribes via the gz python bindings and
+  re-serves MJPEG at `:8099/front.mjpg` + `:8099/bottom.mjpg` (+ `/`
+  for humans, `/health` for scripts). No ROS, no GStreamer, no numpy.
+- `mission_pi` opens both as `url`/`mjpeg` cameras — plain OpenCV http
+  readers, the same code path the UI tiles already use.
+
+Knobs: sensor rate lives in the model's `<update_rate>` (15 Hz keeps a
+laptop happy next to SITL + detector; raise to 30 with headroom);
+bridge JPEG quality is `--jpeg-quality`; sim lens HFOV is 68° in both
+`model.sdf` (`<horizontal_fov>` 1.1868 rad) and `config.gazebo.yaml` —
+change both together or the approach geometry lies.
+
+Alternative (not needed): ardupilot_gazebo also ships a GStreamer RTP
+path ("Streaming camera video" in its README) that `mission_pi` can
+drink with `backend: gstreamer` — but that needs an OpenCV WITH
+GStreamer (apt `python3-opencv`, not pip) plus H.264 CPU. The MJPEG
+bridge above is the supported path; only revisit RTP if localhost
+bandwidth ever matters (it won't — the pixels never leave the laptop).
 
 ## 11. Moving to the Pi 5 (when the bench is green)
 

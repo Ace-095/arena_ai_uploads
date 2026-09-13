@@ -2,7 +2,8 @@
 <!--
   A3 QR panel (297 x 420 mm, lying flat) for Gazebo Harmonic + ogre2.
   Texture is read from model://qr_panel_a3/materials/textures/qr.png —
-  generate it with:  python tools/make_qr_panel.py --out sim/gazebo_qr_panel/materials/textures/qr.png
+  generate it with tools/make_qr_panel.py (out
+  sim/models/qr_panel_a3/materials/textures/qr.png).
 -->
 <sdf version="1.9">
   <model name="qr_panel_a3">

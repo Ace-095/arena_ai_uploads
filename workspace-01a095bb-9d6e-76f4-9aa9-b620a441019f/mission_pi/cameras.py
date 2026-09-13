@@ -365,6 +365,7 @@ class USBCamera(_BaseCamera):
                 "dshow": getattr(cv2, "CAP_DSHOW", cv2.CAP_ANY),
                 "msmf": getattr(cv2, "CAP_MSMF", cv2.CAP_ANY),
                 "ffmpeg": getattr(cv2, "CAP_FFMPEG", cv2.CAP_ANY),
+                "mjpeg": getattr(cv2, "CAP_FFMPEG", cv2.CAP_ANY),  # http mjpeg (Gazebo bridge)
                 "any": cv2.CAP_ANY}.get(self.backend or "any", cv2.CAP_ANY)
 
     def _open(self):

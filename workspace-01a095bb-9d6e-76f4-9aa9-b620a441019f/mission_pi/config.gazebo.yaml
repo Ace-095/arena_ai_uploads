@@ -1,0 +1,67 @@
+# Gazebo closed-loop config — Pop!_OS + SITL(gazebo-iris) + 2 sim cameras.
+# Run:  python3 main.py --config config.gazebo.yaml
+#
+# Topology for Gazebo runs (SIM_GUIDE.md section 10):
+#   gz sim (this laptop)   : sim/worlds/mission_world.sdf (iris_dualcam +
+#                            qr_target) publishes /iris/front/image and
+#                            /iris/bottom/image on gz-transport.
+#   gz_cam_bridge (T-C)    : re-serves both as MJPEG on :8099 (SYSTEM
+#                            python3, not the venv).
+#   SITL (this laptop)     : gazebo-iris JSON; MP takes TCP 5760,
+#                            mission_pi takes TCP 5762 (same as the bench).
+#   mission_pi cameras     : cam1/front + cam2/bottom over http MJPEG —
+#                            the UI shows both tiles, like two webcams.
+#   UI                     : http://<this-laptop-ip>:8000
+
+server: { host: 0.0.0.0, port: 8000 }
+
+fc:
+  conn: "tcp:127.0.0.1:5762"   # SITL serial1 spare MAVLink port (same as bench)
+
+cameras:
+  # Sim lenses are 68 deg (model.sdf) to match the bench geometry math.
+  front: { kind: url, backend: mjpeg, size: [1280, 720], hfov_deg: 68.0,
+           rotation_deg: 0, jpeg_quality: 80,
+           device: "http://127.0.0.1:8099/front.mjpg" }
+  bottom: { kind: url, backend: mjpeg, size: [1280, 720], hfov_deg: 68.0,
+            rotation_deg: 0, jpeg_quality: 80,
+            device: "http://127.0.0.1:8099/bottom.mjpg" }
+  # backend mjpeg = ffmpeg http reader. If a tile stays dark, open the
+  #   MJPEG URL in a browser first: dark there = bridge/Gazebo problem
+  #   (topics? `gz topic -l | grep -i image`), live there = mission_pi
+  #   problem (see SIM_GUIDE.md section 10).
+
+detector:
+  kind: classical            # laptop has no Hailo; stock YOLO knows no QR class
+  conf_thr: 0.35
+  iou_thr: 0.5
+  tile_bottom: true          # skipped automatically for classical
+  tile_grid: [3, 3]
+  full_decode_every_n: 5
+  cue_frames: 2
+
+decode:
+  required_streak: 3
+  miss_tolerance: 1
+
+mission:
+  sweep_alt_m: 15.0
+  approach_stair_m: [12.0, 9.0, 7.0]
+  grid_overlap: 0.5
+  yaw_steps: 12
+  yaw_settle_s: 1.0
+  trigger_timeout_s: 900
+  search_timeout_s: 240
+  approach_timeout_s: 240
+  min_batt_pct: 0            # SITL battery game is silly; don't failsafe on it
+  arrive_m: 2.0
+  post_action: RTL
+  trigger_seq: null
+  trigger_cmds: [216, 222, 223, 42600]
+  trigger_require_auto: true
+  trigger_peek_ahead: false
+  nofence_half_m: 20.0       # no fence: cover a 40x40 m home box (QR at 8,0)
+
+relay:
+  interval_s: 2.0
+  window_s: 15.0
