@@ -226,3 +226,18 @@ button.dim-btn { background: transparent; color: var(--text-dim); border-style: 
   #app { grid-template-columns: 320px 1fr; }
   .cam-view { width: 240px; height: 180px; }
 }
+
+/* ---- UI v2 additions ---- */
+.camctls { margin-top: 6px; }
+.camctls.hidden { display: none; }
+#tabCam1.on, #tabCam2.on { border-color: #ffb020; color: #ffb020; }
+.logbox.short { max-height: 110px; }
+.maphint { cursor: pointer; }
+.maphint:hover { text-decoration: underline; }
+#mapBar { position: absolute; left: 8px; bottom: 8px; z-index: 500; display: flex; gap: 8px; align-items: center; background: rgba(10,14,20,.82); padding: 4px 8px; border-radius: 6px; border: 1px solid #2a3342; }
+#mapBar select { background: #131a26; color: #dfe6f2; border: 1px solid #2a3342; border-radius: 4px; padding: 2px 6px; }
+#mapWrap { position: relative; }
+.badge.ok { border-color: #5fd97a; color: #5fd97a; }
+.lr.ERROR .lt, .lr.ERROR { color: #ff7b7b; }
+.lr.WARN .ll { color: #ffb020; }
+.lr.MP .ll { color: #7ab8ff; }

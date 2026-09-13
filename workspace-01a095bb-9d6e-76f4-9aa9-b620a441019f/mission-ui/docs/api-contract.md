@@ -1,94 +1,171 @@
-# API CONTRACT — Mission Companion (v1)
+# API CONTRACT — Mission Companion (v2)
 
-> Single source of truth. The **UI**, the **Pi backend (workstream 2)** and the **mock**
-> (`bridge/mp_bridge.py --mock`) all implement/consume THIS contract.
-> Nothing here is copied from hehe as-is — hehe shapes are the starting point, re-specified
-> deliberately. Every item is re-verified on bench/SITL before it is trusted.
+> Single source of truth. The **UI**, the **Pi backend (workstream 2)** and the
+> **mock** (`bridge/mp_bridge.py --mock`) all implement/consume THIS contract.
+> v2 change: the laptop has no radio — Mission Planner owns the telemetry link
+> and forwards MAVLink to the bridge over UDP. Nothing here is trusted until
+> bench/SITL-verified (see `our-mission.md` §6).
 
 ## Roles
 
-- **PI** (Raspberry Pi 5, competition): owns MAVLink (USB), camera, search/FSM, fence upload.
-  Serves this contract on `:8000` (FastAPI or otherwise — transport is the contract, not the
-  framework).
-- **BRIDGE** (Windows 11 laptop): `mp_bridge.py`, stdlib-only, `:8100`. Serves the UI, tails
-  MP logs, extracts QR messages, provides manual-entry fallback. In `--mock` mode it ALSO
-  implements the full PI contract (demo/test target).
-- **UI** (browser on laptop): consumes PI (WS + REST, over router/LTE) and BRIDGE (same origin,
-  always available).
+```
+Pixhawk <==telemetry radio==> Mission Planner <==UDP 14551==> BRIDGE ==> UI (SSE)
+   ^                               (the head: arm/home/plan)      |
+   |                                                              | serves UI, tails MP log, serves tiles
+Pi 5 (search FSM, cameras, QR) <==WS receive-only==> UI (mission brain panel)
+```
 
-## Transport notes
+- **FC** (Pixhawk + ArduCopter): flight truth. Inclusion fence, plan, DO_SPRAYER.
+- **MP** (Mission Planner, laptop): the head — arming, home, plan upload,
+  DO_SPRAYER trigger. Forwards MAVLink to the bridge (UDP, **Write access**).
+- **BRIDGE** (this repo, laptop): GCS client (sysid 255) on UDP `:14551`, UI
+  host, MP-log tail, MBTiles server. Owns telemetry / fence / plan / console
+  data for the UI.
+- **PI** (Pi 5): mission brain — search FSM, dual cameras, QR decode. The UI's
+  Pi link is **receive-only** except camera tuning (no MAVLink path exists for
+  libcamera controls).
+- **UI** (browser): fence drawing → bridge → MP → FC; live everything.
 
-- UI→PI REST: plain `fetch` JSON. Errors: `{ "detail": "..." }` with 4xx/5xx.
-- UI→PI WS: `ws(s)://PI/ws/telemetry`. Envelope JSON objects, one per message.
-  **On connect, PI replays the latest envelope per channel** (reconnect resync).
-- UI→BRIDGE SSE: `GET /api/mp/stream` (same origin). `event: <name>\ndata: <json>\n\n`.
-- All timestamps `t` = unix seconds (float).
+## Transports
 
-## Channels / envelopes (WS `/ws/telemetry`)
-
-| channel | rate | data |
+| path | endpoint | direction |
 |---|---|---|
-| `telemetry` | ≤5 Hz | `{lat, lon, alt_rel, alt_msl, vx, vy, vz, hdg, attitude:{roll,pitch,yaw}, mode, armed, gps:{fix, sats}, battery:{v, pct}}` |
-| `system` | 1 Hz | `{cpu, ram, ram_used_mb, ram_total_mb, disk, temp_c, freq_mhz, uptime_s, network:{router:"up|down", lte:"up|down"}}` |
-| `event` | as happens | `{type, value}` — types: `fsm_state`, `qr_decoded`, `fence_updated`, `target_detected`, `mission_result`, `plan_synced`, `abort`, `link_up`, `link_down` |
-| `qr` | 1 Hz | `{streak, required, payload, confirmed, bbox:{x,y,w,h}, source}` |
-| `fsm` | on change | `{state, previous, reason, armable, link_healthy, plan:{items, trigger_seq, synced}, payload}` |
-| `fence` | on change | `GeofenceStatus` (below) |
-| `log` | as happens | `{level:"INFO|WARN|ERROR", msg}` |
+| Pi WS | `ws://<pi>:8000/ws/telemetry` | Pi → UI (envelopes `{channel, t, data}`) |
+| Pi REST | `http://<pi>:8000/...` | UI → Pi (camera tuning only) + status reads |
+| Bridge REST | same origin `/api/mp/*`, `/tiles/*` | UI ↔ bridge |
+| Bridge SSE | same origin `/api/mp/stream` | bridge → UI (all channels) |
+| MAVLink | UDP `:14551`, GCS sysid 255 | bridge ↔ MP ↔ FC |
 
-### FSM states (PI-driven; MP is the mission head — PI never arms)
+v1's Pi `telemetry` / `fence` WS channels are **gone** — flight truth is
+bridge-owned now. The UI ignores them if a stale Pi still sends them.
 
-`IDLE → PLAN_SYNC → WAITING_TRIGGER → SEARCH → TARGET_FOUND → DESCEND → DECODED → TRANSMIT → RTL → LAND → COMPLETE`
-+ `FAILSAFE` (from any in-mission state; abort/manual/safety).
-Handover trigger = plan's DO_SPRAYER item detected via `MISSION_CURRENT` (see ui-spec §5).
+## Pi WS channels (`{channel, t, data}`)
 
-### GeofenceStatus
+- `system`: `{temp_c, cpu_pct, mem_pct, disk_pct, uptime_s}`
+- `fsm`: `{state, reason?, acknowledged?{by, reason}}`
+  (mock may send `{from, to, reason}` — UI reads `state ?? to`)
+- `qr`: `{payload, streak?, required?, confirmed?}`
+- `event`: `{type, ...}` — `target_detected {bbox, confidence, lat, lon}`,
+  `qr_decoded {payload, altitude_m}`, `mission_result {payload, routes}`,
+  `plan_synced {items, trigger_seq}`, `abort {from}`
+- `log`: `{level, msg}`
 
-`{loaded, confirmed, reason, vertex_count, area_m2, max_radius_m,
-   centroid_enu:{x,y}, origin_lat, origin_lon, vertices_latlon:[{lat,lon}]}`
-- `confirmed` = readback on FC matched (1e-7° tolerance). UI lamp: green only when `loaded && confirmed`.
-- No fence ⇒ search must not run (fail-closed). Search area = this polygon.
+The mock replays a short history burst on every WS connect.
 
-## PI REST endpoints
+## Pi REST v2 (`http://<pi>:8000`)
 
-| Method | Path | Notes |
+| method | path | body → reply |
 |---|---|---|
-| GET | `/health` | `{"status":"ok"}` |
-| POST | `/api/geofence` | `{vertices:[{lat,lon}...]}` 3–255 → `GeofenceStatus`. PI uploads to FC (mission_type=FENCE), readback-verifies, enables fence, sends `STATUSTEXT "FENCE: n verts, readback OK"`. 503 = FC unreachable, 500 = fence op failed, 400 = validation. |
-| GET | `/api/geofence` | cached `GeofenceStatus` |
-| DELETE | `/api/geofence` | clear on FC + locally |
-| GET | `/api/fsm/status` | `fsm` envelope data |
-| POST | `/api/fsm/abort` | FAILSAFE → RTL. Works pre-mission too. |
-| POST | `/api/fsm/start` | **debug only** (force handover now; labeled as such in UI) |
-| GET | `/api/qr/status` | `qr` envelope data |
-| GET | `/api/camera/status` | `{mode, active, controls:{exposure_us, gain, af_mode, brightness, contrast, saturation, sharpness, adaptive}}` |
-| POST | `/api/camera/controls` | subset of controls fields → applied via `Picamera2.set_controls` (libcamera: `ExposureTime`, `AnalogueGain`, `AfMode`, `Brightness`, `Contrast`, `Saturation`, `Sharpness`); returns full controls |
-| GET | `/api/camera/frame/cam1` | latest frame, `image/jpeg` (polling fallback when WebRTC unavailable) |
-| WS | `/ws/webrtc/cam1` | optional WebRTC signaling (`{type:"offer",sdp}` → `{type:"answer",sdp}` / `{type:"error"}`); UI must fall back to frame polling on any failure |
-| GET | `/tiles/{z}/{x}/{y}.png` | offline MBTiles (XYZ), 404 when absent |
+| GET | `/health` | `{status, uptime_s, ...}` |
+| GET | `/api/fsm/status` | `{state, acknowledged, ...}` |
+| POST | `/api/fsm/start` | `{}` → started |
+| POST | `/api/fsm/abort` | `{}` → aborted (debug only) |
+| GET | `/api/qr/status` | `{payload, streak, required, confirmed}` |
+| GET/POST | `/api/camera/status` | `{cam?}` → `{cam, model, controls}` |
+| POST | `/api/camera/controls` | `{cam, exposure_us, gain_db, af_mode, adaptive, brightness, contrast, saturation, sharpness}` → `{ok, cam, controls}` |
+| GET | `/api/camera/frame/cam1` `/api/camera/frame/cam2` | JPEG snapshot bytes (mock: SVG) |
+| WS | `/ws/webrtc/cam1` `/ws/webrtc/cam2` | optional WebRTC; UI falls back to polling |
 
-**QR result delivery (3 routes, all shown in UI with receipts):**
-1. PI → Pixhawk → **STATUSTEXT `QR:<payload>`** → MP message console (1st priority; retried 2 s / 15 s window).
-2. PI → WS `event mission_result` + `qr` channel → UI (needs router/LTE).
-3. BRIDGE tails MP logs / manual entry → UI (needs NO uplink).
+There is **no** `/api/geofence` on the Pi in v2 — the fence travels
+UI → bridge → MP → FC over MAVLink.
 
-## BRIDGE REST/SSE endpoints (laptop, `:8100`)
+## Bridge REST (same origin as the UI)
 
-| Method | Path | Notes |
+| method | path | body → reply |
 |---|---|---|
-| GET | `/` + static | the UI (offline-safe; Leaflet vendored locally) |
-| GET | `/api/mp/state` | `{qr:{payload, source, ts, line} | null, last_line, watching:[...], bin_parser_available:bool}` |
-| GET | `/api/mp/stream` | SSE. events: `mp-line {line,ts,source}`, `mp-qr {payload,source,ts,line}`, `bridge-state {watching, ...}`. In `--mock` mode ALSO `pi <envelope>` (mirrors the mock PI's WS stream). |
-| POST | `/api/mp/qr` | `{payload:"42"}` manual entry → emits `mp-qr {source:"manual"}`. Accepts 1–6 alnum. |
-| POST | `/api/mp/watch` | `{path:"C:\\..."}` add watched file/dir (text tail; .bin if pymavlink present) |
+| GET | `/api/mp/state` | bridge-state snapshot (below) |
+| GET | `/api/mp/tiles-info` | `{available, path, zmin, zmax, count, bounds}` |
+| GET | `/tiles/{z}/{x}/{y}.png` | tile bytes, else 404 `{error}` |
+| GET/POST | `/api/mp/mavlink` | mavlink-state / `{port}` → rebind + state |
+| POST/DELETE | `/api/mp/fence` | `{vertices:[{lat,lon}], mission_type:'fence', fence_action?}` → GeofenceStatus |
+| GET | `/api/mp/plan` | plan (fresh read from FC) |
+| POST | `/api/mp/mode` | `{mode:'RTL'|'LAND'}` → `{status, mode}` |
+| POST | `/api/mp/param` | `{name}` → `{name, value}` |
+| POST | `/api/mp/qr` | `{payload}` → `{payload, source:'manual'}` |
+| POST | `/api/mp/watch` | `{path}` → `{watching}` |
+| POST | `/api/mp/mock/restart` | `{}` → `{ok:true}` (mock only) |
 
-MP log QR extraction: pattern `QR:<payload>` (case-insensitive) in any watched text stream
-(matches the STATUSTEXT we send); in .bin via pymavlink DFReader `MESSAGE` records (optional dep).
+`bridge-state`: `{watching, qr, bin_parser_available, mock, mavlink{connected,
+port, vehicle_sysid, mode, armed}, tiles{...}, uptime_s}`
 
-## Invariants (carry into every implementation)
+`mavlink-state`: `{connected, port, gcs_sysid, vehicle_sysid, vehicle_type,
+mode, mode_num, armed, vehicle_state, hb_age_s, rx_msgs, rx_rate, fence, plan}`
 
-1. No hardcoded venue coordinates in any component; search area = runtime fence polygon.
-2. Fail-closed: no fence ⇒ no search; no trigger ⇒ no handover; PI never arms.
-3. Router/LTE status is informational — the radio (MP link) is the mission path.
-4. PI fence readback must match before `confirmed=true`.
-5. UI must be fully usable offline (vendored assets; OSM tiles need internet, grid/map still work).
+`telemetry` (≤5 Hz): `{lat, lon, alt_rel, alt_msl, vx, vy, vz, hdg,
+attitude{roll,pitch,yaw}|null, mode, mode_num, armed, gps{fix,sats}|null,
+battery{v,pct,current_a}|null, mission{seq,total}|null}`
+
+`GeofenceStatus`: `{loaded, confirmed, reason, vertex_count, area_m2,
+max_radius_m, centroid_enu{x,y}, origin_lat, origin_lon,
+vertices_latlon[{lat,lon}]}`
+
+`plan`: `{items:[{seq, command, lat, lon, alt_m}], total, do_sprayer_seq|null,
+synced, ts}`
+
+## Bridge SSE (`GET /api/mp/stream`)
+
+Events: `bridge-state`, `mavlink-state`, `fence`, `plan`, `telemetry`,
+`mp-console {line, ts, severity}` (FC STATUSTEXT),
+`mp-line {line, ts, source}` (tailed MP log file),
+`mp-qr {payload, source, ts, line}` (`mavlink` | filename | `manual`),
+`log {level, msg}`, `keepalive {ts}`.
+In `--mock` the Pi channels (`system`, `event`, `qr`, `fsm`, `log`) are relayed
+on the same stream; the UI only uses them when its Pi WS is down.
+First burst on connect: `bridge-state` + `mavlink-state` (+ `fence`/`plan`
+if known).
+
+## MAVLink bridge (bridge ↔ MP ↔ FC)
+
+- Transport: UDP `:14551` (rebindable), GCS sysid 255, one frame per datagram,
+  replies to last-seen sender. No signing. Heartbeat 1 Hz.
+- IN: `HEARTBEAT` (mode/armed, liveness 2.5 s), `GLOBAL_POSITION_INT`,
+  `ATTITUDE`, `GPS_RAW_INT`, `BATTERY_STATUS`/`SYS_STATUS`, `MISSION_CURRENT`,
+  `MISSION_ITEM_REACHED`, `FENCE_STATUS` (breach → ERROR log), `PARAM_VALUE`,
+  `STATUSTEXT` → `mp-console` (+ `QR[:\s]+([A-Za-z0-9]{1,6})` → `mp-qr`).
+- OUT: fence upload (`MISSION_COUNT`/`MISSION_ITEM_INT`, mission_type 8,
+  `MAV_CMD_NAV_FENCE_POLYGON_VERTEX_INCLUSION` = 5001, frame GLOBAL,
+  **param1 = vertex_count on every item**), readback verify (1e-7° ≈ 1 cm),
+  `FENCE_ENABLE=1` + `FENCE_ACTION` + `FENCE_TYPE|=0x4`,
+  `MISSION_REQUEST_LIST` (plan + DO_SPRAYER=310 discovery),
+  `PARAM_REQUEST_READ`/`PARAM_SET`, `COMMAND_LONG DO_SET_MODE` (**RTL/LAND
+  only** — arming/takeoff stay in MP), `STATUSTEXT` notices.
+- Discipline (ported from validated hehe logic): **subscribe-before-send** on
+  every request/response pair; the UI never sends arm/takeoff/mission-write.
+
+## QR — 4 independent routes
+
+| route | path | needs |
+|---|---|---|
+| pi-ws | Pi → UI socket | Pi network |
+| mavlink | Pi → Pixhawk → radio → MP forward → bridge STATUSTEXT parse | MP link |
+| mp-log | MP log file → bridge tail → UI | watch path set |
+| manual | operator types payload into UI | always |
+
+First payload wins the display; all four receipts are timestamped in the QR card.
+
+## Tiles (offline-first)
+
+- The bridge serves MBTiles at `/tiles/{z}/{x}/{y}.png` with XYZ→TMS row flip
+  (`y' = 2^z − 1 − y`); 404 JSON when the pack/zoom is missing.
+- Build a venue pack (needs net ONCE): `tools/fetch_tiles.py --bbox minlon,minlat,maxlon,maxlat
+  --zoom-min 15 --zoom-max 19 --out venue.mbtiles`, then run with
+  `--mbtiles venue.mbtiles`.
+- UI source order: `offline-mbtiles` (default when `tiles-info.available`) →
+  `osm` → `carto-dark`, with auto-switch on tile-error streaks. Leaflet is
+  vendored — no CDN at the venue.
+
+## UI invariants
+
+1. Flight truth comes ONLY from bridge SSE (never the Pi).
+2. The Pi link is receive-only except camera tuning.
+3. A fence counts as applied only with `loaded && confirmed` (FC readback).
+4. The only flight commands are RTL/LAND via the MP link.
+5. Map + grid work fully offline (vendored Leaflet + local pack).
+
+## Changelog
+
+- **v2 (2026-09-13)**: MP-forwarded MAVLink replaces the Pi radio path; Pi WS
+  drops `telemetry`/`fence`; fence/plan/telemetry/console are bridge SSE;
+  dual cameras with live controls; fixed-anchor culled meter grid; vendored
+  Leaflet; QR gains the `mavlink` STATUSTEXT route (4 total).
+- v1: initial contract — Pi owned MAVLink/fence over USB, 3 QR routes.

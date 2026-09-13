@@ -217,3 +217,37 @@ Windows 11 laptop (zero pip installs). It:
   MP's Fence tab on next read → `.lap` export as fallback. No second link / no extra hardware.
 - **D2 — After decode + transmit = full auto (confirmed).** Pi does **RTL → LAND** itself
   (hehe behavior). Hands-free end-to-end; user only manages up to the DO_SPRAYER trigger.
+
+## 10. v2 rebuild (2026-09-13) — MP-forwarded MAVLink
+
+The laptop has no radio of its own, so v1's "Pi owns MAVLink over USB" path is
+replaced: **Mission Planner owns the telemetry link and forwards MAVLink over
+UDP (Write access) to the bridge**, which acts as a GCS (sysid 255) and serves
+the UI over SSE.
+
+- **D1 SUPERSEDED.** Fence path is now UI → bridge → MP → FC over MAVLink
+  (mission_type 8, cmd 5001, readback verify, `FENCE_ENABLE/ACTION/TYPE`), not
+  UI → Pi → Pixhawk. The `.lap` export stays as manual fallback.
+- **D2 unchanged** (Pi-side auto RTL→LAND after decode+transmit is workstream 2
+  scope); the UI keeps its own ABORT→RTL button, now sent as DO_SET_MODE via
+  the MP link. Arming/takeoff/mission control stay in MP, always.
+- Backend recovered from upstream patch onto `arena/01a09bbf-arena-ai-uploads`:
+  stdlib MAVLink v2 codec (`bridge/_mavlink_v2.py` + `_mavtable_gen.py`),
+  GCS client (`bridge/mav_client.py`), mock FC (`bridge/mock_fc.py`),
+  rewritten bridge (`bridge/mp_bridge.py`), codec test + table generator.
+  Verified: 23/23 byte-identical + SELFTEST PASS.
+- Pi link is WS **receive-only** (fsm/system/qr/events); the UI's sole write
+  path to the Pi is camera tuning (no MAVLink path exists for libcamera).
+- Map: offline MBTiles default (bridge `/tiles`, XYZ→TMS flip) → OSM →
+  Carto-dark; **Leaflet vendored** (`vendor/leaflet/`) — zero network needed.
+- Meter grid fixed: frozen anchor (boot centre; fence origin wins; re-anchor
+  button), canvas renderer, viewport culling (cap ~280 lines), auto-coarsen
+  1→2→5→10→20→50→100 m, click-hint zoom-to-grid, live draw-area readout.
+- Dual cameras CAM1 (Pi Cam 3) + CAM2 (IMX477): WebRTC→polling fallback each,
+  shared enlarge modal, per-cam **live** controls (debounced, no Apply).
+- QR: 4 routes (pi-ws, mavlink STATUSTEXT, mp-log file, manual) with receipt
+  timestamps; new MP-console panel shows FC STATUSTEXT live.
+- Fence counts as applied only with `loaded && confirmed` (FC readback);
+  armable = MAVLink link + confirmed fence.
+- Docs: `mission-ui/docs/api-contract.md` v2, `mission-ui/README.md` v2
+  runbook. Bench list lives in the README open items.

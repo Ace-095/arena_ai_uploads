@@ -1,57 +1,112 @@
-// links.js — Pi WebSocket client + local bridge SSE client
-// Envelope schema: docs/api-contract.md
+/* links.js — UI v2 transports.
+ *
+ * Two links, both receive-heavy:
+ *  1) Pi WS  (ws[s]://<pi>/ws/telemetry): mission/fsm/system/qr/event/log
+ *     envelopes {channel, t, data}. Mission-ui NEVER sends flight data here.
+ *  2) Bridge SSE (/api/mp/stream, same origin as this page): every hub
+ *     channel — bridge-owned (mavlink-state, fence, plan, telemetry,
+ *     mp-line, mp-qr, mp-console, bridge-state, log, keepalive) plus Pi
+ *     channels relayed in mock mode (system, event, qr, fsm, log).
+ */
+(function () {
+'use strict';
 
-const CHANNELS = ['telemetry', 'system', 'fsm', 'qr', 'fence', 'log', 'event'];
+function initPiLink(o) {
+  const st = { ws: null, retry: 0, url: '', opened: false,
+               timer: null, openedAt: 0, lastMsgAt: 0 };
 
-// ---------------- Pi link (WS) ----------------
-export function initPiLink(handlers) {
-  let ws = null, timer = null, stopped = true;
-
-  function connect() {
-    const url = handlers.getPiUrl();
-    if (!url || stopped) return;
-    stopped = false;
-    try { ws = new WebSocket(url.replace(/^http/, 'ws') + '/ws/telemetry'); }
-    catch { handlers.onStatus('error'); schedule(); return; }
-    ws.onopen = () => { handlers.onStatus('connected'); };
-    ws.onmessage = (ev) => {
-      try {
-        const m = JSON.parse(ev.data);
-        if (m && m.channel) handlers.onEnvelope(m);
-      } catch { /* non-envelope (e.g. pong) */ }
+  function status() {
+    return {
+      connected: !!st.ws && st.ws.readyState === 1,
+      url: st.url,
+      retry: st.retry,
+      uptime_s: st.opened ? Math.round((Date.now() - st.openedAt) / 1000) : 0,
+      last_msg_age_s: st.opened && st.lastMsgAt ? Math.round((Date.now() - st.lastMsgAt) / 1000) : null,
     };
-    ws.onclose = () => { handlers.onStatus('disconnected'); schedule(); };
-    ws.onerror = () => { try { ws.close(); } catch { /* ignore */ } };
+  }
+
+  function wsUrl(httpUrl) {
+    const u = httpUrl.replace(/\/$/, '');
+    return (u.startsWith('https') ? u.replace(/^https/, 'wss') : u.replace(/^http/, 'ws')) + '/ws/telemetry';
   }
 
   function schedule() {
-    if (stopped || timer) return;
-    timer = setTimeout(() => { timer = null; connect(); }, 2000);
+    if (st.timer) return;
+    st.retry += 1;
+    const wait = Math.min(20000, 1000 * Math.pow(2, Math.min(st.retry, 5)));
+    o.onStatus && o.onStatus(status());
+    st.timer = setTimeout(() => { st.timer = null; if (st.url) connect(st.url); }, wait);
   }
 
-  return {
-    connect,
-    reconnect() { try { ws && ws.close(); } catch { /* ignore */ } connect(); },
-    stop() { stopped = true; clearTimeout(timer); timer = null; try { ws && ws.close(); } catch { /* ignore */ } },
-    get connected() { return !!(ws && ws.readyState === 1); },
-  };
+  function connect(httpUrl) {
+    st.url = httpUrl;
+    close(false);
+    let sock;
+    try { sock = new WebSocket(wsUrl(httpUrl)); } catch (e) { schedule(); return; }
+    st.ws = sock;
+    sock.onopen = () => {
+      st.retry = 0; st.opened = true; st.openedAt = Date.now(); st.lastMsgAt = 0;
+      o.onStatus && o.onStatus(status());
+      o.onLog && o.onLog('INFO', 'pi ws open: ' + wsUrl(httpUrl));
+    };
+    sock.onmessage = (ev) => {
+      st.lastMsgAt = Date.now();
+      let env;
+      try { env = JSON.parse(ev.data); } catch (e) { return; }
+      o.onEnvelope && o.onEnvelope(env);
+    };
+    sock.onerror = () => { try { sock.close(); } catch (e) { /* noop */ } };
+    sock.onclose = () => {
+      if (st.ws !== sock) return;
+      st.ws = null; st.opened = false;
+      o.onStatus && o.onStatus(status());
+      o.onLog && o.onLog('WARN', 'pi ws closed (retry ' + (st.retry + 1) + ')');
+      if (st.url) schedule();
+    };
+  }
+
+  function close(clearUrl) {
+    if (st.timer) { clearTimeout(st.timer); st.timer = null; }
+    if (st.ws) { const s = st.ws; st.ws = null; try { s.close(); } catch (e) { /* noop */ } }
+    st.opened = false;
+    if (clearUrl) st.url = '';
+  }
+
+  return { connect, close, status };
 }
 
-// ---------------- Bridge link (SSE, same origin) ----------------
-export function initBridge(handlers) {
-  const es = new EventSource('/api/mp/stream');
-  const fwd = (name) => es.addEventListener(name, (e) => {
-    try {
-      const d = JSON.parse(e.data);
-      if (name === 'mp-line') handlers.onMpLine(d);
-      else if (name === 'mp-qr') handlers.onMpQr(d);
-      else if (name === 'bridge-state') handlers.onBridgeState(d);
-      else if (name === 'keepalive') { handlers.onBridgeStatus(true); return; }
-      else handlers.onPiSse({ channel: name, t: d.ts || Date.now() / 1000, data: d });
-    } catch { /* ignore */ }
-  });
-  CHANNELS.concat(['mp-line', 'mp-qr', 'bridge-state', 'keepalive']).forEach(fwd);
-  es.onopen = () => handlers.onBridgeStatus(true);
-  es.onerror = () => handlers.onBridgeStatus(false); // EventSource auto-reconnects
-  return es;
+function initBridge(o) {
+  const SSE_MAP = {
+    'mp-line': 'onMpLine', 'mp-qr': 'onMpQr', 'mp-console': 'onMpConsole',
+    'bridge-state': 'onBridgeState', 'mavlink-state': 'onMavState',
+    'fence': 'onFence', 'plan': 'onPlan', 'telemetry': 'onTelemetry',
+    // Pi channels relayed over the same SSE in mock mode:
+    'system': 'onPiSse', 'event': 'onPiSse', 'qr': 'onPiSse',
+    'fsm': 'onPiSse', 'log': 'onPiSse',
+  };
+  let es = null;
+
+  function connect(base) {
+    disconnect();
+    const url = (base || '').replace(/\/$/, '') + '/api/mp/stream';
+    try { es = new EventSource(url); } catch (e) { return; }
+    es.addEventListener('keepalive', () => { o.onBridgeStatus && o.onBridgeStatus(true); });
+    Object.keys(SSE_MAP).forEach((ev) => {
+      es.addEventListener(ev, (m) => {
+        let d;
+        try { d = JSON.parse(m.data); } catch (e) { return; }
+        o.onBridgeStatus && o.onBridgeStatus(true);
+        const fn = o[SSE_MAP[ev]];
+        if (fn) fn(d, ev);
+      });
+    });
+    es.onerror = () => { o.onBridgeStatus && o.onBridgeStatus(false); };
+  }
+
+  function disconnect() { if (es) { try { es.close(); } catch (e) { /* noop */ } es = null; } }
+
+  return { connect, disconnect };
 }
+
+window.MissionLinks = { initPiLink, initBridge };
+})();

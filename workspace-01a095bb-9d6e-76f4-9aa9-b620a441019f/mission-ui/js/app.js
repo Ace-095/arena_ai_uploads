@@ -1,463 +1,522 @@
-// app.js — Mission Companion: state, wiring, panels
-import { initMap } from './map.js';
-import { initPiLink, initBridge } from './links.js';
-import { initCamera } from './camera.js';
-import { latlonToEnu, polyAreaM2, centroid, maxRadiusFrom } from './geo.js';
+/* app.js — UI v2 wiring.
+ *
+ * Data ownership (ui-spec v2):
+ *  - flight truth (telemetry, mode, fence, plan, battery, MP console): the
+ *    BRIDGE, sourced from MAVLink forwarded by Mission Planner (SSE).
+ *  - mission brain (fsm, system, Pi QR receipts, target events): the PI
+ *    (WebSocket, receive-only).
+ *  - OUT to FC: fence upload/clear, RTL/LAND mode, param read — all through
+ *    the bridge's MP link. OUT to Pi: camera tuning only (no MAVLink path).
+ */
+(function () {
+'use strict';
 
 const $ = (id) => document.getElementById(id);
-const escapeHtml = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-const nowStr = () => new Date().toTimeString().slice(0, 8);
-const fmt = (v, d = 2, suf = '') => (v == null || isNaN(v)) ? '—' : Number(v).toFixed(d) + suf;
+const nowStr = () => new Date().toLocaleTimeString('en-GB');
+const fmtInt = (n) => Math.round(n).toLocaleString('en-US').replace(/,/g, ' ');
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
-const FSM_ORDER = ['IDLE', 'PLAN_SYNC', 'WAITING_TRIGGER', 'SEARCH', 'TARGET_FOUND', 'DESCEND',
-  'DECODED', 'TRANSMIT', 'RTL', 'LAND', 'COMPLETE', 'FAILSAFE'];
-
-// ---------------- state ----------------
 const S = {
-  piUrl: localStorage.getItem('mc_pi_url') || '',
-  isMock: false,
-  fence: null,
-  qr: { payload: null, streak: 0, required: 3, confirmed: false },
-  receipts: { pi: null, mp: null, man: null },
+  piUrl: '', isMock: false, bridgeOk: false,
+  pi: { connected: false },
+  mav: null, fence: null, plan: null, fsm: null,
+  qr: { payload: '', streak: 0, required: 3, confirmed: false },
+  receipts: { pi: '', mavlink: '', mpfile: '', manual: '' },
   logs: [],
 };
 
-// ---------------- logging ----------------
-function renderLogLine(ts, level, src, msg, box = $('logBox')) {
-  const filter = $('logFilter').value.toLowerCase();
-  if (filter && !(String(msg).toLowerCase().includes(filter) || level.toLowerCase().includes(filter) || src.toLowerCase().includes(filter))) return;
-  const d = document.createElement('div');
-  d.className = 'ln';
-  d.innerHTML = `<span class="ts">${ts}</span><span class="${level === 'MP' ? 'MP' : level}">[${src}]</span> ${escapeHtml(msg)}`;
-  box.appendChild(d);
-  while (box.children.length > 500) box.removeChild(box.firstChild);
-  if (box.scrollTop > box.scrollHeight - box.clientHeight - 30) box.scrollTop = box.scrollHeight;
+let map = null, pi = null, bridge = null, cams = null;
+
+// ---------------------------------------------------------------- logs --
+function log(level, msg) {
+  S.logs.push({ ts: nowStr(), level, msg: String(msg) });
+  if (S.logs.length > 500) S.logs.splice(0, S.logs.length - 500);
+  renderLogs();
 }
 
-function log(level, src, msg) {
-  const ts = nowStr();
-  S.logs.push({ ts, level, src, msg });
-  if (S.logs.length > 800) S.logs.shift();
-  renderLogLine(ts, level, src, msg);
-}
-
-function renderAllLogs() {
+function renderLogs() {
+  const f = $('logFilter').value;
   const box = $('logBox');
-  box.innerHTML = '';
-  S.logs.forEach((l) => renderLogLine(l.ts, l.level, l.src, l.msg));
+  box.innerHTML = S.logs
+    .filter((l) => !f || l.level === f)
+    .map((l) => '<div class="lr ' + l.level + '"><span class="lt">' + l.ts + '</span> ' +
+      '<span class="ll">' + l.level + '</span> ' + esc(l.msg) + '</div>')
+    .join('');
   box.scrollTop = box.scrollHeight;
 }
 
-// ---------------- API helpers ----------------
-async function api(method, path, body) {
-  const r = await fetch(S.piUrl + path, {
-    method,
-    headers: body ? { 'Content-Type': 'application/json' } : undefined,
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  let j = null;
-  try { j = await r.json(); } catch { /* no body */ }
-  if (!r.ok) throw new Error((j && j.detail) || `HTTP ${r.status}`);
-  return j;
-}
-const apiGet = (p) => api('GET', p);
-const apiPost = (p, b) => api('POST', p, b || {});
-const apiDel = (p) => api('DELETE', p);
-
-// ---------------- panel renderers ----------------
-function setLamp(id, on, warn = false) {
+function setLamp(id, on) {
   const el = $(id);
-  el.className = 'lamp ' + (on ? (warn ? 'warn' : 'on') : 'off');
+  el.classList.toggle('on', !!on);
+  el.classList.toggle('off', !on);
 }
 
-function renderTelemetry(t) {
-  if (!t) return;
-  $('tLat').textContent = fmt(t.lat, 7);
-  $('tLon').textContent = fmt(t.lon, 7);
-  $('tAlt').textContent = `${fmt(t.alt_rel, 1, ' m')} / ${fmt(t.alt_msl, 1, ' m')}`;
-  $('tMode').textContent = `${t.mode || '—'} / ${t.armed ? 'ARMED' : 'disarmed'}`;
-  $('tVel').textContent = t.vx != null ? `${fmt(t.vx, 1)}, ${fmt(t.vy, 1)}, ${fmt(t.vz, 1)}` : '—';
-  if (t.attitude) $('tAtt').textContent = `${fmt(t.attitude.roll, 1)}°, ${fmt(t.attitude.pitch, 1)}°, ${fmt(t.attitude.yaw, 1)}°`;
-  if (t.gps) $('tGps').textContent = `fix ${t.gps.fix ?? '—'} · ${t.gps.sats ?? '—'} sats`;
-  if (t.battery) $('tBat').textContent = `${fmt(t.battery.v, 2, ' V')} ${t.battery.pct != null ? `· ${t.battery.pct}%` : ''}`;
+// ------------------------------------------------------- bridge-owned --
+function renderTelemetry(d) {
+  $('tLatLon').textContent = d.lat.toFixed(7) + ' / ' + d.lon.toFixed(7);
+  $('tAlt').textContent = d.alt_rel.toFixed(1) + ' / ' + d.alt_msl.toFixed(1) + ' m';
+  $('tMode').textContent = (d.mode || '—') + (d.armed ? ' · ARMED' : '');
+  const sp = Math.hypot(d.vx || 0, d.vy || 0);
+  $('tVel').textContent = sp.toFixed(1) + ' m/s (vz ' + (d.vz != null ? d.vz.toFixed(1) : '—') + ')';
+  $('tAtt').textContent = d.attitude
+    ? d.attitude.roll.toFixed(1) + ' / ' + d.attitude.pitch.toFixed(1) + ' / ' + d.attitude.yaw.toFixed(1) : '—';
+  $('tGps').textContent = d.gps ? ('fix ' + d.gps.fix + ' / ' + d.gps.sats + ' sats') : '—';
+  $('tBatt').textContent = d.battery
+    ? ((d.battery.v != null ? d.battery.v.toFixed(1) + ' V' : '—') +
+       (d.battery.pct != null ? ' · ' + d.battery.pct + '%' : '') +
+       (d.battery.current_a != null ? ' · ' + d.battery.current_a.toFixed(1) + ' A' : '')) : '—';
+  $('tMis').textContent = d.mission ? ('seq ' + d.mission.seq + ' / ' + (d.mission.total || '?')) : '—';
+  if (map) map.setDrone(d.lat, d.lon, d.hdg);
 }
 
-function renderSystem(s) {
-  if (!s) return;
-  $('sysBadge').textContent = 'live';
-  $('sysBadge').className = 'badge ok';
-  $('sCpu').textContent = `${fmt(s.cpu, 0, '%')} / ${fmt(s.temp_c, 1, '°C')}`;
-  $('sRam').textContent = s.ram != null ? `${fmt(s.ram, 0, '%')} (${(s.ram_used_mb / 1024).toFixed(1)}/${(s.ram_total_mb / 1024).toFixed(1)} GB)` : '—';
-  $('sDisk').textContent = `${fmt(s.disk, 0, '%')} / ${fmt(s.freq_mhz, 0, ' MHz')}`;
-  if (s.uptime_s != null) {
-    const h = Math.floor(s.uptime_s / 3600), m = Math.floor((s.uptime_s % 3600) / 60);
-    $('sUp').textContent = `${h}h ${m}m`;
+function renderMav(d) {
+  S.mav = d;
+  const b = $('mavBadge');
+  b.textContent = d.connected ? ('CONNECTED · ' + (d.mode || '?')) : 'DISCONNECTED';
+  b.classList.toggle('ok', !!d.connected);
+  setLamp('lampMav', d.connected);
+  $('mavVeh').textContent = d.vehicle_sysid != null
+    ? ('sysid ' + d.vehicle_sysid + ' / type ' + d.vehicle_type) : '—';
+  $('mavMode').textContent = (d.mode || '—') + (d.armed ? ' · ARMED' : '') +
+    (d.hb_age_s != null ? ' · hb ' + d.hb_age_s + 's ago' : '');
+  $('mavRx').textContent = d.rx_rate + ' msg/s · ' + fmtInt(d.rx_msgs) + ' total · :' + d.port;
+  renderPlan(S.plan || d.plan);
+  renderArmable();
+}
+
+function renderFence(d) {
+  S.fence = d;
+  if (!d) {
+    $('fState').textContent = '—'; $('fReadback').textContent = '—';
+    $('fVerts').textContent = '—'; $('fArea').textContent = '—';
+    $('fRadius').textContent = '—'; $('fOrigin').textContent = '—';
+    return;
   }
-  if (s.network) {
-    const r = s.network.router === 'up', l = s.network.lte === 'up';
-    const el = $('sNet');
-    el.textContent = `${r ? 'router ●' : 'router ○'}  ${l ? 'lte ●' : 'lte ○'}`;
-    el.style.color = (r || l) ? 'var(--green)' : 'var(--text-dim)';
+  $('fState').textContent = d.loaded ? 'LOADED on FC' : 'not loaded';
+  $('fState').style.color = d.loaded ? (d.confirmed ? '#5fd97a' : '#ffb020') : '';
+  $('fReadback').textContent = d.loaded ? (d.confirmed ? 'MATCH ✓' : 'MISMATCH ✗') : '—';
+  $('fVerts').textContent = d.vertex_count != null ? d.vertex_count : '—';
+  $('fArea').textContent = d.area_m2 != null ? fmtInt(d.area_m2) + ' m²' : '—';
+  $('fRadius').textContent = d.max_radius_m != null ? d.max_radius_m + ' m' : '—';
+  $('fOrigin').textContent = (d.origin_lat != null)
+    ? (d.origin_lat.toFixed(5) + ', ' + d.origin_lon.toFixed(5)) : '—';
+  if (d.reason) log(d.confirmed ? 'INFO' : 'WARN', 'fence: ' + d.reason);
+  if (map) {
+    const verts = (d.vertices_latlon || []).map((v) => [v.lat, v.lon]);
+    map.setFence(verts);
+    if (d.origin_lat != null) map.setOrigin(d.origin_lat, d.origin_lon);
+  }
+  renderArmable();
+}
+
+function renderPlan(p) {
+  if (p) S.plan = p;
+  p = S.plan;
+  const txt = !p ? '—'
+    : (p.synced ? (p.total + ' items' + (p.do_sprayer_seq != null ? ' · sprayer trig #' + p.do_sprayer_seq : ' · no sprayer cmd'))
+      : 'empty');
+  $('planInfo').textContent = txt;
+  $('mavPlan').textContent = txt;
+}
+
+function renderArmable() {
+  const ok = !!(S.mav && S.mav.connected && S.fence && S.fence.loaded && S.fence.confirmed);
+  const el = $('armableInfo');
+  el.textContent = ok ? 'YES — fence confirmed on FC' : 'NO — need MAVLink link + confirmed fence';
+  el.style.color = ok ? '#5fd97a' : '#ff6b6b';
+}
+
+function renderBridgeState(d) {
+  S.isMock = !!d.mock;
+  $('mockBadge').classList.toggle('hidden', !d.mock);
+  $('piMode').textContent = d.mock ? 'mock (bridge loopback)' : 'real';
+  $('watchInfo').textContent = d.watching || '—';
+  if (d.qr && d.qr.payload && !S.qr.payload) {
+    S.qr.payload = d.qr.payload;
+    $('qrPayload').textContent = d.qr.payload;
+    log('INFO', 'QR already latched on bridge: ' + d.qr.payload);
+  }
+  if (d.mavlink) {
+    // lightweight summary until the first full mavlink-state arrives
+    if (!S.mav) {
+      $('mavBadge').textContent = d.mavlink.connected ? 'CONNECTED' : 'DISCONNECTED';
+      setLamp('lampMav', d.mavlink.connected);
+    }
+  }
+  if (d.tiles) {
+    log('INFO', 'tiles: ' + (d.tiles.available
+      ? (d.tiles.count + ' tiles z' + d.tiles.zmin + '–' + d.tiles.zmax) : 'OFFLINE PACK MISSING'));
   }
 }
 
-function renderFsm(f) {
-  if (!f) return;
-  const st = $('fsmState');
-  st.textContent = f.state || '—';
-  st.className = 'fsm-state ' + ({
-    FAILSAFE: 'bad', COMPLETE: 'good',
-    DECODED: 'good', TRANSMIT: 'good',
-  }[f.state] || (['IDLE', 'PLAN_SYNC', 'WAITING_TRIGGER'].includes(f.state) ? '' : 'run'));
-  $('fsmReason').textContent = f.reason || (f.state || 'waiting for Pi…');
-  $('fsmBadge').textContent = f.state || '—';
-  $('fsmBadge').className = 'badge ' + (f.state === 'FAILSAFE' ? 'bad' : (f.state === 'COMPLETE' ? 'ok' : 'cyan'));
-  $('armableInfo').textContent = f.armable ? 'YES' : 'no';
-  $('planInfo').textContent = f.plan && f.plan.synced
-    ? `${f.plan.items} items · trigger #${f.plan.trigger_seq} ✓` : 'not synced';
-  const chips = $('fsmChips');
-  chips.innerHTML = '';
-  FSM_ORDER.forEach((s) => {
-    const c = document.createElement('span');
-    c.textContent = s;
-    if (s === f.state) c.className = (s === 'FAILSAFE') ? 'fail' : 'cur';
-    else if (s === f.previous) c.className = 'pv';
-    chips.appendChild(c);
-  });
+function renderMpConsole(m) {
+  const box = $('mpConsole');
+  const div = document.createElement('div');
+  div.className = 'lr' + (m.severity <= 2 ? ' ERROR' : '');
+  div.innerHTML = '<span class="lt">' + nowStr() + '</span> ' + esc(m.line);
+  box.appendChild(div);
+  while (box.children.length > 100) box.removeChild(box.firstChild);
+  box.scrollTop = box.scrollHeight;
+  if (m.severity <= 2) log('ERROR', '[FC] ' + m.line);
 }
 
-function renderQrQ(q) {
-  if (!q) return;
-  S.qr.streak = q.streak || 0;
-  S.qr.required = q.required || 3;
-  if (q.confirmed && q.payload) { S.qr.payload = q.payload; S.qr.confirmed = true; }
-  renderQr();
+function onMpQr(m) {
+  const t = nowStr();
+  if (m.source === 'mavlink') { S.receipts.mavlink = t; $('qrSrcMav').textContent = t; }
+  else if (m.source === 'manual') { S.receipts.manual = t; $('qrSrcMan').textContent = t; }
+  else { S.receipts.mpfile = t; $('qrSrcMp').textContent = t + ' (' + m.source + ')'; }
+  if (m.payload && !S.qr.payload) {
+    S.qr.payload = m.payload;
+    $('qrPayload').textContent = m.payload;
+  }
+  log('WARN', 'QR via ' + m.source + ': ' + m.payload);
 }
 
-function renderQr() {
-  const dots = $('qrStreak').children;
-  for (let i = 0; i < 3; i++) {
-    dots[i].className = (S.qr.confirmed || i < S.qr.streak) ? (S.qr.confirmed ? 'max' : 'on') : '';
-  }
-  const box = $('qrPayload');
-  if (S.qr.payload) {
-    box.textContent = S.qr.payload;
-    box.classList.add('ok');
-    $('qrBadge').textContent = 'decoded';
-    $('qrBadge').className = 'badge ok';
-  } else {
-    $('qrBadge').textContent = S.qr.streak ? `streak ${S.qr.streak}/3` : 'awaiting';
-    $('qrBadge').className = 'badge ' + (S.qr.streak ? 'warn' : 'idle');
-  }
-  $('qrSrcPi').textContent = S.receipts.pi ? `✓ ${S.qr.payload || ''} @ ${S.receipts.pi}` : '—';
-  $('qrSrcMp').textContent = S.receipts.mp ? `✓ ${S.qr.payload || ''} @ ${S.receipts.mp}` : '—';
-  $('qrSrcMan').textContent = S.receipts.man ? `✓ @ ${S.receipts.man}` : '—';
+// ----------------------------------------------------------- pi-owned --
+function renderSystem(d) {
+  if (d.temp_c != null) $('sTemp').textContent = d.temp_c.toFixed(1) + ' °C';
+  else if (d.temp != null) $('sTemp').textContent = d.temp + ' °C';
+  const cpu = d.cpu_pct != null ? d.cpu_pct : d.cpu;
+  const mem = d.mem_pct != null ? d.mem_pct : d.mem;
+  if (cpu != null || mem != null)
+    $('sCpu').textContent = (cpu != null ? cpu.toFixed(0) + '%' : '?') + ' / ' + (mem != null ? mem.toFixed(0) + '%' : '?');
+  if (d.disk_pct != null) $('sDisk').textContent = d.disk_pct.toFixed(0) + '%';
+  else if (d.disk != null) $('sDisk').textContent = d.disk + '%';
+  if (d.uptime_s != null) $('sUp').textContent = Math.floor(d.uptime_s / 60) + 'm ' + Math.floor(d.uptime_s % 60) + 's';
 }
 
-function renderFence(st) {
-  if (!st) return;
-  S.fence = st;
-  const badge = $('fenceBadge');
-  if (st.loaded && st.vertices_latlon && st.vertices_latlon.length) {
-    badge.textContent = st.confirmed ? 'on FC ✓' : 'MISMATCH';
-    badge.className = 'badge ' + (st.confirmed ? 'ok' : 'bad');
-    $('fenceState').textContent = st.reason || 'loaded';
-    $('fenceState').style.color = st.confirmed ? 'var(--green)' : 'var(--red)';
-    $('fenceReadback').textContent = st.confirmed ? 'matched' : 'MISMATCH';
-    $('fenceVerts').textContent = st.vertex_count;
-    $('fenceArea').textContent = st.area_m2 != null ? `${Math.round(st.area_m2)} m²` : '—';
-    $('fenceRadius').textContent = st.max_radius_m != null ? `${st.max_radius_m.toFixed(1)} m` : '—';
-    $('fenceOrigin').textContent = st.origin_lat != null ? `${st.origin_lat.toFixed(6)}, ${st.origin_lon.toFixed(6)}` : '—';
-  } else {
-    badge.textContent = 'none';
-    badge.className = 'badge idle';
-    $('fenceState').textContent = st.reason || 'no fence loaded';
-    $('fenceState').style.color = '';
-    ['fenceReadback', 'fenceVerts', 'fenceArea', 'fenceRadius', 'fenceOrigin'].forEach((id) => $(id).textContent = '—');
-  }
-  map.setFence(st);
-  if (st.origin_lat != null) map.setOrigin(st.origin_lat, st.origin_lon);
+function renderFsm(d) {
+  S.fsm = d;
+  const state = d.state || d.to || '?';
+  const reason = d.reason || (d.acknowledged && (d.acknowledged.reason || d.acknowledged.by)) || '—';
+  $('fsmBadge').textContent = state;
+  $('fsmState').textContent = state;
+  $('fsmReason').textContent = reason;
 }
 
-// ---------------- events ----------------
-function onEvent(d) {
-  const v = d.value || {};
-  switch (d.type) {
-    case 'fsm_state':
-      log('INFO', 'PI', `FSM ${v.from} -> ${v.to}${v.reason ? ' | ' + v.reason : ''}`);
-      break;
-    case 'qr_decoded':
-      S.receipts.pi = S.receipts.pi || nowStr();
-      if (!S.qr.payload) { S.qr.payload = v.payload; S.qr.confirmed = true; renderQr(); }
-      log('WARN', 'PI', `QR decoded via PI (WS): ${v.payload}`);
-      break;
-    case 'mission_result':
-      S.receipts.pi = S.receipts.pi || nowStr();
-      if (!S.qr.payload && v.payload) { S.qr.payload = v.payload; S.qr.confirmed = true; renderQr(); }
-      log('WARN', 'PI', `mission result via PI: ${v.payload}`);
-      break;
-    case 'target_detected':
-      map.setTarget(true);
-      log('INFO', 'PI', `target detected (confidence ${v.confidence ?? '?'})`);
-      break;
-    case 'fence_updated':
-      log('INFO', 'PI', 'fence state updated on FC');
-      break;
-    case 'plan_synced':
-      log('INFO', 'PI', `plan synced: ${v.items} items, DO_SPRAYER trigger seq ${v.trigger_seq}`);
-      break;
-    case 'abort':
-      log('WARN', 'PI', `abort from Pi (was ${v.from})`);
-      break;
-    default:
-      log('INFO', 'PI', `event: ${d.type}`);
+function renderQrUpdate(d) {
+  if (d.payload) {
+    S.qr.payload = d.payload;
+    $('qrPayload').textContent = d.payload;
   }
+  if (d.streak != null) S.qr.streak = d.streak;
+  else if (d.count != null) S.qr.streak = d.count;
+  if (d.required != null) S.qr.required = d.required;
+  S.qr.confirmed = d.confirmed != null ? !!d.confirmed : (S.qr.streak >= S.qr.required && S.qr.streak > 0);
+  $('qrStreak').textContent = S.qr.streak + ' / ' + S.qr.required + (S.qr.confirmed ? ' ✓' : '');
+  S.receipts.pi = nowStr();
+  $('qrSrcPi').textContent = S.receipts.pi;
+}
+
+function renderEvent(d) {
+  const t = d.type || d.event || '';
+  if (/target/i.test(t)) {
+    const lat = d.lat != null ? d.lat : d.latitude, lon = d.lon != null ? d.lon : d.longitude;
+    if (map && lat != null) map.setTarget(lat, lon);
+    log('WARN', 'target: ' + (d.confidence != null ? Math.round(d.confidence * 100) + '% ' : '') +
+      (lat != null ? ('@ ' + lat.toFixed(5) + ', ' + lon.toFixed(5)) : '(no fix)'));
+    return;
+  }
+  if (d.payload) {
+    renderQrUpdate(d);
+    log('WARN', 'QR via pi-ws: ' + d.payload);
+    return;
+  }
+  if (/mission_result/i.test(t)) {
+    log('INFO', 'mission result: ' + (d.routes ? d.routes.length + ' routes' : JSON.stringify(d).slice(0, 200)));
+    return;
+  }
+  if (/abort/i.test(t)) { log('ERROR', 'ABORT from Pi: ' + (d.reason || d.from || '')); return; }
+  log('INFO', '[event] ' + (t || JSON.stringify(d).slice(0, 160)));
 }
 
 function onEnvelope(env) {
+  if (!env || !env.channel) return;
   const d = env.data || {};
   switch (env.channel) {
-    case 'telemetry': renderTelemetry(d); map.setDrone(d); break;
     case 'system': renderSystem(d); break;
+    case 'event': renderEvent(d); break;
+    case 'qr': renderQrUpdate(d); log('WARN', 'QR via pi-ws: ' + (d.payload || '?')); break;
     case 'fsm': renderFsm(d); break;
-    case 'qr': renderQrQ(d); break;
-    case 'fence': renderFence(d); break;
-    case 'log': if (d.msg) log(d.level || 'INFO', 'PI', d.msg); break;
-    case 'event': onEvent(d); break;
+    case 'log': log(d.level || 'INFO', d.msg || JSON.stringify(d).slice(0, 200)); break;
+    default: break; // bridge-owned channels also arrive on WS in mock — ignore, SSE handles them
   }
 }
 
-// ---------------- map ----------------
-const map = initMap((msg) => log('INFO', 'MAP', msg));
+// ------------------------------------------------- camera live controls --
+const CAMS = [{ id: 'cam1', p: 'c1' }, { id: 'cam2', p: 'c2' }];
+const camTimers = {};
 
-// ---------------- Pi link ----------------
-let pi = null;
-pi = initPiLink({
-  getPiUrl: () => S.piUrl,
-  onEnvelope,
-  onStatus(s) {
-    $('piWs').textContent = s;
-    setLamp('lampPi', s === 'connected');
-    if (s === 'connected') {
-      log('INFO', 'UI', `Pi WS connected (${S.piUrl})`);
-      $('mockBadge').hidden = !S.isMock;
-    } else if (s !== 'disconnected') {
-      /* keep log quiet for transient reconnects */
-    }
-  },
-});
-
-// ---------------- Bridge link ----------------
-initBridge({
-  onEnvelope,
-  // SSE also mirrors the mock Pi's stream; use it only when the direct WS is down
-  onPiSse(env) { if (!pi.connected) onEnvelope(env); },
-  onMpLine(d) { if (d.line) log('MP', 'MP', String(d.line).slice(0, 200)); },
-  onMpQr(d) {
-    S.receipts.mp = nowStr();
-    if (!S.qr.payload && d.payload) { S.qr.payload = d.payload; S.qr.confirmed = true; renderQr(); }
-    log('WARN', 'MP', `QR via MP log bridge (source: ${d.source}): ${d.payload} — no router/LTE needed`);
-  },
-  onBridgeState(st) {
-    S.isMock = !!st.mock;
-    $('mockBadge').hidden = !st.mock;
-    $('btnRestartMock').hidden = !st.mock;
-    $('mpWatch').textContent = st.watching && st.watching.length ? st.watching.join(', ') : 'none';
-    $('mpDfr').textContent = st.bin_parser_available ? 'available' : 'not installed (optional)';
-    if (st.mock && !S.piUrl) {
-      S.piUrl = location.origin;
-      $('piUrl').value = S.piUrl;
-      log('INFO', 'UI', `mock Pi detected at ${S.piUrl} — auto-connecting`);
-      pi.connect();
-      camera.start();
-    }
-  },
-  onBridgeStatus(up) {
-    setLamp('lampBridge', up);
-    if (up) log('INFO', 'UI', 'MP log bridge connected (local)');
-  },
-});
-
-// ---------------- camera ----------------
-const camera = initCamera({ getPiUrl: () => S.piUrl });
-
-// ---------------- wiring: map tile source ----------------
-$('selTile').addEventListener('change', (e) => map.setTileSourceByName(e.target.value));
-
-// ---------------- wiring: Pi link ----------------
-function connectPi() {
-  const v = $('piUrl').value.trim();
-  if (v) { S.piUrl = v; localStorage.setItem('mc_pi_url', v); }
-  $('piMode').textContent = S.piUrl ? (S.isMock ? 'mock (same host)' : 'live') : '—';
-  if (!S.piUrl) { log('WARN', 'UI', 'No Pi URL set — enter the Pi address (e.g. http://192.168.1.50:8000)'); return; }
-  pi.connect();
-  camera.start();
-}
-$('btnPiConnect').addEventListener('click', connectPi);
-$('piUrl').addEventListener('change', connectPi);
-
-// ---------------- wiring: fence ----------------
-let drawing = false;
-$('btnDraw').addEventListener('click', () => {
-  drawing = !drawing;
-  map.setDrawing(drawing);
-  $('btnDraw').textContent = drawing ? 'Stop drawing' : 'Start drawing';
-  log('INFO', 'UI', drawing ? 'fence drawing ON — click the map to add points' : 'fence drawing off');
-});
-$('btnUndoV').addEventListener('click', () => map.undoVertex());
-$('btnClearV').addEventListener('click', () => { map.clearVertices(); log('INFO', 'UI', 'drawing cleared'); });
-$('selGrid').addEventListener('change', () => log('INFO', 'UI', `grid spacing: ${$('selGrid').value} m`));
-
-function busy(btnId, on, label) {
-  const b = $(btnId);
-  b.disabled = on;
-  b.dataset.label = b.dataset.label || b.textContent;
-  b.textContent = on ? label : (b.dataset.label || label);
+function setSlider(p, name, v) {
+  if (v == null) return;
+  const s = $(p + name);
+  if (s) { s.value = v; $(p + name + 'V').textContent = v; }
 }
 
-$('btnApplyFence').addEventListener('click', async () => {
-  const verts = map.getVertices();
-  if (verts.length < 3) { alert('Need at least 3 points to form a polygon fence.'); return; }
-  if (!S.piUrl) { alert('Set the Pi address first (or run the bridge with --mock).'); return; }
-  busy('btnApplyFence', true, 'Applying…');
-  try {
-    const st = await apiPost('/api/geofence', { vertices: verts });
-    renderFence(st);
-    log('WARN', 'UI', `FENCE APPLIED: ${st.vertex_count} verts, area ${Math.round(st.area_m2)} m², readback ${st.confirmed ? 'OK' : 'MISMATCH'} — search area = this polygon`);
-  } catch (e) {
-    log('ERROR', 'UI', 'fence apply failed: ' + e.message);
-  }
-  busy('btnApplyFence', false, 'Apply fence → Pi → FC');
-});
-
-$('btnClearFence').addEventListener('click', async () => {
+function seedCamControls() {
   if (!S.piUrl) return;
-  try {
-    const st = await apiDel('/api/geofence');
-    renderFence(st);
-    log('INFO', 'UI', 'fence cleared on FC + locally');
-  } catch (e) { log('ERROR', 'UI', 'fence clear failed: ' + e.message); }
-});
-
-$('btnExportLap').addEventListener('click', () => {
-  const verts = (S.fence && S.fence.vertices_latlon && S.fence.vertices_latlon.length)
-    ? S.fence.vertices_latlon : map.getVertices();
-  if (!verts.length) { alert('No fence vertices to export.'); return; }
-  const n = verts.length;
-  const lines = verts.map((v) =>
-    `WPL,0,5001,26,${n},0,0,0,${v.lat.toFixed(7)},${v.lon.toFixed(7)},0,0,0,0,0,0,0`);
-  const txt = ['# Mission Companion fence export',
-    '# cmd 5001 = NAV_FENCE_POLYGON_VERTEX_INCLUSION, frame 26 = fence, p1 = vertex count (every row)',
-    '# NEED TEST: load via MP "Load Mission" and confirm the fence tab shows the polygon',
-    ...lines, ''].join('\n');
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(new Blob([txt], { type: 'text/plain' }));
-  a.download = 'geofence.lap';
-  a.click();
-  URL.revokeObjectURL(a.href);
-  log('INFO', 'UI', `exported geofence.lap (${n} vertices) — load in MP as fallback path`);
-});
-
-// ---------------- wiring: telemetry/QR/system panels receive via onEnvelope ----------------
-
-// ---------------- wiring: QR ----------------
-function showPayload(p, srcName) {
-  if (!S.qr.payload && p) { S.qr.payload = p; S.qr.confirmed = true; }
-  renderQr();
-  log('WARN', srcName, `QR payload displayed: ${p}`);
+  CAMS.forEach((c) => {
+    postJson(S.piUrl + '/api/camera/status', { cam: c.id }).then((st) => {
+      if (!st || !st.controls) return;
+      const k = st.controls;
+      setSlider(c.p, 'Exp', k.exposure_us);
+      setSlider(c.p, 'Gain', k.gain_db != null ? k.gain_db : k.gain);
+      setSlider(c.p, 'Bri', k.brightness);
+      setSlider(c.p, 'Con', k.contrast);
+      setSlider(c.p, 'Sat', k.saturation);
+      setSlider(c.p, 'Sha', k.sharpness);
+      if (k.af_mode) $(c.p + 'Af').value = k.af_mode;
+      if (k.adaptive != null) $(c.p + 'Adapt').checked = !!k.adaptive;
+    }).catch(() => {});
+  });
 }
-$('btnManualQr').addEventListener('click', async () => {
-  const p = $('manualQr').value.trim();
-  if (!p) return;
-  try {
-    const r = await fetch('/api/mp/qr', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ payload: p }) });
-    if (!r.ok) throw new Error('bridge rejected');
-    S.receipts.man = nowStr();
-    showPayload(p, 'MANUAL');
-    $('manualQr').value = '';
-  } catch (e) { log('ERROR', 'UI', 'manual QR entry failed: ' + e.message); }
-});
 
-// ---------------- wiring: camera controls ----------------
-[['cExp', 'cExpV', v => v], ['cGain', 'cGainV', v => v], ['cBri', 'cBriV', v => Number(v).toFixed(2)],
- ['cCon', 'cConV', v => Number(v).toFixed(2)], ['cSat', 'cSatV', v => Number(v).toFixed(2)],
- ['cSha', 'cShaV', v => Number(v).toFixed(2)]].forEach(([id, vid, fmtFn]) => {
-  $(id).addEventListener('input', () => { $(vid).textContent = fmtFn($(id).value); });
-});
-$('btnCamApply').addEventListener('click', async () => {
-  if (!S.piUrl) { log('WARN', 'UI', 'camera settings: no Pi connected'); return; }
+function scheduleCamPush(camId, p) {
+  $(p + 'Live').textContent = 'sending…';
+  if (camTimers[camId]) clearTimeout(camTimers[camId]);
+  camTimers[camId] = setTimeout(() => pushCamControls(camId, p), 250);
+}
+
+function pushCamControls(camId, p) {
+  if (!S.piUrl) { $(p + 'Live').textContent = 'no Pi link'; return; }
   const body = {
-    exposure_us: parseInt($('cExp').value, 10),
-    gain: parseFloat($('cGain').value),
-    af_mode: $('cAf').value,
-    brightness: parseFloat($('cBri').value),
-    contrast: parseFloat($('cCon').value),
-    saturation: parseFloat($('cSat').value),
-    sharpness: parseFloat($('cSha').value),
-    adaptive: $('cAdaptive').checked,
+    cam: camId,
+    exposure_us: +$(p + 'Exp').value, gain_db: +$(p + 'Gain').value,
+    af_mode: $(p + 'Af').value, adaptive: $(p + 'Adapt').checked,
+    brightness: +$(p + 'Bri').value, contrast: +$(p + 'Con').value,
+    saturation: +$(p + 'Sat').value, sharpness: +$(p + 'Sha').value,
   };
-  try {
-    await apiPost('/api/camera/controls', body);
-    log('INFO', 'UI', `camera settings applied: exp=${body.exposure_us}µs gain=${body.gain} af=${body.af_mode} adaptive=${body.adaptive}`);
-    $('camCtlHint').textContent = 'applied ✓ (verify effect in feed — bench-test on Pi)';
-  } catch (e) { log('ERROR', 'UI', 'camera settings failed: ' + e.message); }
-});
-
-// ---------------- wiring: MP bridge panel ----------------
-$('btnWatch').addEventListener('click', async () => {
-  const p = $('watchPath').value.trim();
-  if (!p) return;
-  try {
-    const r = await fetch('/api/mp/watch', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: p }) });
-    const j = await r.json();
-    log('INFO', 'UI', `bridge now watching: ${j.watching.join(', ') || p}`);
-    $('watchPath').value = '';
-  } catch (e) { log('ERROR', 'UI', 'watch failed: ' + e.message); }
-});
-
-// ---------------- wiring: logs ----------------
-$('logFilter').addEventListener('input', renderAllLogs);
-$('btnLogClr').addEventListener('click', () => { S.logs = []; renderAllLogs(); });
-$('btnLogDl').addEventListener('click', () => {
-  const txt = S.logs.map((l) => `[${l.ts}] ${l.level} [${l.src}] ${l.msg}`).join('\n');
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(new Blob([txt], { type: 'text/plain' }));
-  a.download = 'mission-companion-log.txt';
-  a.click();
-  URL.revokeObjectURL(a.href);
-});
-
-// ---------------- wiring: controls ----------------
-$('btnAbort').addEventListener('click', async () => {
-  if (!S.piUrl) { log('WARN', 'UI', 'abort: no Pi connected'); return; }
-  if (!confirm('Abort the autonomous mission? Pi will go FAILSAFE → RTL.')) return;
-  try {
-    const st = await apiPost('/api/fsm/abort');
-    log('WARN', 'UI', `ABORT sent — Pi state: ${st.state}`);
-  } catch (e) { log('ERROR', 'UI', 'abort failed: ' + e.message); }
-});
-$('btnRestartMock').addEventListener('click', async () => {
-  try { await apiPost('/api/fsm/start'); log('INFO', 'UI', 'mock mission (re)started (debug)'); }
-  catch (e) { log('ERROR', 'UI', 'mock restart failed: ' + e.message); }
-});
-
-// ---------------- wiring: camera enlarge ----------------
-$('camView1').addEventListener('click', () => camera.openModal());
-$('modalClose').addEventListener('click', () => camera.closeModal());
-$('modalBg').addEventListener('click', () => camera.closeModal());
-document.addEventListener('keydown', (e) => { if (e.key === 'Escape') camera.closeModal(); });
-
-// ---------------- boot ----------------
-function tickClock() { $('clock').textContent = new Date().toLocaleTimeString(); }
-setInterval(tickClock, 1000);
-tickClock();
-
-$('piUrl').value = S.piUrl;
-log('INFO', 'UI', 'Mission Companion UI started — MP stays the mission head (arm/plan in MP)');
-if (S.piUrl) {
-  log('INFO', 'UI', `connecting Pi: ${S.piUrl}`);
-  pi.connect();
-  camera.start();
+  postJson(S.piUrl + '/api/camera/controls', body).then(() => {
+    $(p + 'Live').textContent = 'applied ✓ ' + nowStr();
+  }).catch((e) => {
+    $(p + 'Live').textContent = 'error: ' + e.message;
+    log('ERROR', camId + ' controls push failed: ' + e.message);
+  });
 }
-// if no Pi URL yet, the bridge's state (SSE, same origin) auto-connects us
-// when it reports mock mode; otherwise wait for the user to set the Pi address.
+
+// ------------------------------------------------------- fetch helpers --
+function postJson(url, body) {
+  return fetch(url, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body || {}),
+  }).then((r) => {
+    if (!r.ok) return r.text().then((t) => { throw new Error('HTTP ' + r.status + ': ' + t.slice(0, 200)); });
+    return r.json();
+  });
+}
+
+// ------------------------------------------------------------------ boot --
+function boot() {
+  setInterval(() => { $('clock').textContent = nowStr(); }, 1000);
+  $('clock').textContent = nowStr();
+  $('logFilter').addEventListener('change', renderLogs);
+  $('btnLogClear').addEventListener('click', () => { S.logs = []; renderLogs(); });
+  $('btnLogDownload').addEventListener('click', () => {
+    const blob = new Blob([S.logs.map((l) => l.ts + ' ' + l.level + ' ' + l.msg).join('\n')],
+      { type: 'text/plain' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = 'mission-ui.log'; a.click();
+  });
+  $('piUrl').value = window.location.origin;
+
+  // ---- map (tiles-info first so the offline pack is default when present) --
+  fetch('/api/mp/tiles-info').then((r) => r.json()).then((info) => {
+    map = window.MissionMap.initMap({
+      onLog: log,
+      tilesAvailable: !!(info && info.available),
+      tilesZmax: (info && info.zmax) || 18,
+    });
+    log('INFO', 'map ready (tiles: ' + (info && info.available ? 'offline pack' : 'online fallback') + ')');
+  }).catch((e) => {
+    map = window.MissionMap.initMap({ onLog: log, tilesAvailable: false });
+    log('WARN', 'tiles-info failed, online tiles: ' + e.message);
+  });
+
+  // ---- fence tools ----
+  $('btnDraw').addEventListener('click', () => {
+    if (!map) return;
+    const on = map.setDrawing($('btnDraw').classList.toggle('on'));
+    if (!on) $('btnDraw').classList.remove('on');
+  });
+  $('btnUndo').addEventListener('click', () => { map && map.undoVertex(); });
+  $('btnClearDraw').addEventListener('click', () => { map && map.clearVertices(); });
+  $('btnReanchor').addEventListener('click', () => { map && map.reanchorGrid(); });
+  $('btnFenceApply').addEventListener('click', () => {
+    if (!map) return;
+    const verts = map.getVertices();
+    if (verts.length < 3) { log('ERROR', 'fence needs ≥3 drawn vertices (have ' + verts.length + ')'); return; }
+    if (!window.confirm('Apply ' + verts.length + '-vertex fence via MP link to the FC?')) return;
+    postJson('/api/mp/fence', { vertices: verts, mission_type: 'fence', fence_action: null })
+      .then((st) => { renderFence(st); log('WARN', 'fence upload done: ' + st.vertex_count + ' verts, ' + (st.confirmed ? 'readback MATCH' : 'READBACK MISMATCH')); })
+      .catch((e) => log('ERROR', 'fence upload failed: ' + e.message));
+  });
+  $('btnFenceClear').addEventListener('click', () => {
+    if (!window.confirm('Clear the fence on the FC?')) return;
+    fetch('/api/mp/fence', { method: 'DELETE' }).then((r) => {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    }).then((st) => { renderFence(st); log('WARN', 'fence cleared on FC'); })
+      .catch((e) => log('ERROR', 'fence clear failed: ' + e.message));
+  });
+  $('btnExportLap').addEventListener('click', () => {
+    const verts = (S.fence && S.fence.vertices_latlon) || (map && map.getVertices()) || [];
+    if (!verts.length) { log('ERROR', 'nothing to export (no fence, no drawing)'); return; }
+    const txt = verts.map((v) => v.lat.toFixed(7) + ',' + v.lon.toFixed(7)).join('\n') + '\n';
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([txt], { type: 'text/plain' }));
+    a.download = 'fence.lap'; a.click();
+    log('INFO', 'exported ' + verts.length + ' verts to fence.lap');
+  });
+
+  // ---- MP link tools ----
+  $('btnMavPort').addEventListener('click', () => {
+    const port = parseInt($('mavPort').value, 10);
+    if (!port || port < 1 || port > 65535) { log('ERROR', 'bad UDP port'); return; }
+    postJson('/api/mp/mavlink', { port }).then((d) => log('INFO', 'MAVLink listener → port ' + d.port))
+      .catch((e) => log('ERROR', 'rebind failed: ' + e.message));
+  });
+  $('btnParam').addEventListener('click', () => {
+    const name = $('paramName').value.trim().toUpperCase();
+    if (!name) return;
+    $('paramVal').textContent = '…';
+    postJson('/api/mp/param', { name }).then((d) => {
+      $('paramVal').textContent = d.name + ' = ' + d.value;
+      log('INFO', 'param ' + d.name + ' = ' + d.value);
+    }).catch((e) => { $('paramVal').textContent = 'error'; log('ERROR', 'param read failed: ' + e.message); });
+  });
+
+  // ---- actions (via MP link) ----
+  $('btnAbort').addEventListener('click', () => {
+    if (!window.confirm('ABORT → send RTL to the vehicle via MP?')) return;
+    postJson('/api/mp/mode', { mode: 'RTL' })
+      .then((d) => log('WARN', 'RTL commanded (' + d.status + ')'))
+      .catch((e) => log('ERROR', 'RTL failed: ' + e.message));
+  });
+  $('btnLand').addEventListener('click', () => {
+    if (!window.confirm('Send LAND to the vehicle via MP?')) return;
+    postJson('/api/mp/mode', { mode: 'LAND' })
+      .then((d) => log('WARN', 'LAND commanded (' + d.status + ')'))
+      .catch((e) => log('ERROR', 'LAND failed: ' + e.message));
+  });
+  $('btnMockRestart').addEventListener('click', () => {
+    postJson('/api/mp/mock/restart', {}).then(() => log('INFO', 'mock scenario restarted'))
+      .catch((e) => log('ERROR', 'mock restart failed: ' + e.message));
+  });
+
+  // ---- QR manual + MP log watch ----
+  $('btnQrManual').addEventListener('click', () => {
+    const payload = $('qrManual').value.trim();
+    if (!payload) return;
+    postJson('/api/mp/qr', { payload }).then((d) => {
+      S.qr.payload = d.payload;
+      $('qrPayload').textContent = d.payload;
+      S.receipts.manual = nowStr();
+      $('qrSrcMan').textContent = S.receipts.manual;
+      log('WARN', 'manual QR latched: ' + d.payload);
+    }).catch((e) => log('ERROR', 'manual QR failed: ' + e.message));
+  });
+  $('btnWatch').addEventListener('click', () => {
+    const path = $('watchPath').value.trim();
+    if (!path) return;
+    postJson('/api/mp/watch', { path }).then((d) => {
+      $('watchInfo').textContent = d.watching || '—';
+      log('INFO', 'watching MP log: ' + d.watching);
+    }).catch((e) => log('ERROR', 'watch failed: ' + e.message));
+  });
+
+  // ---- links ----
+  pi = window.MissionLinks.initPiLink({
+    onStatus: (s) => {
+      S.pi.connected = s.connected;
+      $('piWs').textContent = s.connected
+        ? ('open · ' + s.url) : ('down · retry ' + s.retry);
+      setLamp('lampPi', s.connected);
+      $('btnPiConnect').textContent = s.connected ? 'disconnect' : 'connect';
+    },
+    onEnvelope,
+    onLog: log,
+  });
+  $('btnPiConnect').addEventListener('click', () => {
+    if (S.pi.connected) {
+      pi.close(true);
+      S.pi.connected = false;
+      $('piWs').textContent = 'closed by user';
+      setLamp('lampPi', false);
+      $('btnPiConnect').textContent = 'connect';
+      return;
+    }
+    S.piUrl = $('piUrl').value.trim().replace(/\/$/, '') || window.location.origin;
+    $('piUrl').value = S.piUrl;
+    pi.connect(S.piUrl);
+    seedCamControls();
+  });
+
+  bridge = window.MissionLinks.initBridge({
+    onBridgeStatus: (ok) => { S.bridgeOk = ok; setLamp('lampBridge', ok); },
+    onBridgeState: renderBridgeState,
+    onMavState: renderMav,
+    onFence: renderFence,
+    onPlan: renderPlan,
+    onTelemetry: (d) => { renderTelemetry(d); },
+    onMpLine: (m) => log('MP', '[' + (m.source || 'mp-log') + '] ' + m.line),
+    onMpQr,
+    onMpConsole: renderMpConsole,
+    onPiSse: (d, channel) => {
+      if (!S.pi.connected) onEnvelope({ channel, t: Date.now() / 1000, data: d });
+    },
+  });
+  bridge.connect('');
+
+  // ---- cameras ----
+  cams = window.MissionCameras.initCameras({
+    getPiUrl: () => S.piUrl,
+    onMode: (id, mode) => { $(id === 'cam1' ? 'c1Mode' : 'c2Mode').textContent = mode; },
+    onLatency: (id, ms) => { $(id === 'cam1' ? 'c1Lat' : 'c2Lat').textContent = ms; },
+    onStats: (id, t) => { $(id === 'cam1' ? 'camStats1' : 'camStats2').textContent = t; },
+    onHint: (id, t) => { $(id === 'cam1' ? 'camHint1' : 'camHint2').textContent = t; },
+    onLog: log,
+  });
+  $('tabCam1').addEventListener('click', () => {
+    $('tabCam1').classList.add('on'); $('tabCam2').classList.remove('on');
+    $('camCtls1').classList.remove('hidden'); $('camCtls2').classList.add('hidden');
+  });
+  $('tabCam2').addEventListener('click', () => {
+    $('tabCam2').classList.add('on'); $('tabCam1').classList.remove('on');
+    $('camCtls2').classList.remove('hidden'); $('camCtls1').classList.add('hidden');
+  });
+  CAMS.forEach((c) => {
+    ['Exp', 'Gain', 'Bri', 'Con', 'Sat', 'Sha'].forEach((name) => {
+      $(c.p + name).addEventListener('input', (e) => {
+        $(c.p + name + 'V').textContent = e.target.value;
+        scheduleCamPush(c.id, c.p);
+      });
+    });
+    $(c.p + 'Af').addEventListener('change', () => scheduleCamPush(c.id, c.p));
+    $(c.p + 'Adapt').addEventListener('change', () => scheduleCamPush(c.id, c.p));
+  });
+  $('btnModalCam1').addEventListener('click', () => cams.openModal('cam1'));
+  $('btnModalCam2').addEventListener('click', () => cams.openModal('cam2'));
+  $('btnModalClose').addEventListener('click', () => cams.closeModal());
+  $('btnPauseCam1').addEventListener('click', (e) => {
+    e.target.textContent = cams.togglePause('cam1') ? 'resume' : 'pause';
+  });
+  $('btnPauseCam2').addEventListener('click', (e) => {
+    e.target.textContent = cams.togglePause('cam2') ? 'resume' : 'pause';
+  });
+
+  // ---- map toolbar ----
+  $('selTile').addEventListener('change', (e) => { map && map.setTileSourceByName(e.target.value); });
+  $('mapHint').addEventListener('click', () => { map && map.zoomToGrid(); });
+
+  // ---- mock auto-connect (same origin serves UI + mock Pi + bridge) ----
+  S.piUrl = window.location.origin;
+  $('piUrl').value = S.piUrl;
+  pi.connect(S.piUrl);
+  cams.startCam('cam1');
+  cams.startCam('cam2');
+  seedCamControls();
+  log('INFO', 'mission-ui v2 boot: Pi WS + bridge SSE + cams starting on ' + S.piUrl);
+}
+
+document.addEventListener('DOMContentLoaded', boot);
+})();
