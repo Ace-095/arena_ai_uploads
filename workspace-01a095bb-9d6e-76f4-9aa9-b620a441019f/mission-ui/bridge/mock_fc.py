@@ -50,7 +50,7 @@ class VehicleState:
         self.hdg = 90.0
         self.vx = self.vy = self.vz = 0.0
         self.roll = self.pitch = 0.0
-        self.mode_num = M.MODE_STANDBY
+        self.mode_num = M.MODE_STABILIZE
         self.armed = False
         self.batt_v = 16.6
         self.batt_pct = 97

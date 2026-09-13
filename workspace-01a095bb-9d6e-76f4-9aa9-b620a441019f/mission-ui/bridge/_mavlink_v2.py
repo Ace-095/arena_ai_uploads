@@ -162,16 +162,19 @@ MAV_MODE_FLAG_SAFETY_ARMED = 128
 
 MAVLINK_MSG_ID_GPS_GLOBAL_ORIGIN = 49
 
-# ArduCopter custom modes (ArduPilot 4.x) — the subset a copter actually uses.
+# ArduCopter custom modes — authoritative: pymavlink v20 ardupilotmega
+# COPTER_MODE_* enum (+ POSITION/OF_LOITER: real in ArduPilot 4.x, absent
+# from that dialect snapshot; 12 was removed upstream, 29 is ENUM_END).
 ARDU_COPTER_MODES = {
-    0: "STANDBY", 1: "ACRO", 2: "TRAINING", 3: "LOITER", 4: "GUIDED",
-    5: "AUTO", 6: "RTL", 7: "CIRCLE", 8: "SPLIT_S", 9: "LAND",
-    11: "FLY_BY_WIRE_A", 12: "FLY_BY_WIRE_B", 13: "AUTO_TAKEOFF",
-    14: "AUTO_LAND", 15: "POSHOLD", 16: "BRAKE", 17: "AUTO_RTL",
-    18: "AUTO_TAKELAND", 19: "ZONE", 20: "SPORT", 21: "FUN", 22: "FPV",
-    23: "DRAFT_AVOIDANCE", 24: "AUTOROTATE",
+    0: "STABILIZE", 1: "ACRO", 2: "ALT_HOLD", 3: "AUTO", 4: "GUIDED",
+    5: "LOITER", 6: "RTL", 7: "CIRCLE", 8: "POSITION", 9: "LAND",
+    10: "OF_LOITER", 11: "DRIFT", 13: "SPORT", 14: "FLIP", 15: "AUTOTUNE",
+    16: "POSHOLD", 17: "BRAKE", 18: "THROW", 19: "AVOID_ADSB",
+    20: "GUIDED_NOGPS", 21: "SMART_RTL", 22: "FLOWHOLD", 23: "FOLLOW",
+    24: "ZIGZAG", 25: "SYSTEMID", 26: "AUTOROTATE", 27: "AUTO_RTL",
+    28: "TURTLE",
 }
-MODE_STANDBY, MODE_GUIDED, MODE_AUTO, MODE_RTL, MODE_LAND = 0, 4, 5, 6, 9
+MODE_STABILIZE, MODE_GUIDED, MODE_AUTO, MODE_RTL, MODE_LAND = 0, 4, 3, 6, 9
 
 # FENCE_TYPE bits (AP_Fence.h): ALT_MAX=1 CIRCLE=2 POLYGON=4 ALT_MIN=8
 FENCE_TYPE_POLYGON_BIT = 4

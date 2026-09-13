@@ -539,7 +539,7 @@ class MockPi:
             elif self.phase == "PLAN_SYNC" and t >= 3.0:
                 await self.event("plan_synced", {"items": 3, "trigger_seq": 2})
                 await self.log("INFO", "Plan synced: 3 items, DO_SPRAYER trigger at seq 2")
-                v.armed, v.mode_num, v.alt = True, 5, 14.0
+                v.armed, v.mode_num, v.alt = True, 3, 14.0  # 3 = AUTO (was 5 = LOITER)
                 v.lat, v.lon = ox, oy
                 self.alt, self.pos = 14.0, [ox, oy]
                 await self.set_phase("WAITING_TRIGGER", "in AUTO — waiting for DO_SPRAYER trigger")
@@ -973,10 +973,10 @@ class Server:
             return self.json(status)
         if p == "/api/mp/mode" and method == "POST":
             mode = str(jbody.get("mode", "")).upper()
-            from _mavlink_v2 import MODE_RTL, MODE_LAND, MODE_STANDBY
-            mnum = {"RTL": MODE_RTL, "LAND": MODE_LAND, "STANDBY": MODE_STANDBY}.get(mode)
+            from _mavlink_v2 import MODE_RTL, MODE_LAND
+            mnum = {"RTL": MODE_RTL, "LAND": MODE_LAND}.get(mode)
             if mnum is None:
-                return self.json({"detail": "mode must be RTL|LAND|STANDBY"}, 400)
+                return self.json({"detail": "mode must be RTL|LAND"}, 400)
             try:
                 ok = await asyncio.to_thread(self.mav.set_mode, mnum, 3.0)
             except Exception as e:
