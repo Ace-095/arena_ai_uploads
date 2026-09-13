@@ -812,6 +812,7 @@ class Server:
             head, rest = head.split(b"\r\n\r\n", 1)
             lines = head.decode("latin-1").split("\r\n")
             method, path, _ = lines[0].split(" ", 2)
+            path = path.split("?", 1)[0]  # strip query (camera ?t= cache-busters etc.)
             headers = {}
             for ln in lines[1:]:
                 if ":" in ln:
@@ -1070,6 +1071,8 @@ class Server:
                       "saturation", "sharpness", "adaptive"):
                 if k in jbody:
                     m.controls[cam][k] = jbody[k]
+            if "gain_db" in jbody:  # contract alias (workstream 2 uses gain_db)
+                m.controls[cam]["gain"] = jbody["gain_db"]
             return self.json({"status": "ok", "cam": cam, "controls": m.controls[cam]})
         if p in ("/api/camera/frame/cam1", "/api/camera/frame/cam2") and method == "GET":
             cam = p.rsplit("/", 1)[-1]

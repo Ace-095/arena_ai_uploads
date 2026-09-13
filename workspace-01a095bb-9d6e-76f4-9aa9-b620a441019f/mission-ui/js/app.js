@@ -130,7 +130,7 @@ function renderBridgeState(d) {
   S.isMock = !!d.mock;
   $('mockBadge').classList.toggle('hidden', !d.mock);
   $('piMode').textContent = d.mock ? 'mock (bridge loopback)' : 'real';
-  $('watchInfo').textContent = d.watching || '—';
+  $('watchInfo').textContent = ([].concat(d.watching || []).join('; ')) || '—';
   if (d.qr && d.qr.payload && !S.qr.payload) {
     S.qr.payload = d.qr.payload;
     $('qrPayload').textContent = d.qr.payload;
@@ -408,18 +408,19 @@ function boot() {
     const payload = $('qrManual').value.trim();
     if (!payload) return;
     postJson('/api/mp/qr', { payload }).then((d) => {
-      S.qr.payload = d.payload;
-      $('qrPayload').textContent = d.payload;
+      const p = (d.qr && d.qr.payload) || d.payload || '';
+      S.qr.payload = p;
+      $('qrPayload').textContent = p;
       S.receipts.manual = nowStr();
       $('qrSrcMan').textContent = S.receipts.manual;
-      log('WARN', 'manual QR latched: ' + d.payload);
+      log('WARN', 'manual QR latched: ' + p);
     }).catch((e) => log('ERROR', 'manual QR failed: ' + e.message));
   });
   $('btnWatch').addEventListener('click', () => {
     const path = $('watchPath').value.trim();
     if (!path) return;
     postJson('/api/mp/watch', { path }).then((d) => {
-      $('watchInfo').textContent = d.watching || '—';
+      $('watchInfo').textContent = ([].concat(d.watching || []).join('; ')) || '—';
       log('INFO', 'watching MP log: ' + d.watching);
     }).catch((e) => log('ERROR', 'watch failed: ' + e.message));
   });

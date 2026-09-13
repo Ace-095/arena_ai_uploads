@@ -81,7 +81,7 @@ UI → bridge → MP → FC over MAVLink.
 | GET | `/api/mp/plan` | plan (fresh read from FC) |
 | POST | `/api/mp/mode` | `{mode:'RTL'|'LAND'}` → `{status, mode}` |
 | POST | `/api/mp/param` | `{name}` → `{name, value}` |
-| POST | `/api/mp/qr` | `{payload}` → `{payload, source:'manual'}` |
+| POST | `/api/mp/qr` | `{payload}` → `{status, qr:{payload, source:'manual', ts, line}}` |
 | POST | `/api/mp/watch` | `{path}` → `{watching}` |
 | POST | `/api/mp/mock/restart` | `{}` → `{ok:true}` (mock only) |
 
