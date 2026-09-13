@@ -101,7 +101,10 @@ function renderFence(d) {
   $('fRadius').textContent = d.max_radius_m != null ? d.max_radius_m + ' m' : '—';
   $('fOrigin').textContent = (d.origin_lat != null)
     ? (d.origin_lat.toFixed(5) + ', ' + d.origin_lon.toFixed(5)) : '—';
-  if (d.reason) log(d.confirmed ? 'INFO' : 'WARN', 'fence: ' + d.reason);
+  if (d.reason && d.reason !== S._lastFenceReason) {
+    S._lastFenceReason = d.reason;
+    log(d.confirmed ? 'INFO' : 'WARN', 'fence: ' + d.reason);
+  }
   if (map) {
     const verts = (d.vertices_latlon || []).map((v) => [v.lat, v.lon]);
     map.setFence(verts);

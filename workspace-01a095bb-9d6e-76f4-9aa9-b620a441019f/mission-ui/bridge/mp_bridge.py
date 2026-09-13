@@ -995,9 +995,10 @@ class Server:
             except Exception as e:
                 return self.json({"detail": "mode set failed: %s" % e}, 503)
             rname = COMMAND_ACK_RESULT.get(res, "?")
-            await self.hub.emit("log", {"level": "WARN", "msg": "UI sent mode %s via MAVLink (via MP) — result=%d (%s)" % (mode, res, rname)})
+            ack_src = self.mav._last_ack_src.get("COMMAND_ACK", "?")
+            await self.hub.emit("log", {"level": "WARN", "msg": "UI sent mode %s via MAVLink (via MP) — result=%d (%s, from sysid %s)" % (mode, res, rname, ack_src)})
             return self.json({"status": "ok" if res == 0 else "rejected", "mode": mode,
-                              "result": res, "result_name": rname})
+                              "result": res, "result_name": rname, "from_sysid": ack_src})
         if p == "/api/mp/param" and method == "POST":
             name = str(jbody.get("name", "")).strip().upper()
             if not re.fullmatch(r"[A-Z0-9_]{1,15}", name):

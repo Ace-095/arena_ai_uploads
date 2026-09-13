@@ -140,6 +140,8 @@ class MavClient:
         self._last_ack_src = {}
         self.sender_changes = 0
         self.link_flaps = 0
+        self._breach_active = False
+        self._breach_last_log = 0.0
         self._rx_window = 0
         self._rx_window_t = time.time()
 
@@ -354,9 +356,11 @@ class MavClient:
                 new_mode = M.ARDU_COPTER_MODES.get(f["custom_mode"], "MODE(%d)" % f["custom_mode"])
                 new_armed = bool(f["base_mode"] & M.MAV_MODE_FLAG_SAFETY_ARMED)
                 if self.mode is not None and (new_mode != self.mode or new_armed != self.armed):
-                    self.hub.emit_threadsafe("log", {
-                        "level": "WARN",
-                        "msg": "vehicle mode: %s -> %s (armed=%s)" % (self.mode, new_mode, new_armed)})
+                    if new_mode != self.mode:
+                        arrow = "vehicle mode: %s -> %s (armed=%s)" % (self.mode, new_mode, new_armed)
+                    else:
+                        arrow = "vehicle %s (mode %s)" % ("ARMED" if new_armed else "DISARMED", new_mode)
+                    self.hub.emit_threadsafe("log", {"level": "WARN", "msg": arrow})
                 self.mode = new_mode
                 self.armed = new_armed
                 self.veh_state = f["system_status"]
@@ -407,10 +411,19 @@ class MavClient:
         elif name == "FENCE_STATUS":
             if f["breach_status"] != 0:
                 self.fence_breach = f
+                now = time.time()
+                if not self._breach_active or now - self._breach_last_log > 10.0:
+                    self._breach_last_log = now
+                    self.hub.emit_threadsafe("log", {
+                        "level": "ERROR",
+                        "msg": "FENCE BREACH: status=%d type=%d count=%d" % (
+                            f["breach_status"], f["breach_type"], f["breach_count"])})
+                self._breach_active = True
+                self._maybe_emit_state()
+            elif self._breach_active:
+                self._breach_active = False
                 self.hub.emit_threadsafe("log", {
-                    "level": "ERROR",
-                    "msg": "FENCE BREACH: status=%d type=%d count=%d" % (
-                        f["breach_status"], f["breach_type"], f["breach_count"])})
+                    "level": "WARN", "msg": "fence breach CLEARED"})
                 self._maybe_emit_state()
         elif name == "PARAM_VALUE":
             pid = self._decode_id(f["param_id"])
@@ -524,6 +537,7 @@ class MavClient:
             })
             sent = set()
             ack = None
+            retries = 0
             while (len(sent) < n or ack is None) and time.time() < deadline:
                 msg = self._pull_until(q, lambda m: True, time.time() + 0.5)
                 if msg is None:
@@ -531,10 +545,15 @@ class MavClient:
                 name, f = msg[0], msg[1]
                 if f.get("mission_type") != M.MAV_MISSION_TYPE_FENCE:
                     continue
-                if name == "MISSION_REQUEST_INT" and f["seq"] not in sent:
+                if name == "MISSION_REQUEST_INT":
                     seq = f["seq"]
                     if seq >= n:
                         raise MavError("FC requested out-of-range fence seq %d (n=%d)" % (seq, n))
+                    if seq in sent:
+                        retries += 1
+                        if retries <= 5 or retries % 10 == 0:
+                            self.hub.emit_threadsafe("log", {"level": "WARN",
+                                "msg": "fence item seq %d re-requested by FC (retry %d) — resending" % (seq, retries)})
                     lat, lon = vertices[seq]
                     self._send(M.MSG_ID['MISSION_ITEM_INT'], {  # MISSION_ITEM_INT
                         "param1": float(n), "param2": 0.0, "param3": 0.0, "param4": 0.0,
@@ -544,6 +563,7 @@ class MavClient:
                         "frame": M.MAV_FRAME_GLOBAL, "current": 0, "autocontinue": 0,
                         "mission_type": M.MAV_MISSION_TYPE_FENCE,
                     })
+                    time.sleep(0.03)  # pace the burst: MP's mirror socket drops rapid-fire UDP
                     sent.add(seq)
                 elif name == "MISSION_ACK":
                     ack = f
