@@ -224,6 +224,12 @@ Now:
 4. Re-run: MP Actions → re-arm, re-select Auto (SITL restarts the
    mission from the top). Restart `main.py` for a clean slate.
 
+   In mission-ui (Pi link `http://<linux-ip>:8000`), the bench webcam
+   shows in the **CAM2** tile; CAM1 reads "frame fetch failed" — normal,
+   the laptop has one camera. If CAM2 is blank too, T2's process exited
+   or the Pi link is wrong (the process now stays alive after the
+   mission ends, so a blank CAM2 with T2 running means link trouble).
+
 Two honest bench artefacts to expect:
 
 * The sim flies at 15 m while your webcam sits on a desk — positions

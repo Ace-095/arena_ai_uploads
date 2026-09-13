@@ -13,6 +13,7 @@ import logging
 import os
 import sys
 import threading
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -118,6 +119,12 @@ def main():
     print("UI: http://<this-pi>:%d  (paste as Pi link)" % port)
     try:
         mission.run()
+        # The Pi link must outlive the mission: the UI needs cameras +
+        # status after FAILSAFE/DONE too (post-flight inspection, re-runs).
+        print("mission ended (%s) — server keeps running for the UI (Ctrl-C to stop)"
+              % getattr(mission, "phase", "?"))
+        while True:
+            time.sleep(1.0)
     except KeyboardInterrupt:
         print("stopped by user")
     finally:
