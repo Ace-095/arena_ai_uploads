@@ -252,24 +252,35 @@ class LogTailer(threading.Thread):
 
     def run(self):
         while True:
-            for p in list(self.watch):
-                if os.isdir(p):
+            try:
+                self.poll_once()
+            except Exception:
+                pass  # the tailer thread must never die on a bad path
+            time.sleep(0.7)
+
+    def poll_once(self):
+        """One sweep over watched paths (split out so tests can drive it)."""
+        for p in list(self.watch):
+            try:
+                if os.path.isdir(p):
                     try:
-                        for name in os.listdir(p):
-                            full = os.path.join(p, name)
-                            ext = os.path.splitext(name)[1].lower()
-                            if ext in (".txt", ".log"):
-                                self._read_text(full)
-                            elif ext == ".bin":
-                                self._scan_bin(full)
+                        names = os.listdir(p)
                     except OSError:
-                        pass
+                        continue
+                    for name in names:
+                        full = os.path.join(p, name)
+                        ext = os.path.splitext(name)[1].lower()
+                        if ext in (".txt", ".log"):
+                            self._read_text(full)
+                        elif ext == ".bin":
+                            self._scan_bin(full)
                 else:
                     if os.path.splitext(p)[1].lower() == ".bin":
                         self._scan_bin(p)
                     else:
                         self._read_text(p)
-            time.sleep(0.7)
+            except Exception:
+                continue
 
 
 # ---------------------------------------------------------------------------
@@ -1249,6 +1260,8 @@ def main():
             if os.path.isfile(cand):
                 args.mbtiles = cand
                 break
+    if args.mbtiles and not os.path.isfile(args.mbtiles):
+        print("[bridge] WARNING: --mbtiles file not found: %s (using online tiles fallback)" % args.mbtiles)
 
     if args.selftest:
         try:
