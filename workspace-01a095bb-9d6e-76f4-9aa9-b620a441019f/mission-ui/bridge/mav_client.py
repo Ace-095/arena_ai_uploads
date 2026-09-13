@@ -15,19 +15,6 @@ Access) pipes the same MAVLink stream to this client over UDP (default
          (RTL/LAND — the only flight commands the UI may send; MP stays
          the head for arming/takeoff), STATUSTEXT notices.
 
-LINK TOPOLOGY WARNING (field-proven Sep 2026): MP's "MAVLink Forwarding"
-is NOT a transparent bridge — its own mission-upload handler consumes
-FC->GCS MISSION_REQUEST_INT (so fence UPLOAD from this client starves:
-5x COUNT, 0 REQUESTs), while downloads/params/commands all pass. The
-supported topology is a real MAVLink router between the radio and BOTH
-MP and this client:
-
-    Pixhawk <==radio==> MAVProxy <==UDP 14550==> MP  +  <==UDP 14551==> THIS
-
-MP-forwarding remains a degraded fallback (telemetry + params + modes +
-plan/fence READ; no mission/fence upload). Mission Planner's "Mavlink
-Mirror" is monitor-only (downlink) — not a substitute.
-
 Protocol discipline (ported from hehe's validated mavlink_fence.py):
   * subscribe BEFORE send on every request/response pair (the reply can
     beat a late subscriber on a fast link — a proven race).
@@ -151,7 +138,6 @@ class MavClient:
         self.tx_msgs = 0
         self.rx_rate = 0.0
         self._last_ack_src = {}
-        self._last_ack_comp = {}
         self.sender_changes = 0
         self.link_flaps = 0
         self._breach_active = False
@@ -342,7 +328,6 @@ class MavClient:
             self._fanout(name, (name, fields, src_sys))
             if name in ("MISSION_ACK", "COMMAND_ACK"):
                 self._last_ack_src[name] = src_sys
-                self._last_ack_comp[name] = _src_comp
             self._dispatch(name, src_sys, fields)
 
     def _update_rx_rate(self, addr):
@@ -619,10 +604,9 @@ class MavClient:
                 elif name == "MISSION_ACK":
                     ack = f
                     self.hub.emit_threadsafe("log", {"level": "WARN",
-                        "msg": "fence: ACK type=%d (%s) from sysid %s comp %s — COUNT x%d, %d REQUESTs, %d items sent" % (
+                        "msg": "fence: ACK type=%d (%s) from sysid %s — COUNT x%d, %d REQUESTs, %d items sent" % (
                             ack["type"], M.MAV_MISSION_RESULT.get(ack["type"], "?"),
                             self._last_ack_src.get("MISSION_ACK", "?"),
-                            self._last_ack_comp.get("MISSION_ACK", "?"),
                             count_sends, req_seen, items_sent)})
         finally:
             self._unsubscribe(q)
@@ -632,10 +616,9 @@ class MavClient:
                 xfer, "FC never answered: COUNT lost UI->FC or REQUESTs lost FC->UI"
                 if req_seen == 0 else "FC asked, then went silent mid-upload"))
         if ack["type"] != M.MAV_MISSION_ACCEPTED:
-            raise MavError("fence upload REJECTED by FC (MAV_MISSION type=%d [%s], from sysid %s comp %s; %s — %s)" % (
+            raise MavError("fence upload REJECTED by FC (MAV_MISSION type=%d [%s], from sysid %s; %s — %s)" % (
                 ack["type"], M.MAV_MISSION_RESULT.get(ack["type"], "?"),
-                self._last_ack_src.get("MISSION_ACK", "?"),
-                self._last_ack_comp.get("MISSION_ACK", "?"), xfer,
+                self._last_ack_src.get("MISSION_ACK", "?"), xfer,
                 "FC never asked for items: COUNT lost UI->FC or REQUESTs lost FC->UI"
                 if req_seen == 0 else "FC asked but starved: our ITEMs are being dropped UI->FC"))
 
