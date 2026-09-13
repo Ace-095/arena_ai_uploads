@@ -67,6 +67,13 @@ def list_video_devices():
 class _BaseCamera:
     kind = "base"
 
+    #: Contract tuning shape (api-contract.md Pi REST): the UI sliders speak
+    #: these units. Defaults mirror the UI slider defaults so a fresh seed is
+    #: a no-op round-trip.
+    TUNING_DEFAULTS = {"exposure_us": 8333, "gain_db": 6.0, "af_mode": "auto",
+                       "adaptive": True, "brightness": 0.0, "contrast": 1.0,
+                       "saturation": 1.0, "sharpness": 1.0}
+
     def __init__(self, name, index, size, hfov_deg, facing,
                  rotation_deg=0, jpeg_quality=80):
         self.name = name            # cam1 | cam2
@@ -78,6 +85,7 @@ class _BaseCamera:
         self.jpeg_quality = int(jpeg_quality)
         self.model = "?"
         self.display_only = False  # True for mirrors: UI tile only, no detector worker
+        self.tuning = dict(self.TUNING_DEFAULTS)
         self._lock = threading.Lock()
         self._frame = None
         self._frame_ts = 0.0
@@ -166,6 +174,23 @@ class _BaseCamera:
         """boxes: [(x,y,w,h,label), ...] drawn onto the streamed JPEG."""
         with self._lock:
             self._overlay = list(boxes or [])
+
+    # -- contract tuning (UI sliders) ------------------------------------
+    def apply_tuning(self, tuning):
+        """Store contract tuning; backends override to drive hardware.
+        Accepts the mock's `gain` alias for `gain_db`. Returns get_tuning()."""
+        for k in self.TUNING_DEFAULTS:
+            if tuning is not None and k in tuning:
+                self.tuning[k] = tuning[k]
+        if tuning is not None and "gain" in tuning and "gain_db" not in tuning:
+            self.tuning["gain_db"] = tuning["gain"]
+        return self.get_tuning()
+
+    def get_tuning(self):
+        """Contract-shaped tuning incl. the mock's `gain` alias."""
+        t = dict(self.tuning)
+        t["gain"] = t.get("gain_db")
+        return t
 
     def jpeg(self, max_width=960):
         """Annotated JPEG bytes for /api/camera/frame/<cam> (or None)."""
@@ -257,6 +282,41 @@ class Camera(_BaseCamera):
             pass
         self._picam = None
 
+    def apply_tuning(self, tuning):
+        """Contract tuning -> libcamera controls (the contract was designed
+        for these units: ExposureTime µs, 0..2 scalers, -100..100 brightness)."""
+        t = super().apply_tuning(tuning)
+        if not _HAVE_PICAM or self._picam is None:
+            return t
+        ctrls = {}
+        if "exposure_us" in (tuning or {}) or "adaptive" in (tuning or {}):
+            ctrls["AeEnable"] = bool(t["adaptive"])
+            if not t["adaptive"]:
+                ctrls["ExposureTime"] = int(max(100, min(1000000, float(t["exposure_us"]))))
+        if "gain_db" in (tuning or {}) or "gain" in (tuning or {}) or "adaptive" in (tuning or {}):
+            if not t["adaptive"]:
+                ctrls["AnalogueGain"] = 10.0 ** (float(t["gain_db"]) / 20.0)
+        if tuning is not None and "brightness" in tuning:
+            ctrls["Brightness"] = max(-1.0, min(1.0, float(t["brightness"]) / 100.0))
+        for k in ("contrast", "saturation", "sharpness"):
+            if tuning is not None and k in tuning:
+                ctrls[k.capitalize()] = max(0.0, float(t[k]))
+        if tuning is not None and "af_mode" in tuning and "imx708" in (self.model or ""):
+            try:
+                from libcamera import controls as LC
+                ctrls["AfMode"] = {"manual": LC.AfModeEnum.Manual,
+                                   "continuous": LC.AfModeEnum.Continuous}.get(
+                                       t["af_mode"], LC.AfModeEnum.Auto)
+            except Exception:
+                pass
+        if ctrls:
+            try:
+                self._picam.set_controls(ctrls)
+                log.info("%s tuning: %s", self.name, ctrls)
+            except Exception as e:
+                log.warning("%s tuning %s failed: %r", self.name, ctrls, e)
+        return t
+
 
 class USBCamera(_BaseCamera):
     """OpenCV source: V4L2 index, /dev/videoN, URL, or GStreamer pipeline."""
@@ -294,6 +354,7 @@ class USBCamera(_BaseCamera):
         self.controls = dict(controls or {})
         self.fourcc = (fourcc or "").upper() or None
         self._cap = None
+        self._anchors = {}  # driver currents at first tuning: the 1.0/0 point
 
     def _api(self):
         if self.backend == "gstreamer" or (
@@ -391,6 +452,80 @@ class USBCamera(_BaseCamera):
         st = super().status()
         st["controls"] = dict(self.controls)
         return st
+
+    def _driver_family(self):
+        """'dshow' (log exposure, 0/1 auto flag, -100..100 brightness) or
+        'v4l2' (100us-unit exposure, 1=manual/3=auto). Best-effort guess for
+        backend:any from the OS — logged, and every set reports actuals."""
+        b = (self.backend or "any").lower()
+        if b in ("dshow", "msmf"):
+            return "dshow"
+        if b in ("v4l2",):
+            return "v4l2"
+        import sys
+        return "dshow" if sys.platform == "win32" else "v4l2"
+
+    def apply_tuning(self, tuning):
+        """Contract tuning -> V4L2/DShow props (bench mapping).
+
+        Driver ranges differ per vendor, so the 0..2 scalers work RELATIVE
+        to the driver's own current value (snapshotted as anchors on the
+        first tuning: 1.0 == 'leave the driver default alone'). Brightness
+        is native -100..100 on DShow, relative on V4L2. Exposure is
+        absolute per driver family. adaptive=False flips the driver toward
+        manual exposure so the exposure/gain sliders bite; adaptive=True
+        (the UI default) hands control back to the driver.
+        """
+        t = super().apply_tuning(tuning)
+        if not _HAVE_CV2 or self._cap is None or not tuning:
+            return t
+        if not self._anchors:
+            cur = self.get_controls()
+            for k in ("brightness", "contrast", "saturation", "sharpness",
+                      "gain", "exposure"):
+                if cur.get(k) not in (None,):
+                    self._anchors[k] = cur[k]
+            log.info("%s tuning anchors (%s driver): %s", self.name,
+                     self._driver_family(), self._anchors)
+        fam = self._driver_family()
+
+        def anchor(k):
+            v = self._anchors.get(k)
+            return v if isinstance(v, (int, float)) else None
+
+        drv = {}
+        for k in ("contrast", "saturation", "sharpness"):
+            if k in tuning:
+                a = anchor(k)
+                if a:
+                    drv[k] = max(0.0, a * float(t[k]))
+        if "brightness" in tuning:
+            if fam == "dshow":
+                drv["brightness"] = max(-100.0, min(100.0, float(t["brightness"])))
+            else:
+                a = anchor("brightness")
+                if a:
+                    drv["brightness"] = max(0.0, a + (float(t["brightness"]) / 100.0) * a)
+        if "gain_db" in tuning or "gain" in tuning:
+            a = anchor("gain")
+            if a:  # UI default 6 dB == keep the driver current
+                drv["gain"] = max(0.0, a * max(0.05, float(t["gain_db"]) / 6.0))
+        if "adaptive" in tuning or "exposure_us" in tuning:
+            manual = not bool(t["adaptive"])
+            drv["autoexposure"] = (0 if manual else 1) if fam == "dshow" else (1 if manual else 3)
+            if manual and "exposure_us" in tuning:
+                us = max(100.0, float(t["exposure_us"]))
+                if fam == "dshow":
+                    import math
+                    drv["exposure"] = round(math.log2(us / 1e6))
+                else:
+                    drv["exposure"] = round(us / 100.0)
+        if "af_mode" in tuning:
+            drv["autofocus"] = 0 if t["af_mode"] == "manual" else 1
+        if drv:
+            applied = self.apply_controls(drv)
+            log.info("%s tuning applied: %s", self.name, applied)
+        return t
 
     def _grab(self):
         if self._cap is None:
@@ -524,6 +659,12 @@ class MirrorCamera(_BaseCamera):
     def get_controls(self):
         fn = getattr(self._src, "get_controls", None)
         return fn() if fn else {}
+
+    def apply_tuning(self, tuning):
+        return self._src.apply_tuning(tuning) if self._src else self.get_tuning()
+
+    def get_tuning(self):
+        return self._src.get_tuning() if self._src else super().get_tuning()
 
     def status(self):
         st = super().status()

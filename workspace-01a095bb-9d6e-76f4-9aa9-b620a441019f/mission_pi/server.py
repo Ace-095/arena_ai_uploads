@@ -8,6 +8,10 @@ Contract (must match mission-ui js/links.js + js/camera.js):
   WS  /ws/telemetry             envelopes {channel, t, data}; Pi channels:
                                 qr / fsm / event / log / system.
   GET /health                   {ok, cams, link}
+  GET /api/cameras              rig status {cam1: {...}, cam2: {...}}
+  GET/POST /api/camera/status   {cam?} -> {cam, model, controls} (contract)
+  POST /api/camera/controls     UI slider tuning -> {ok, cam, controls}
+  GET/POST /api/camera/{cam}/controls  RAW driver props (bench/SSH only)
   GET /api/mission/status       mission snapshot passthrough.
   POST /api/mission/takeover    LOCAL USE ONLY (bench/SSH): force GUIDED
   POST /api/mission/abort       takeover now / RTL + stop. The flight UI
@@ -27,6 +31,7 @@ log = logging.getLogger("server")
 try:
     from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
     from fastapi.responses import JSONResponse, Response
+    from fastapi.middleware.cors import CORSMiddleware
     import uvicorn
     _HAVE_API = True
 except Exception as e:
@@ -81,6 +86,11 @@ def create_app(rig, mission, fc):
     """rig: CameraRig, mission: Mission (or None pre-start), fc: FCLink."""
     _require_api()
     app = FastAPI(title="mission_pi")
+    # The UI is served from the BRIDGE origin, not the Pi — without CORS
+    # every UI fetch() to the Pi (camera probe, slider tuning) dies in the
+    # browser while <img> polling and WS sail through. Open LAN tool: allow all.
+    app.add_middleware(CORSMiddleware, allow_origins=["*"],
+                       allow_methods=["*"], allow_headers=["*"])
     hub = Hub()
 
     @app.on_event("startup")
@@ -108,6 +118,40 @@ def create_app(rig, mission, fc):
             return JSONResponse({"detail": "no frame yet from %s" % cam}, 503)
         return Response(jpg, media_type="image/jpeg",
                         headers={"Cache-Control": "no-store"})
+
+    @app.api_route("/api/camera/status", methods=["GET", "POST"])
+    async def camera_status(req: Request):
+        """Contract: {cam?} -> {cam, model, controls} (UI seeds sliders here)."""
+        cam = req.query_params.get("cam", "cam1")
+        if req.method == "POST":
+            try:
+                body = await req.json()
+            except Exception:
+                body = None
+            if isinstance(body, dict) and body.get("cam"):
+                cam = str(body["cam"])
+        c = rig.get(cam) if rig else None
+        if c is None:
+            return JSONResponse({"detail": "unknown camera (want cam1|cam2)"}, 404)
+        return {"cam": cam, "model": c.model, "controls": c.get_tuning()}
+
+    @app.post("/api/camera/controls")
+    async def camera_controls(req: Request):
+        """Contract: {cam, exposure_us, gain_db, af_mode, adaptive,
+        brightness, contrast, saturation, sharpness} -> {ok, cam, controls}.
+        The UI sliders POST here (debounced)."""
+        try:
+            body = await req.json()
+        except Exception:
+            body = None
+        if not isinstance(body, dict):
+            return JSONResponse({"detail": "want a JSON tuning object {cam, ...}"}, 400)
+        cam = str(body.get("cam", "cam1"))
+        c = rig.get(cam) if rig else None
+        if c is None:
+            return JSONResponse({"detail": "unknown camera (want cam1|cam2)"}, 404)
+        applied = c.apply_tuning(body)
+        return {"ok": True, "status": "ok", "cam": cam, "controls": applied}
 
     @app.get("/api/camera/{cam}/controls")
     async def get_controls(cam: str):

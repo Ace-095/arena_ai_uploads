@@ -19,6 +19,7 @@ const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&l
 const S = {
   piUrl: '', isMock: false, bridgeOk: false,
   pi: { connected: false },
+  camsAvail: { cam1: true, cam2: true }, camsProbed: false,
   mav: null, fence: null, plan: null, fsm: null,
   qr: { payload: '', streak: 0, required: 3, confirmed: false },
   receipts: { pi: '', mavlink: '', mpfile: '', manual: '' },
@@ -257,9 +258,49 @@ function setSlider(p, name, v) {
   if (s) { s.value = v; $(p + name + 'V').textContent = v; }
 }
 
+// One camera on the rig => one tile + one tab. The Pi reports its rig at
+// GET /api/cameras; anything missing is hidden (and never polled). When the
+// probe fails (old Pi, mock, Pi down) both tiles stay up and keep trying.
+function probeCameras() {
+  if (!S.piUrl) return Promise.resolve(null);
+  return fetch(S.piUrl + '/api/cameras').then((r) => {
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+  }).then((st) => {
+    const avail = { cam1: !!(st && st.cam1), cam2: !!(st && st.cam2) };
+    if (!avail.cam1 && !avail.cam2) return null; // empty/ancient: keep trying both
+    S.camsProbed = true;
+    S.camsAvail = avail;
+    applyCamVisibility();
+    log('INFO', 'cameras on Pi: ' + (avail.cam1 ? 'cam1 ' : '') + (avail.cam2 ? 'cam2' : ''));
+    return st;
+  }).catch(() => null);
+}
+
+function applyCamVisibility() {
+  const a = S.camsAvail;
+  [['cam1', '1'], ['cam2', '2']].forEach(([id, n]) => {
+    const show = a[id] !== false;
+    $('camView' + n).classList.toggle('hidden', !show);
+    $('tabCam' + n).classList.toggle('hidden', !show);
+  });
+  // keep a VISIBLE tab selected (single-cam rigs must not strand the panel)
+  const v1 = a.cam1 !== false, v2 = a.cam2 !== false;
+  const c1on = $('tabCam1').classList.contains('on');
+  if (c1on && !v1 && v2) $('tabCam2').click();
+  else if (!c1on && !v2 && v1) $('tabCam1').click();
+}
+
+function startAvailableCams() {
+  CAMS.forEach((c) => {
+    if (S.camsAvail[c.id] !== false && cams) cams.startCam(c.id);
+  });
+}
+
 function seedCamControls() {
   if (!S.piUrl) return;
   CAMS.forEach((c) => {
+    if (S.camsProbed && S.camsAvail[c.id] === false) return;
     postJson(S.piUrl + '/api/camera/status', { cam: c.id }).then((st) => {
       if (!st || !st.controls) return;
       const k = st.controls;
@@ -443,11 +484,18 @@ function boot() {
   // ---- links ----
   pi = window.MissionLinks.initPiLink({
     onStatus: (s) => {
+      const was = S.pi.connected;
       S.pi.connected = s.connected;
       $('piWs').textContent = s.connected
         ? ('open · ' + s.url) : ('down · retry ' + s.retry);
       setLamp('lampPi', s.connected);
       $('btnPiConnect').textContent = s.connected ? 'disconnect' : 'connect';
+      // Fresh Pi (WS open <=> HTTP up, same server): probe the rig, show
+      // only real tiles, and (re)start polling against THIS Pi URL — polls
+      // bound at boot would otherwise stare at the old base forever.
+      if (s.connected && !was) {
+        probeCameras().then(() => { startAvailableCams(); seedCamControls(); });
+      }
     },
     onEnvelope,
     onLog: log,
@@ -463,8 +511,10 @@ function boot() {
     }
     S.piUrl = $('piUrl').value.trim().replace(/\/$/, '') || window.location.origin;
     $('piUrl').value = S.piUrl;
+    S.camsProbed = false; // new Pi => re-probe its rig on WS open
+    S.camsAvail = { cam1: true, cam2: true };
+    applyCamVisibility();
     pi.connect(S.piUrl);
-    seedCamControls();
   });
 
   bridge = window.MissionLinks.initBridge({
@@ -525,13 +575,12 @@ function boot() {
   $('mapHint').addEventListener('click', () => { map && map.zoomToGrid(); });
 
   // ---- mock auto-connect (same origin serves UI + mock Pi + bridge) ----
+  // No eager cam start here: probe + start + seed run on the first Pi WS
+  // open (onStatus), so tiles always poll the connected Pi, not boot origin.
   S.piUrl = window.location.origin;
   $('piUrl').value = S.piUrl;
   pi.connect(S.piUrl);
-  cams.startCam('cam1');
-  cams.startCam('cam2');
-  seedCamControls();
-  log('INFO', 'mission-ui v2 boot: Pi WS + bridge SSE + cams starting on ' + S.piUrl);
+  log('INFO', 'mission-ui v2 boot: Pi WS + bridge SSE starting on ' + S.piUrl);
 }
 
 document.addEventListener('DOMContentLoaded', boot);

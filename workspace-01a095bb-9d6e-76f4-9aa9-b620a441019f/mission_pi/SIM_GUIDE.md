@@ -99,17 +99,18 @@ python main.py --check --config config.laptop.yaml
 If `model=usb` didn't appear: wrong `device:` index (try `1`), or the
 cam is held by another app (close Cheese/Zoom/browser), or perms §2.
 
-Live-view the bench cams any time while the stack runs (cam1 "Pi Cam 3"
-is a display-only mirror of the webcam — same picture, both UI tiles lit):
+Live-view the bench cam any time while the stack runs (the UI shows a
+single CAM2 tile — one camera, one tile):
 
 ```
-http://127.0.0.1:8000/api/camera/frame/cam1
 http://127.0.0.1:8000/api/camera/frame/cam2
 ```
 
-Tune the webcam (contrast etc.) live, then bake the winners into
-`cameras.bottom.controls` in the yaml. Ranges are driver-specific —
-query first:
+Tune the webcam (contrast etc.) with the UI's CAMERAS sliders — they POST
+the contract tuning and the 0..2 scalers work relative to your driver's
+own defaults (1.0 == leave it alone). Uncheck `adaptive` to flip toward
+manual exposure so the exposure/gain sliders bite. Raw driver props for
+bench/SSH debugging:
 
 ```bash
 curl http://127.0.0.1:8000/api/camera/cam2/controls

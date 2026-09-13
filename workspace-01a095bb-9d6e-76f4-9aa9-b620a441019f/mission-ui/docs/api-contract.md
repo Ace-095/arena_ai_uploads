@@ -63,6 +63,7 @@ The mock replays a short history burst on every WS connect.
 | GET | `/api/qr/status` | `{payload, streak, required, confirmed}` |
 | GET/POST | `/api/camera/status` | `{cam?}` → `{cam, model, controls}` |
 | POST | `/api/camera/controls` | `{cam, exposure_us, gain_db, af_mode, adaptive, brightness, contrast, saturation, sharpness}` → `{ok, cam, controls}` |
+| GET | `/api/cameras` | rig status `{cam1: {...}, cam2: {...}}` — UI hides tiles/tabs for missing cams (one camera ⇒ one tile); absent on mock/old Pi ⇒ UI keeps both tiles trying |
 | GET | `/api/camera/frame/cam1` `/api/camera/frame/cam2` | JPEG snapshot bytes (mock: SVG) |
 | WS | `/ws/webrtc/cam1` `/ws/webrtc/cam2` | optional WebRTC; UI falls back to polling |
 
