@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+config.yaml
+snaps/
+qr_dataset/
+runs/
