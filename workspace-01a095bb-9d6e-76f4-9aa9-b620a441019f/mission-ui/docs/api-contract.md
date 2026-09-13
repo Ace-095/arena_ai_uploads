@@ -88,8 +88,9 @@ UI → bridge → MP → FC over MAVLink.
 `bridge-state`: `{watching, qr, bin_parser_available, mock, mavlink{connected,
 port, vehicle_sysid, mode, armed}, tiles{...}, uptime_s}`
 
-`mavlink-state`: `{connected, port, gcs_sysid, vehicle_sysid, vehicle_type,
-mode, mode_num, armed, vehicle_state, hb_age_s, rx_msgs, rx_rate, fence, plan}`
+`mavlink-state`: `{connected, port, gcs_sysid, sender, vehicle_sysid, vehicle_type,
+mode, mode_num, armed, vehicle_state, hb_age_s, rx_msgs, tx_msgs, rx_rate,
+sender_changes, link_flaps, fence, plan}`
 
 `telemetry` (≤5 Hz): `{lat, lon, alt_rel, alt_msl, vx, vy, vz, hdg,
 attitude{roll,pitch,yaw}|null, mode, mode_num, armed, gps{fix,sats}|null,

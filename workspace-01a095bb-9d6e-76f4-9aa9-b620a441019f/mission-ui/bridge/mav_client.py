@@ -138,6 +138,8 @@ class MavClient:
         self.tx_msgs = 0
         self.rx_rate = 0.0
         self._last_ack_src = {}
+        self.sender_changes = 0
+        self.link_flaps = 0
         self._rx_window = 0
         self._rx_window_t = time.time()
 
@@ -313,6 +315,13 @@ class MavClient:
                 self.hub.emit_threadsafe("log", {
                     "level": "INFO",
                     "msg": "MAVLink link up: receiving from %s:%d" % (addr[0], addr[1])})
+            elif addr != self.sender:
+                self.sender_changes += 1
+                self.hub.emit_threadsafe("log", {
+                    "level": "WARN",
+                    "msg": "MAVLink sender switched %s:%d -> %s:%d (switch #%d — check for duplicate MP mirror rows)" % (
+                        self.sender[0], self.sender[1], addr[0], addr[1], self.sender_changes)})
+                self.sender = addr
             name = M.name_of(msgid)
             self._fanout(name, (name, fields, src_sys))
             if name in ("MISSION_ACK", "COMMAND_ACK"):
@@ -330,6 +339,7 @@ class MavClient:
         was = self.connected
         self.connected = self.sender is not None and (time.time() - self.last_hb) < 2.5
         if was and not self.connected:
+            self.link_flaps += 1
             self.hub.emit_threadsafe("log", {
                 "level": "WARN", "msg": "MAVLink link LOST (no heartbeat >2.5 s)"})
         self._maybe_emit_state()
@@ -460,6 +470,8 @@ class MavClient:
             "gcs_sysid": self.sysid,
             "sender": ("%s:%d" % self.sender) if self.sender else None,
             "tx_msgs": self.tx_msgs,
+            "sender_changes": self.sender_changes,
+            "link_flaps": self.link_flaps,
             "vehicle_sysid": self.veh_sysid,
             "vehicle_type": self.veh_type,
             "mode": self.mode, "mode_num": self.mode_num,
