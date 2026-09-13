@@ -516,7 +516,7 @@ class MavClient:
                 msg = self._pull_until(q, lambda m: True, time.time() + 0.5)
                 if msg is None:
                     continue
-                name, f = msg
+                name, f = msg[0], msg[1]
                 if f.get("mission_type") != M.MAV_MISSION_TYPE_FENCE:
                     continue
                 if name == "MISSION_REQUEST_INT" and f["seq"] not in sent:
