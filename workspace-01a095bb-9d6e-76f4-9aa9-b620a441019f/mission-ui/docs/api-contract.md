@@ -77,6 +77,7 @@ UI → bridge → MP → FC over MAVLink.
 | GET | `/api/mp/tiles-info` | `{available, path, zmin, zmax, count, bounds}` |
 | GET | `/tiles/{z}/{x}/{y}.png` | tile bytes, else 404 `{error}` |
 | GET/POST | `/api/mp/mavlink` | mavlink-state / `{port}` → rebind + state |
+| GET | `/api/mp/fence` | read fence from FC (adopts MP-uploaded fence) → GeofenceStatus |
 | POST/DELETE | `/api/mp/fence` | `{vertices:[{lat,lon}], mission_type:'fence', fence_action?}` → GeofenceStatus |
 | GET | `/api/mp/plan` | plan (fresh read from FC) |
 | POST | `/api/mp/mode` | `{mode:'RTL'|'LAND'}` → `{status, mode, result, result_name, from_sysid, home_set, home}` (`home_set`/`home` filled only when RTL is rejected — FC home query) |

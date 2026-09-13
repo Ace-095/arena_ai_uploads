@@ -362,6 +362,17 @@ function boot() {
     }).then((st) => { renderFence(st); log('WARN', 'fence cleared on FC'); })
       .catch((e) => log('ERROR', 'fence clear failed: ' + e.message));
   });
+  $('btnFenceRefresh').addEventListener('click', () => {
+    fetch('/api/mp/fence').then((r) => {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    }).then((st) => {
+      renderFence(st);
+      log(st.loaded ? 'WARN' : 'INFO', st.loaded
+        ? ('fence refreshed from FC: ' + st.vertex_count + ' verts')
+        : 'no fence stored on FC');
+    }).catch((e) => log('ERROR', 'fence refresh failed: ' + e.message));
+  });
   $('btnExportLap').addEventListener('click', () => {
     const verts = (S.fence && S.fence.vertices_latlon) || (map && map.getVertices()) || [];
     if (!verts.length) { log('ERROR', 'nothing to export (no fence, no drawing)'); return; }

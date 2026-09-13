@@ -962,6 +962,22 @@ class Server:
             self.mav.rebind(port)
             await self.hub.emit("bridge-state", self.bridge_state())
             return self.json({"status": "ok", "port": port})
+        if p == "/api/mp/fence" and method == "GET":
+            # read-back only: adopt whatever fence the FC has (e.g. uploaded
+            # from Mission Planner) and show it in the UI.
+            if self.mav.sender is None:
+                return self.json({"detail": "no MAVLink link"}, 503)
+            try:
+                status = await asyncio.to_thread(self.mav.refresh_fence, 4.0)
+            except Exception as e:
+                return self.json({"detail": "fence refresh failed: %s" % e}, 500)
+            if status is None:
+                return self.json({"loaded": False, "confirmed": False,
+                                  "reason": "no fence stored on FC (or read failed — retry)",
+                                  "vertex_count": 0, "area_m2": None, "max_radius_m": None,
+                                  "centroid_enu": None, "origin_lat": None, "origin_lon": None,
+                                  "vertices_latlon": []})
+            return self.json(status)
         if p == "/api/mp/fence" and method == "POST":
             verts = jbody.get("vertices", [])
             if not (3 <= len(verts) <= 255):
