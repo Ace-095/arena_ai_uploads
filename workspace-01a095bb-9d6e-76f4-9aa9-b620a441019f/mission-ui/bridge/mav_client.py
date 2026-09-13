@@ -839,7 +839,7 @@ class MavClient:
             try:
                 self._tsend(0, {  # HEARTBEAT (GCS)
                     "custom_mode": 0, "type": M.MAV_TYPE_GCS,
-                    "autopilot": M.MAV_AUTOPILOT_GCS, "base_mode": 0,
+                    "autopilot": M.MAV_AUTOPILOT_INVALID, "base_mode": 0,
                     "system_status": M.MAV_STATE_ACTIVE, "mavlink_version": 3,
                 })
             except Exception:

@@ -226,7 +226,7 @@ UDP (Write access) to the bridge**, which acts as a GCS (sysid 254) and serves
 the UI over SSE.
 
 - **D1 SUPERSEDED.** Fence path is now UI → bridge → MP → FC over MAVLink
-  (mission_type 8, cmd 5001, readback verify, `FENCE_ENABLE/ACTION/TYPE`), not
+  (mission_type 1, cmd 5001, readback verify, `FENCE_ENABLE/ACTION/TYPE`), not
   UI → Pi → Pixhawk. The `.lap` export stays as manual fallback.
 - **D2 unchanged** (Pi-side auto RTL→LAND after decode+transmit is workstream 2
   scope); the UI keeps its own ABORT→RTL button, now sent as DO_SET_MODE via
