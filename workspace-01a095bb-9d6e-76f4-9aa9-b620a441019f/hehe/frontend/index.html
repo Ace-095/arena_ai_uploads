@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Geofence Uplink</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css" />
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<style>
+  :root {
+    --bg: #0a0e13;
+    --panel: #12171f;
+    --panel-border: #232b36;
+    --text: #d7dde3;
+    --text-dim: #7b8794;
+    --amber: #ffb020;
+    --green: #34d17c;
+    --red: #ff5c5c;
+    --cyan: #52c7e0;
+    --mono: "JetBrains Mono", "SFMono-Regular", Consolas, Menlo, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; background: var(--bg); color: var(--text); font-family: var(--sans); }
+  #app { display: grid; grid-template-columns: 340px 1fr; height: 100%; }
+  #map-wrapper { position: relative; height: 100%; width: 100%; overflow: hidden; }
+  #map { height: 100%; filter: saturate(0.85) brightness(0.95); }
+
+  #camera-grid {
+    position: absolute;
+    bottom: 20px;
+    right: 20px;
+    z-index: 1000;
+    display: flex;
+    gap: 12px;
+    pointer-events: auto;
+  }
+  .cam-view {
+    width: 280px;
+    height: 210px;
+    background: #0d1218;
+    border: 1px solid var(--panel-border);
+    border-radius: 6px;
+    overflow: hidden;
+    position: relative;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+  }
+  .cam-view video, .cam-view img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+  }
+  .cam-view .cam-label {
+    position: absolute;
+    top: 6px;
+    left: 6px;
+    background: rgba(10, 14, 19, 0.85);
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--cyan);
+    letter-spacing: 0.05em;
+  }
+  .cam-view .cam-stats {
+    position: absolute;
+    bottom: 6px;
+    right: 6px;
+    background: rgba(10, 14, 19, 0.85);
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-family: var(--mono);
+    font-size: 9px;
+    color: var(--text-dim);
+  }
+
+  #panel {
+    background: var(--panel);
+    border-right: 1px solid var(--panel-border);
+    padding: 18px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+  .brand { font-family: var(--mono); font-size: 12px; letter-spacing: 0.14em; color: var(--text-dim); text-transform: uppercase; }
+  .brand strong { color: var(--cyan); }
+
+  .card {
+    background: #0d1218;
+    border: 1px solid var(--panel-border);
+    border-radius: 6px;
+    padding: 14px;
+  }
+  .card h2 {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--text-dim);
+    margin: 0 0 10px 0;
+    font-weight: 600;
+  }
+
+  .annunciator {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px;
+    border-radius: 4px;
+    border: 1px solid var(--panel-border);
+    font-family: var(--mono);
+  }
+  .annunciator .lamp {
+    width: 14px; height: 14px; border-radius: 3px;
+    background: #2a3138;
+    box-shadow: inset 0 0 4px rgba(0,0,0,0.6);
+  }
+  .annunciator.armable { border-color: rgba(52,209,124,0.4); }
+  .annunciator.armable .lamp { background: var(--green); box-shadow: 0 0 10px var(--green); }
+  .annunciator.not-armable { border-color: rgba(255,92,92,0.4); }
+  .annunciator.not-armable .lamp { background: var(--red); box-shadow: 0 0 10px var(--red); }
+  .annunciator .label { font-size: 13px; letter-spacing: 0.05em; }
+  .annunciator .sub { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
+
+  button {
+    width: 100%;
+    padding: 10px 12px;
+    background: #1a2129;
+    border: 1px solid var(--panel-border);
+    color: var(--text);
+    border-radius: 5px;
+    font-family: var(--sans);
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    margin-bottom: 8px;
+    transition: border-color 0.15s;
+  }
+  button:hover { border-color: var(--cyan); }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  button.primary { background: rgba(82,199,224,0.12); border-color: var(--cyan); color: var(--cyan); }
+  button.danger { background: rgba(255,92,92,0.1); border-color: rgba(255,92,92,0.4); color: var(--red); }
+
+  .stat-row { display: flex; justify-content: space-between; font-family: var(--mono); font-size: 12px; padding: 4px 0; border-bottom: 1px solid #171d24; }
+  .stat-row:last-child { border-bottom: none; }
+  .stat-row .k { color: var(--text-dim); }
+  .stat-row .v { color: var(--text); }
+
+  .reason {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-dim);
+    line-height: 1.5;
+    word-break: break-word;
+  }
+
+  input[type=text] {
+    width: 100%;
+    background: #0d1218;
+    border: 1px solid var(--panel-border);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 12px;
+    padding: 8px;
+    border-radius: 4px;
+    margin-bottom: 8px;
+  }
+
+  .badge {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 10px;
+    padding: 2px 6px;
+    border-radius: 3px;
+    letter-spacing: 0.05em;
+  }
+  .badge.drawing { background: rgba(255,176,32,0.15); color: var(--amber); }
+  .badge.idle { background: rgba(123,135,148,0.15); color: var(--text-dim); }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="panel">
+    <div class="brand"><strong>GEOFENCE</strong> UPLINK — M1</div>
+
+    <div class="card">
+      <h2>Backend</h2>
+      <input type="text" id="backendUrl" placeholder="http://raspberrypi.local:8000" />
+      <div class="stat-row"><span class="k">connection</span><span class="v" id="connState">unknown</span></div>
+    </div>
+
+    <div class="card">
+      <h2>Map & Tile Source</h2>
+      <div class="stat-row"><span class="k">tile source</span><span class="v" id="tileSourceState">ONLINE (OSM)</span></div>
+      <button id="btnToggleTileSource">Switch to Offline Tiles</button>
+      <button id="btnToggleGrid">Toggle Meter Grid Overlay</button>
+    </div>
+
+    <div class="card">
+      <h2>Telemetry <span class="badge idle" id="telemBadge">disconnected</span></h2>
+      <div class="stat-row"><span class="k">lat</span><span class="v" id="telemLat">—</span></div>
+      <div class="stat-row"><span class="k">lon</span><span class="v" id="telemLon">—</span></div>
+      <div class="stat-row"><span class="k">alt MSL</span><span class="v" id="telemAlt">—</span></div>
+      <div class="stat-row"><span class="k">alt rel</span><span class="v" id="telemAltRel">—</span></div>
+      <div class="stat-row"><span class="k">hdg</span><span class="v" id="telemHdg">—</span></div>
+      <div class="stat-row"><span class="k">vx,vy,vz</span><span class="v" id="telemVel">—</span></div>
+      <div class="stat-row"><span class="k">roll,pitch,yaw</span><span class="v" id="telemAtt">—</span></div>
+      <div class="stat-row"><span class="k">mode</span><span class="v" id="telemMode">—</span></div>
+      <div class="stat-row"><span class="k">armed</span><span class="v" id="telemArmed">—</span></div>
+      <div class="stat-row"><span class="k">GPS fix</span><span class="v" id="telemGps">—</span></div>
+      <div class="stat-row"><span class="k">bat V</span><span class="v" id="telemBatV">—</span></div>
+    </div>
+
+    <div class="card">
+      <h2>System Info <span class="badge idle" id="sysBadge">—</span></h2>
+      <div class="stat-row"><span class="k">CPU</span><span class="v" id="sysCpu">—</span></div>
+      <div class="stat-row"><span class="k">RAM</span><span class="v" id="sysRam">—</span></div>
+      <div class="stat-row"><span class="k">Disk</span><span class="v" id="sysDisk">—</span></div>
+      <div class="stat-row"><span class="k">CPU temp</span><span class="v" id="sysTemp">—</span></div>
+      <div class="stat-row"><span class="k">CPU freq</span><span class="v" id="sysFreq">—</span></div>
+      <div class="stat-row"><span class="k">uptime</span><span class="v" id="sysUptime">—</span></div>
+      <div class="stat-row"><span class="k">AI accelerator</span><span class="v" id="sysAi">—</span></div>
+      <div class="stat-row"><span class="k">Internet</span><span class="v" id="sysInternet">—</span></div>
+    </div>
+
+    <div class="card">
+      <h2>Camera Pipeline <span class="badge idle" id="camBadge">mode: dual</span></h2>
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 8px;">
+        <button id="btnCamModeCam1">Cam 1</button>
+        <button id="btnCamModeCam2">Cam 2</button>
+        <button id="btnCamModeDual" class="primary">Dual</button>
+        <button id="btnCamModeOff">Off</button>
+      </div>
+      <div class="stat-row"><span class="k">mode</span><span class="v" id="camModeVal">dual</span></div>
+      <div class="stat-row"><span class="k">cam1 status</span><span class="v" id="cam1Status">—</span></div>
+      <div class="stat-row"><span class="k">cam2 status</span><span class="v" id="cam2Status">—</span></div>
+      <div style="margin-top: 8px;">
+        <div class="stat-row"><span class="k">hardware focus</span><span class="v" id="focusVal">0.5</span></div>
+        <input type="range" id="focusSlider" min="0" max="1" step="0.05" value="0.5" style="width: 100%; margin-top: 4px;" />
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Fence status</h2>
+      <div class="annunciator not-armable" id="annunciator">
+        <div class="lamp"></div>
+        <div>
+          <div class="label" id="annLabel">NOT ARMABLE</div>
+          <div class="sub" id="annSub">no fence loaded</div>
+        </div>
+      </div>
+      <div style="margin-top:10px;">
+        <div class="stat-row"><span class="k">vertices</span><span class="v" id="stVertices">—</span></div>
+        <div class="stat-row"><span class="k">max radius (m)</span><span class="v" id="stRadius">—</span></div>
+        <div class="stat-row"><span class="k">origin lat</span><span class="v" id="stOriginLat">—</span></div>
+        <div class="stat-row"><span class="k">origin lon</span><span class="v" id="stOriginLon">—</span></div>
+        <div class="stat-row"><span class="k">FC readback</span><span class="v" id="stReadback">—</span></div>
+      </div>
+      <div class="reason" id="stReason" style="margin-top:8px;"></div>
+    </div>
+
+    <div class="card">
+      <h2>Draw fence <span class="badge idle" id="drawBadge">idle</span></h2>
+      <button id="btnDraw">Start drawing</button>
+      <button id="btnUndo">Undo last point</button>
+      <button id="btnClearDraw">Clear drawing</button>
+      <div class="stat-row"><span class="k">points placed</span><span class="v" id="ptCount">0</span></div>
+    </div>
+
+    <div class="card">
+      <h2>Flight controller</h2>
+      <button class="primary" id="btnUpload">Upload to flight controller</button>
+      <button class="danger" id="btnDelete">Clear fence on FC</button>
+    </div>
+
+    <div class="reason">
+      Search area = this polygon. No default area exists — if nothing is
+      uploaded and confirmed, the fence service reports NOT ARMABLE.
+    </div>
+  </div>
+  <div id="map-wrapper">
+    <div id="map"></div>
+    <div id="camera-grid">
+      <div class="cam-view" id="camView1">
+        <div class="cam-label">CAM 1 (BELLY)</div>
+        <video id="videoCam1" autoplay playsinline muted></video>
+        <div class="cam-stats" id="statsCam1">0 ms</div>
+      </div>
+      <div class="cam-view" id="camView2">
+        <div class="cam-label">CAM 2 (SEARCH)</div>
+        <video id="videoCam2" autoplay playsinline muted></video>
+        <div class="cam-stats" id="statsCam2">0 ms</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+
+<script type="module">
+import { TelemetryClient } from './js/telemetry.js';
+import { TileManager } from './js/tiles.js';
+import { CameraStreamManager } from './js/cameras.js';
+
+const $ = (id) => document.getElementById(id);
+
+const map = L.map('map', { zoomControl: true });
+
+function centerMap(lat, lon, zoom) {
+  map.setView([lat, lon], zoom);
+}
+if (navigator.geolocation) {
+  navigator.geolocation.getCurrentPosition(
+    (pos) => centerMap(pos.coords.latitude, pos.coords.longitude, 19),
+    () => centerMap(20, 0, 3)
+  );
+} else {
+  centerMap(20, 0, 3);
+}
+
+// --- Backend URL ---
+const backendInput = $('backendUrl');
+backendInput.value = localStorage.getItem('geofence_backend_url') || '';
+backendInput.addEventListener('change', () => {
+  localStorage.setItem('geofence_backend_url', backendInput.value.trim());
+});
+function backendUrl() { return (backendInput.value || '').trim().replace(/\/$/, ''); }
+
+// --- Camera Stream Manager ---
+const cameraMgr = new CameraStreamManager(backendUrl);
+
+cameraMgr.onLatencyUpdate = (cameraId, latencyMs) => {
+  const statsEl = cameraId === 'cam1' ? $('statsCam1') : $('statsCam2');
+  if (statsEl) statsEl.textContent = `${latencyMs.toFixed(0)} ms`;
+};
+
+async function updateCameraUi(status) {
+  if (!status) return;
+  $('camModeVal').textContent = status.mode;
+  $('camBadge').textContent = `mode: ${status.mode}`;
+
+  const c1 = status.sources.cam1;
+  const c2 = status.sources.cam2;
+  $('cam1Status').textContent = c1 ? (c1.active ? `ACTIVE (${c1.type})` : 'stopped') : 'n/a';
+  $('cam2Status').textContent = c2 ? (c2.active ? `ACTIVE (${c2.type})` : 'stopped') : 'n/a';
+
+  // Toggle video display visibility
+  const showCam1 = status.mode === 'cam1' || status.mode === 'dual';
+  const showCam2 = status.mode === 'cam2' || status.mode === 'dual';
+
+  $('camView1').style.display = showCam1 ? 'block' : 'none';
+  $('camView2').style.display = showCam2 ? 'block' : 'none';
+
+  if (showCam1) cameraMgr.attachStream('cam1', $('videoCam1'));
+  else cameraMgr.detachStream('cam1');
+
+  if (showCam2) cameraMgr.attachStream('cam2', $('videoCam2'));
+  else cameraMgr.detachStream('cam2');
+}
+
+$('btnCamModeCam1').addEventListener('click', async () => {
+  const s = await cameraMgr.setMode('cam1');
+  updateCameraUi(s);
+});
+$('btnCamModeCam2').addEventListener('click', async () => {
+  const s = await cameraMgr.setMode('cam2');
+  updateCameraUi(s);
+});
+$('btnCamModeDual').addEventListener('click', async () => {
+  const s = await cameraMgr.setMode('dual');
+  updateCameraUi(s);
+});
+$('btnCamModeOff').addEventListener('click', async () => {
+  const s = await cameraMgr.setMode('none');
+  updateCameraUi(s);
+});
+
+$('focusSlider').addEventListener('change', (e) => {
+  const val = parseFloat(e.target.value);
+  $('focusVal').textContent = val.toFixed(2);
+  cameraMgr.setFocus(val);
+});
+
+// --- Tile & Meter Grid Manager ---
+const tileManager = new TileManager(map, backendUrl);
+let gridEnabled = true;
+
+
+$('btnToggleTileSource').addEventListener('click', () => {
+  const isOffline = tileManager.toggleMode();
+  $('tileSourceState').textContent = isOffline ? 'OFFLINE (MBTiles)' : 'ONLINE (OSM)';
+  $('btnToggleTileSource').textContent = isOffline ? 'Switch to Online OSM' : 'Switch to Offline Tiles';
+});
+
+$('btnToggleGrid').addEventListener('click', () => {
+  gridEnabled = !gridEnabled;
+  tileManager.setGridEnabled(gridEnabled);
+  $('btnToggleGrid').textContent = gridEnabled ? 'Hide Meter Grid' : 'Show Meter Grid';
+});
+
+// --- Telemetry WebSocket client ---
+const telem = new TelemetryClient(backendUrl());
+telem.on('connected', () => {
+  $('telemBadge').textContent = 'connected';
+  $('telemBadge').className = 'badge drawing';
+});
+telem.on('disconnected', () => {
+  $('telemBadge').textContent = 'disconnected';
+  $('telemBadge').className = 'badge idle';
+});
+telem.on('position', (pos) => {
+  $('telemLat').textContent = pos.lat.toFixed(7);
+  $('telemLon').textContent = pos.lon.toFixed(7);
+  $('telemAlt').textContent = pos.alt_msl != null ? pos.alt_msl.toFixed(1) : '—';
+  $('telemAltRel').textContent = pos.alt_rel != null ? pos.alt_rel.toFixed(1) : '—';
+  if (pos.hdg != null) $('telemHdg').textContent = pos.hdg.toFixed(1) + '°';
+});
+telem.on('velocity', (vel) => {
+  $('telemVel').textContent = vel.vx != null ? `${vel.vx.toFixed(2)}, ${vel.vy.toFixed(2)}, ${vel.vz.toFixed(2)}` : '—';
+});
+telem.on('attitude', (att) => {
+  $('telemAtt').textContent = `${att.roll.toFixed(1)}, ${att.pitch.toFixed(1)}, ${att.yaw.toFixed(1)}`;
+});
+telem.on('mode', (mode) => {
+  $('telemMode').textContent = mode || '—';
+});
+telem.on('armed', (armed) => {
+  $('telemArmed').textContent = armed ? 'YES' : 'NO';
+});
+telem.on('gps', (gps) => {
+  $('telemGps').textContent = gps.fix_type != null ? `fix=${gps.fix_type}, sats=${gps.satellites_visible}` : '—';
+});
+telem.on('battery', (bat) => {
+  $('telemBatV').textContent = bat.voltage_battery != null ? bat.voltage_battery.toFixed(2) + 'V' : '—';
+});
+
+telem.on('system', (sys) => {
+  $('sysBadge').textContent = 'live';
+  $('sysBadge').className = 'badge drawing';
+  $('sysCpu').textContent = sys.cpu_percent != null ? sys.cpu_percent.toFixed(0) + '%' : '—';
+  $('sysRam').textContent = sys.ram_percent != null
+    ? `${sys.ram_percent.toFixed(0)}% (${(sys.ram_used_mb/1024).toFixed(1)}/${(sys.ram_total_mb/1024).toFixed(1)} GB)`
+    : '—';
+  $('sysDisk').textContent = sys.disk_percent != null ? sys.disk_percent.toFixed(0) + '%' : '—';
+  $('sysTemp').textContent = sys.cpu_temp_c != null ? sys.cpu_temp_c.toFixed(1) + '°C' : 'n/a';
+  $('sysFreq').textContent = sys.cpu_freq_mhz != null ? (sys.cpu_freq_mhz/1000).toFixed(2) + ' GHz' : '—';
+  if (sys.uptime_s != null) {
+    const h = Math.floor(sys.uptime_s / 3600);
+    const m = Math.floor((sys.uptime_s % 3600) / 60);
+    $('sysUptime').textContent = `${h}h ${m}m`;
+  }
+  $('sysAi').textContent = sys.ai_accelerator_available ? 'online' : 'unavailable';
+  const internetEl = $('sysInternet');
+  internetEl.textContent = sys.internet_status === 'up' ? 'up' : 'down';
+  internetEl.style.color = sys.internet_status === 'up' ? 'var(--green)' : 'var(--text-dim)';
+});
+
+backendInput.addEventListener('change', () => {
+  telem.disconnect();
+  telem._backendUrl = backendUrl();
+  if (backendUrl()) telem.connect();
+});
+if (backendUrl()) telem.connect();
+
+// --- Drawing state ---
+let drawing = false;
+let vertices = [];
+let markers = [];
+let polygonLayer = null;
+
+function redraw() {
+  if (polygonLayer) { map.removeLayer(polygonLayer); polygonLayer = null; }
+  if (vertices.length >= 2) {
+    polygonLayer = L.polygon(vertices.map(v => [v.lat, v.lng]), {
+      color: '#52c7e0', weight: 2, fillColor: '#52c7e0', fillOpacity: 0.08
+    }).addTo(map);
+  }
+  $('ptCount').textContent = vertices.length;
+}
+
+map.on('click', (e) => {
+  if (!drawing) return;
+  vertices.push(e.latlng);
+  const marker = L.circleMarker(e.latlng, { radius: 5, color: '#ffb020', fillColor: '#ffb020', fillOpacity: 1 }).addTo(map);
+  markers.push(marker);
+  redraw();
+});
+
+$('btnDraw').addEventListener('click', () => {
+  drawing = !drawing;
+  $('drawBadge').textContent = drawing ? 'drawing — click map' : 'idle';
+  $('drawBadge').className = 'badge ' + (drawing ? 'drawing' : 'idle');
+  $('btnDraw').textContent = drawing ? 'Stop drawing' : 'Start drawing';
+});
+
+$('btnUndo').addEventListener('click', () => {
+  vertices.pop();
+  const m = markers.pop();
+  if (m) map.removeLayer(m);
+  redraw();
+});
+
+$('btnClearDraw').addEventListener('click', () => {
+  vertices = [];
+  markers.forEach(m => map.removeLayer(m));
+  markers = [];
+  redraw();
+});
+
+// --- Backend calls ---
+async function apiGet(path) {
+  const r = await fetch(backendUrl() + path);
+  return r.json();
+}
+async function apiPost(path, body) {
+  const r = await fetch(backendUrl() + path, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+  });
+  return r.json();
+}
+async function apiDelete(path) {
+  const r = await fetch(backendUrl() + path, { method: 'DELETE' });
+  return r.json();
+}
+
+$('btnUpload').addEventListener('click', async () => {
+  if (vertices.length < 3) { alert('Need at least 3 points to form a polygon.'); return; }
+  if (!backendUrl()) { alert('Set the backend URL first.'); return; }
+  $('btnUpload').disabled = true;
+  $('btnUpload').textContent = 'Uploading…';
+  try {
+    const body = { vertices: vertices.map(v => ({ lat: v.lat, lon: v.lng })) };
+    const status = await apiPost('/api/geofence', body);
+    renderStatus(status);
+  } catch (e) {
+    $('connState').textContent = 'unreachable';
+  } finally {
+    $('btnUpload').disabled = false;
+    $('btnUpload').textContent = 'Upload to flight controller';
+  }
+});
+
+$('btnDelete').addEventListener('click', async () => {
+  if (!backendUrl()) { alert('Set the backend URL first.'); return; }
+  const status = await apiDelete('/api/geofence');
+  renderStatus(status);
+});
+
+function renderStatus(s) {
+  const ann = $('annunciator');
+  ann.className = 'annunciator ' + (s.armable ? 'armable' : 'not-armable');
+  $('annLabel').textContent = s.armable ? 'ARMABLE' : 'NOT ARMABLE';
+  $('annSub').textContent = s.armable ? 'fence confirmed on flight controller' : 'search must not proceed';
+  $('stVertices').textContent = s.vertex_count ?? '—';
+  $('stRadius').textContent = s.max_radius_m != null ? s.max_radius_m.toFixed(1) : '—';
+  $('stOriginLat').textContent = s.origin_lat != null ? s.origin_lat.toFixed(7) : '—';
+  $('stOriginLon').textContent = s.origin_lon != null ? s.origin_lon.toFixed(7) : '—';
+  $('stReadback').textContent = s.fc_readback_matched === true ? 'matched' : (s.fc_readback_matched === false ? 'mismatch' : '—');
+  $('stReason').textContent = s.reason || '';
+
+  if (s.origin_lat != null && s.origin_lon != null) {
+    tileManager.setGridOrigin(s.origin_lat, s.origin_lon, false);
+  }
+}
+
+async function pollStatus() {
+  if (!backendUrl()) return;
+  try {
+    const s = await apiGet('/api/geofence');
+    renderStatus(s);
+    $('connState').textContent = 'connected';
+  } catch (e) {
+    $('connState').textContent = 'unreachable';
+  }
+}
+setInterval(pollStatus, 3000);
+pollStatus();
+</script>
+</body>
+</html>

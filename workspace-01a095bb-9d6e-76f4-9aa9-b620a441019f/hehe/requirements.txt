@@ -1,0 +1,37 @@
+# Consolidated requirements — covers Phases 0-8 of docs/IMPLEMENTATION_PLAN.md.
+#
+# Create the venv first, THEN read the "NOT in this file" section below
+# before installing anything — a few real dependencies (picamera2, ROS 2,
+# Gazebo, the Hailo SDK) are not ordinary pip packages and will either
+# fail to install or install something broken if you try to pip-install
+# them normally.
+#
+#   python3 -m venv .venv
+#   source .venv/bin/activate
+#   pip install --upgrade pip
+#   pip install -r requirements.txt
+
+# --- Core backend (Phase 0/2/3): FastAPI service, MAVLink, models ---
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pymavlink>=2.4.40
+pydantic>=2.6
+psutil>=5.9               # Pi CPU/RAM/disk/temp monitoring — system_monitor.py
+
+# --- Phase 4: offline tile pre-caching tool ---
+requests>=2.31
+
+# --- Phase 5/7: camera pipeline, QR detection/decode ---
+numpy>=1.26
+opencv-contrib-python>=4.9      # superset of opencv-python; includes WeChatQRCode.
+                                 # Do NOT also install plain `opencv-python` — the two
+                                 # packages conflict (same cv2 module, different builds).
+pyzbar>=0.1.9                   # needs the system zbar library — see below
+aiortc>=1.9                     # WebRTC publishing; needs system media libs — see below
+
+# --- Phase 1: synthetic QR test-image generation (no simulator needed) ---
+qrcode[pil]>=7.4                # the [pil] extra pulls in Pillow for image rendering
+Pillow>=10.0                    # explicit pin — also used directly by camera_source.py
+
+# --- Optional: only if you migrate the plain test scripts to pytest ---
+# pytest>=8.0

@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""
+QR Scanner – Motion Optimized (Indoor)
+For Raspberry Pi Camera Module 3 Wide (IMX708)
+----------------------------------------------------
+• pyzbar-based (accuracy-focused)
+• Motion-adaptive shutter + ISO
+• 3/5-frame fusion for hand or drone vibration
+• Live preview with FPS and motion overlays
+"""
+
+import cv2
+import numpy as np
+import time
+import logging
+from pyzbar import pyzbar
+from collections import deque
+from dataclasses import dataclass
+
+# -------------------------------------
+# Logging
+# -------------------------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("QRScanner")
+
+# -------------------------------------
+# Data container
+# -------------------------------------
+@dataclass
+class FrameData:
+    frame: np.ndarray
+    timestamp: float
+    motion_score: float = 0.0
+
+
+# -------------------------------------
+# Camera Backend for Pi Camera 3 Wide
+# -------------------------------------
+class CameraBackend:
+    def __init__(self, resolution=(1280, 720)):
+        self.resolution = resolution
+        self.camera = None
+        self.is_picamera = False
+
+    def initialize(self):
+        try:
+            from picamera2 import Picamera2
+            from libcamera import controls
+            self.camera = Picamera2()
+            config = self.camera.create_preview_configuration(
+                main={"size": self.resolution, "format": "RGB888"},
+                controls={
+                    "AfMode": controls.AfModeEnum.Continuous,
+                    "AfSpeed": controls.AfSpeedEnum.Fast,
+                    "Brightness": 0.1,
+                    "Contrast": 1.2,
+                    "Saturation": 1.1,
+                    "Sharpness": 1.2,
+                },
+            )
+            self.camera.configure(config)
+            self.camera.start()
+            time.sleep(1.0)
+            self.camera.set_controls({
+                "AfMode": controls.AfModeEnum.Manual,
+                "AnalogueGain": 8.0,     # ISO ~800
+                "ExposureTime": 18000,   # 18 ms initial exposure
+            })
+            logger.info("✅ Pi Camera 3 Wide initialized.")
+            self.is_picamera = True
+            return True
+        except Exception as e:
+            logger.error(f"❌ PiCamera2 init failed: {e}")
+            return False
+
+    def capture(self):
+        try:
+            frame = self.camera.capture_array("main")
+            return cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        except Exception as e:
+            logger.debug(f"Capture failed: {e}")
+            return None
+
+    def update_exposure(self, exposure):
+        try:
+            from libcamera import controls
+            self.camera.set_controls({"ExposureTime": int(exposure)})
+        except Exception as e:
+            logger.debug(f"Exposure update failed: {e}")
+
+    def close(self):
+        try:
+            self.camera.stop()
+        except:
+            pass
+
+
+# -------------------------------------
+# Stabilizer + Motion Detector
+# -------------------------------------
+class MotionStabilizer:
+    def __init__(self, buffer_size=5):
+        self.prev_gray = None
+        self.buffer = deque(maxlen=buffer_size)
+
+    def calc_motion(self, gray):
+        if self.prev_gray is None:
+            self.prev_gray = gray
+            return 0.0
+        flow = cv2.calcOpticalFlowFarneback(
+            self.prev_gray, gray, None,
+            0.5, 3, 15, 3, 5, 1.2, 0
+        )
+        mag, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+        score = min(np.mean(mag) / 10.0, 1.0)
+        self.prev_gray = gray
+        return score
+
+
+# -------------------------------------
+# Frame Fusion Engine
+# -------------------------------------
+class FrameFusion:
+    def __init__(self):
+        self.frames = deque(maxlen=5)
+
+    def add_frame(self, frame):
+        self.frames.append(frame.astype(np.float32))
+
+    def fuse(self, mode):
+        if len(self.frames) < 2:
+            return self.frames[-1].astype(np.uint8)
+        if mode == "average":
+            return np.clip(np.mean(self.frames, axis=0), 0, 255).astype(np.uint8)
+        elif mode == "median":
+            return np.median(np.stack(self.frames, axis=0), axis=0).astype(np.uint8)
+        return self.frames[-1].astype(np.uint8)
+
+
+# -------------------------------------
+# Main QR Scanner
+# -------------------------------------
+class QRScanner:
+    def __init__(self, resolution=(1280, 720)):
+        self.camera = CameraBackend(resolution)
+        self.motion = MotionStabilizer()
+        self.fusion = FrameFusion()
+        self.running = True
+        self.exposure = 18000
+        self.fps_times = deque(maxlen=30)
+        self.motion_score = 0.0
+
+    def detect_qr(self, frame):
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        barcodes = pyzbar.decode(gray)
+        detections = []
+        for b in barcodes:
+            data = b.data.decode('utf-8', errors='ignore')
+            if data:
+                detections.append((data, (b.rect.left, b.rect.top, b.rect.width, b.rect.height)))
+        return detections
+
+    def start(self):
+        if not self.camera.initialize():
+            logger.error("Camera init failed.")
+            return
+
+        cv2.namedWindow("QR Scanner", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("QR Scanner", 1280, 720)
+
+        while self.running:
+            t0 = time.time()
+            frame = self.camera.capture()
+            if frame is None:
+                continue
+
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            self.motion_score = self.motion.calc_motion(gray)
+
+            # Adaptive exposure control
+            if self.motion_score > 0.3:
+                self.exposure = max(1000, self.exposure // 2)
+                self.camera.update_exposure(self.exposure)
+            elif self.motion_score < 0.15:
+                self.exposure = min(20000, self.exposure + 1000)
+                self.camera.update_exposure(self.exposure)
+
+            # Adaptive fusion
+            fusion_mode = None
+            if 0.25 <= self.motion_score < 0.6:
+                fusion_mode = "average"
+            elif self.motion_score >= 0.6:
+                fusion_mode = "median"
+
+            if fusion_mode:
+                self.fusion.add_frame(frame)
+                if len(self.fusion.frames) >= (3 if fusion_mode == "average" else 5):
+                    frame = self.fusion.fuse(fusion_mode)
+            else:
+                self.fusion.frames.clear()
+
+            # Detect QR
+            detections = self.detect_qr(frame)
+
+            # Draw overlays
+            fps = 1.0 / np.mean(self.fps_times) if self.fps_times else 0
+            cv2.putText(frame, f"FPS:{fps:.1f}", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(frame, f"Motion:{self.motion_score:.2f}", (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            cv2.putText(frame, f"Exp:{self.exposure}us", (10, 90),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+            for data, (x, y, w, h) in detections:
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 3)
+                cv2.putText(frame, data[:25], (x, y - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                logger.info(f"[QR DETECTED] {data}")
+
+            self.fps_times.append(time.time() - t0)
+            cv2.imshow("QR Scanner", frame)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+
+        self.stop()
+
+    def stop(self):
+        self.running = False
+        self.camera.close()
+        cv2.destroyAllWindows()
+        logger.info("Scanner stopped.")
+
+
+# -------------------------------------
+# Run
+# -------------------------------------
+if __name__ == "__main__":
+    scanner = QRScanner(resolution=(1280, 720))
+    scanner.start()

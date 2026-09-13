@@ -1,0 +1,96 @@
+"""
+Minimal mock flight controller that speaks just enough of the ArduPilot
+fence + param protocol to validate mavlink_fence.py end-to-end over a real
+MAVLink/UDP transport, without needing a Pixhawk or a full SITL build.
+
+This is a correctness check for the client-side protocol implementation,
+NOT a substitute for testing against real ArduPilot firmware (SITL or
+hardware) before competition. It doesn't replicate ArduPilot's actual
+fence storage/enforcement logic, EKF behavior, or edge cases — just enough
+of the wire protocol to catch client-side bugs.
+"""
+
+import os
+os.environ.setdefault("MAVLINK20", "1")
+
+import threading
+import time
+from pymavlink import mavutil
+
+
+def run_mock_fc(bind_addr: str, stop_event: threading.Event,
+                 origin_lat: float = 12.9716, origin_lon: float = 77.5946):
+    conn = mavutil.mavlink_connection(bind_addr)
+    fence_items = []  # list of (x_int, y_int, command)
+    last_hb = 0.0
+
+    while not stop_event.is_set():
+        now = time.time()
+        if now - last_hb > 1.0:
+            conn.mav.heartbeat_send(
+                mavutil.mavlink.MAV_TYPE_QUADROTOR,
+                mavutil.mavlink.MAV_AUTOPILOT_ARDUPILOTMEGA,
+                0, 0, mavutil.mavlink.MAV_STATE_STANDBY,
+            )
+            last_hb = now
+
+        msg = conn.recv_match(blocking=True, timeout=0.2)
+        if msg is None:
+            continue
+        mtype = msg.get_type()
+
+        if mtype == "COMMAND_LONG" and msg.command == mavutil.mavlink.MAV_CMD_REQUEST_MESSAGE:
+            if int(msg.param1) == mavutil.mavlink.MAVLINK_MSG_ID_GPS_GLOBAL_ORIGIN:
+                conn.mav.gps_global_origin_send(
+                    int(origin_lat * 1e7), int(origin_lon * 1e7), 0, int(time.time() * 1e6)
+                )
+
+        elif mtype == "MISSION_COUNT" and msg.mission_type == mavutil.mavlink.MAV_MISSION_TYPE_FENCE:
+            count = msg.count
+            received = {}
+            deadline = time.time() + 5.0
+            for seq in range(count):
+                conn.mav.mission_request_int_send(
+                    conn.target_system if hasattr(conn, "target_system") else 1,
+                    1, seq, mission_type=mavutil.mavlink.MAV_MISSION_TYPE_FENCE
+                )
+                while seq not in received and time.time() < deadline:
+                    item = conn.recv_match(type="MISSION_ITEM_INT", blocking=True, timeout=1.0)
+                    if item is None:
+                        continue
+                    if item.mission_type != mavutil.mavlink.MAV_MISSION_TYPE_FENCE:
+                        continue
+                    received[item.seq] = (item.x, item.y, item.command)
+            fence_items = [received[i] for i in range(count)]
+            conn.mav.mission_ack_send(
+                1, 1, mavutil.mavlink.MAV_MISSION_ACCEPTED,
+                mission_type=mavutil.mavlink.MAV_MISSION_TYPE_FENCE,
+            )
+
+        elif mtype == "MISSION_REQUEST_LIST" and msg.mission_type == mavutil.mavlink.MAV_MISSION_TYPE_FENCE:
+            conn.mav.mission_count_send(1, 1, len(fence_items), mission_type=mavutil.mavlink.MAV_MISSION_TYPE_FENCE)
+
+        elif mtype == "MISSION_REQUEST_INT" and msg.mission_type == mavutil.mavlink.MAV_MISSION_TYPE_FENCE:
+            seq = msg.seq
+            if seq < len(fence_items):
+                x, y, cmd = fence_items[seq]
+                conn.mav.mission_item_int_send(
+                    1, 1, seq, mavutil.mavlink.MAV_FRAME_GLOBAL, cmd, 0, 0,
+                    float(len(fence_items)), 0, 0, 0, x, y, 0.0,
+                    mission_type=mavutil.mavlink.MAV_MISSION_TYPE_FENCE,
+                )
+
+        elif mtype == "MISSION_CLEAR_ALL" and msg.mission_type == mavutil.mavlink.MAV_MISSION_TYPE_FENCE:
+            fence_items = []
+            conn.mav.mission_ack_send(
+                1, 1, mavutil.mavlink.MAV_MISSION_ACCEPTED,
+                mission_type=mavutil.mavlink.MAV_MISSION_TYPE_FENCE,
+            )
+
+        elif mtype == "PARAM_SET":
+            param_id = msg.param_id
+            if isinstance(param_id, str):
+                param_id = param_id.encode("ascii")
+            conn.mav.param_value_send(
+                param_id, msg.param_value, mavutil.mavlink.MAV_PARAM_TYPE_REAL32, 1, 0
+            )

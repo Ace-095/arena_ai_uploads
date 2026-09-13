@@ -1,0 +1,98 @@
+<?xml version="1.0" ?>
+<!--
+  qr_box/model.sdf — Intelligence Cache target model for Gazebo Harmonic.
+
+  A flat 1.0m × 1.0m × 0.1m slab with a QR code texture applied to the
+  top face. Stands in for the physical cache target during simulation.
+
+  Texture: materials/textures/qr_code.png
+  Regenerate the PNG with: sim/textures/generate_qr_texture.py
+
+  Coordinate convention: model origin is at the geometric centre.
+  The box rests on the ground when z = 0.05 in the world file.
+
+  SDF version: 1.9 (Gazebo Harmonic default)
+-->
+<sdf version="1.9">
+  <model name="qr_box">
+    <static>true</static>
+
+    <link name="base">
+      <!-- Inertial (static model, inertial values are unused by the physics
+           engine but must be present and physically plausible to suppress
+           Gazebo warnings). -->
+      <inertial>
+        <mass>5.0</mass>
+        <inertia>
+          <ixx>0.42</ixx>
+          <ixy>0.0</ixy>
+          <ixz>0.0</ixz>
+          <iyy>0.42</iyy>
+          <iyz>0.0</iyz>
+          <izz>0.83</izz>
+        </inertia>
+      </inertial>
+
+      <!-- Collision shape -->
+      <collision name="collision">
+        <geometry>
+          <box>
+            <size>1.0 1.0 0.1</size>
+          </box>
+        </geometry>
+        <surface>
+          <friction>
+            <ode>
+              <mu>0.6</mu>
+              <mu2>0.6</mu2>
+            </ode>
+          </friction>
+        </surface>
+      </collision>
+
+      <!-- Visual: top face carries the QR texture; side faces are plain white.
+           We use two visuals: the full box (white), and a flat plane on the
+           top surface with the QR material. This avoids UV-mapping the box
+           and ensures the QR is visible from above. -->
+
+      <!-- White box body -->
+      <visual name="body">
+        <geometry>
+          <box>
+            <size>1.0 1.0 0.1</size>
+          </box>
+        </geometry>
+        <material>
+          <ambient>0.9 0.9 0.9 1</ambient>
+          <diffuse>0.9 0.9 0.9 1</diffuse>
+          <specular>0.1 0.1 0.1 1</specular>
+        </material>
+      </visual>
+
+      <!-- QR top face: a thin plane sitting at z=+0.051 (just above the box top).
+           Rendered as a 1m × 1m plane with the QR PNG as its diffuse map.
+           The camera looks down from above, so the Y-axis flip aligns the
+           texture correctly (plane normal points +Z). -->
+      <visual name="qr_top">
+        <pose>0 0 0.051 0 0 0</pose>
+        <geometry>
+          <plane>
+            <normal>0 0 1</normal>
+            <size>1.0 1.0</size>
+          </plane>
+        </geometry>
+        <material>
+          <!-- Gazebo Harmonic uses Ogre2/PBR material pipeline.
+               The diffuse_map path is relative to the model root directory. -->
+          <pbr>
+            <metal>
+              <albedo_map>materials/textures/qr_code.png</albedo_map>
+              <metalness>0.0</metalness>
+              <roughness>0.9</roughness>
+            </metal>
+          </pbr>
+        </material>
+      </visual>
+    </link>
+  </model>
+</sdf>

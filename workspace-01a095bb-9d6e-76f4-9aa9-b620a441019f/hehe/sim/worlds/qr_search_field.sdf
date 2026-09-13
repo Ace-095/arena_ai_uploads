@@ -1,0 +1,187 @@
+<?xml version="1.0" ?>
+<!--
+  qr_search_field.sdf — Gazebo Harmonic world for ADDC 2027 search pipeline dev.
+
+  Contents:
+    - Physics (Bullet Featherstone, Harmonic default, appropriate for multirotor)
+    - Lighting: directional sun + ambient
+    - Ground plane: 60m x 60m green field
+    - ArduPilot Gazebo plugin: routes SITL flight dynamics through Gazebo physics
+    - Iris vehicle with a downward-facing RGB camera sensor
+    - QR target box: flat 1m x 1m slab at ground level with a decodable QR texture
+
+  Usage:
+    1. Follow docs/SIMULATION_SETUP.md to install ardupilot_gazebo and set
+       GZ_SIM_SYSTEM_PLUGIN_PATH, GZ_SIM_RESOURCE_PATH.
+    2. Start SITL: sim_vehicle.py -v ArduCopter -f gazebo-iris -model JSON -map -console
+    3. Launch this world: gz sim sim/worlds/qr_search_field.sdf
+
+  Camera topic:
+    NEED TEST — run `ros2 topic list` after launching with gz-ros-bridge to find
+    the actual topic name. Set ROS2_CAMERA_TOPIC in your environment to match.
+    Expected pattern: /world/qr_search_field/model/iris_with_ardupilot/link/{link}/sensor/{sensor}/image
+
+  Coordinate system:
+    - World origin: centre of the 60m x 60m field.
+    - +X = East, +Y = North, +Z = Up (ENU — matches ArduPilot local frame).
+    - QR target box placed at (10.0, 5.0, 0.05): 10m East, 5m North of origin.
+      Offset intentionally non-zero so it's not centred (easier to notice if
+      guidance logic is ignoring the real pose).
+
+  NOTES:
+    - The iris vehicle start position (0, 0, 0.3) is at the world origin.
+      ArduPilot SITL spawns the vehicle here. Do not move it — SITL uses its
+      own internal physics state and the Gazebo pose is updated by the plugin.
+    - Ground plane friction is set conservatively; landing will be stable.
+    - Search-field scale is 60m x 60m. This is an approximation of a typical
+      competition field size — NEED TEAM INPUT on actual expected dimensions.
+-->
+<sdf version="1.9" xmlns:experimental="http://sdformat.org/schemas/experimental">
+  <world name="qr_search_field">
+
+    <!-- Physics -->
+    <physics name="1ms" type="bullet_featherstone">
+      <!-- 500 Hz physics, 1ms step — appropriate for multirotor control loops -->
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+      <real_time_update_rate>1000</real_time_update_rate>
+    </physics>
+
+    <plugin
+      filename="gz-sim-physics-system"
+      name="gz::sim::systems::Physics">
+    </plugin>
+    <plugin
+      filename="gz-sim-user-commands-system"
+      name="gz::sim::systems::UserCommands">
+    </plugin>
+    <plugin
+      filename="gz-sim-scene-broadcaster-system"
+      name="gz::sim::systems::SceneBroadcaster">
+    </plugin>
+    <plugin
+      filename="gz-sim-contact-system"
+      name="gz::sim::systems::Contact">
+    </plugin>
+    <plugin
+      filename="gz-sim-sensors-system"
+      name="gz::sim::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+    <plugin
+      filename="gz-sim-imu-system"
+      name="gz::sim::systems::Imu">
+    </plugin>
+    <plugin
+      filename="gz-sim-air-pressure-system"
+      name="gz::sim::systems::AirPressure">
+    </plugin>
+    <plugin
+      filename="gz-sim-altimeter-system"
+      name="gz::sim::systems::Altimeter">
+    </plugin>
+
+    <!-- Lighting -->
+    <light name="sunlight" type="directional">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 100 0 0 0</pose>
+      <diffuse>1.0 1.0 0.95 1</diffuse>
+      <specular>0.3 0.3 0.3 1</specular>
+      <!-- Angle matches a mid-morning sun: azimuth ~30 deg, elevation ~50 deg -->
+      <direction>-0.5 0.25 -0.8</direction>
+      <attenuation>
+        <range>1000</range>
+        <constant>0.9</constant>
+        <linear>0.01</linear>
+        <quadratic>0.001</quadratic>
+      </attenuation>
+    </light>
+
+    <scene>
+      <ambient>0.4 0.4 0.4 1</ambient>
+      <background>0.53 0.81 0.98 1</background>
+      <shadows>true</shadows>
+    </scene>
+
+    <!-- Ground plane: 60m x 60m green field -->
+    <model name="ground_plane">
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <plane>
+              <normal>0 0 1</normal>
+              <size>60 60</size>
+            </plane>
+          </geometry>
+          <surface>
+            <friction>
+              <ode>
+                <mu>0.8</mu>
+                <mu2>0.8</mu2>
+              </ode>
+            </friction>
+          </surface>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <plane>
+              <normal>0 0 1</normal>
+              <size>60 60</size>
+            </plane>
+          </geometry>
+          <material>
+            <ambient>0.18 0.40 0.12 1</ambient>
+            <diffuse>0.22 0.50 0.15 1</diffuse>
+            <specular>0.02 0.05 0.02 1</specular>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- QR target box: Intelligence Cache stand-in -->
+    <include>
+      <uri>model://qr_box</uri>
+      <name>intelligence_cache</name>
+      <pose>10.0 5.0 0.05 0 0 0</pose>
+    </include>
+
+    <!-- Iris vehicle with ArduPilot plugin and downward camera sensor -->
+    <include>
+      <uri>model://iris_with_ardupilot</uri>
+      <name>iris_with_ardupilot</name>
+      <pose>0 0 0.3 0 0 0</pose>
+
+      <experimental:params>
+        <sensor
+          element_id="iris_with_standoffs::base_link"
+          action="add"
+          type="camera"
+          name="downward_cam">
+
+          <!-- Point straight down -->
+          <pose>0 0 -0.1 3.14159 0 0</pose>
+
+          <camera>
+            <horizontal_fov>1.396</horizontal_fov>
+            <image>
+              <width>640</width>
+              <height>480</height>
+              <format>R8G8B8</format>
+            </image>
+            <clip>
+              <near>0.05</near>
+              <far>200</far>
+            </clip>
+          </camera>
+
+          <update_rate>10</update_rate>
+          <visualize>false</visualize>
+
+          <topic>/iris/downward_cam/image_raw</topic>
+        </sensor>
+      </experimental:params>
+    </include>
+
+  </world>
+</sdf>
