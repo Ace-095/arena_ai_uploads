@@ -1,0 +1,1470 @@
+#!/usr/bin/env python3
+"""
+Autonomous QR-Guided Drone System with PID Landing Control
+Part 1: Core Classes and Configuration
+
+Compatible with SITL simulation and real hardware (Raspberry Pi 4 + Pixhawk 2.4.8)
+Features: QR detection, auto-to-guided switching, PID landing, payload drop, RTL
+"""
+
+import sys
+import os
+import cv2
+import numpy as np
+import time
+import logging
+import threading
+from collections import deque
+from pyzbar import pyzbar
+from pymavlink import mavutil
+from dataclasses import dataclass
+from typing import Optional, Tuple, List
+
+# Suppress zbar warnings
+sys.stderr = open(os.devnull, 'w')
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+@dataclass
+class SystemConfig:
+    """Main system configuration"""
+    # Hardware mode
+    USE_SITL: bool = True  # Set to False for real drone
+    
+    # Camera settings - OPTIMIZED FOR QR DETECTION
+    CAMERA_RESOLUTION: Tuple[int, int] = (1920, 1080)  # Full HD for better detection
+    CAMERA_ISO: int = 100  # Low ISO for sharp images (AnalogueGain = 1.0)
+    CAMERA_SHUTTER_US: int = 600  # Fast shutter 1/1666s for motion blur elimination
+    CAMERA_FPS: int = 20  # 20 FPS for stability
+    
+    # QR detection - DYNAMIC SIZING
+    QR_SIZE_CM: float = 21.0  # A2 paper recommended (will auto-detect actual size)
+    QR_MIN_PIXEL_WIDTH: int = 40  # Minimum QR width in pixels for reliable detection
+    QR_DETECTION_CONFIDENCE: int = 2  # Consecutive frames (reduced from 3)
+    QR_MIN_AREA: int = 1600  # Minimum QR area (80x80 pixels)
+    QR_SEARCH_TIMEOUT: float = 120.0  # Extended search time
+    QR_SEARCH_PATTERN_ENABLED: bool = True  # Enable search pattern movement
+    
+    # PID tuning for landing alignment - IMPROVED
+    PID_KP: float = 0.5  # Increased for faster response
+    PID_KI: float = 0.08
+    PID_KD: float = 0.2
+    PID_MAX_VEL: float = 0.8  # Increased max velocity
+    
+    # Mission parameters
+    APPROACH_ALTITUDE: float = 5.0  # meters (higher for better QR visibility)
+    LANDING_THRESHOLD_CM: float = 25.0  # Relaxed threshold (was 10cm)
+    CENTERING_TIMEOUT: float = 60.0  # Increased timeout
+    
+    # MAVLink settings
+    MAVLINK_PORT_SITL: str = "tcp:192.168.29.8:5762"
+    MAVLINK_PORT_REAL: str = "/dev/serial0"
+    MAVLINK_BAUD: int = 57600
+    
+    # Display
+    SHOW_GUI: bool = True  # Set to False for headless mode
+    
+    # Environment adaptation
+    AUTO_EXPOSURE_ADAPT: bool = True  # Adapt to lighting conditions
+    
+    def get_mavlink_connection(self) -> str:
+        return self.MAVLINK_PORT_SITL if self.USE_SITL else self.MAVLINK_PORT_REAL
+
+
+# ============================================================================
+# LOGGING SETUP
+# ============================================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("qr_drone.log"),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger("QRDrone")
+
+
+# ============================================================================
+# PID CONTROLLER
+# ============================================================================
+
+class PIDController:
+    """PID controller for drone positioning"""
+    
+    def __init__(self, kp: float, ki: float, kd: float, max_output: float):
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.max_output = max_output
+        
+        self.integral = 0.0
+        self.prev_error = 0.0
+        self.prev_time = None
+        
+    def reset(self):
+        """Reset controller state"""
+        self.integral = 0.0
+        self.prev_error = 0.0
+        self.prev_time = None
+        
+    def update(self, error: float, current_time: float) -> float:
+        """Calculate PID output"""
+        if self.prev_time is None:
+            self.prev_time = current_time
+            return 0.0
+            
+        dt = current_time - self.prev_time
+        if dt <= 0:
+            return 0.0
+            
+        # PID calculations
+        self.integral += error * dt
+        derivative = (error - self.prev_error) / dt if dt > 0 else 0.0
+        
+        output = (self.kp * error) + (self.ki * self.integral) + (self.kd * derivative)
+        
+        # Clamp output
+        output = max(-self.max_output, min(self.max_output, output))
+        
+        self.prev_error = error
+        self.prev_time = current_time
+        
+        return output
+
+
+# ============================================================================
+# QR DETECTOR
+# ============================================================================
+
+class QRDetector:
+    """Optimized QR code detector following 80px rule and environmental adaptation"""
+    
+    def __init__(self, config: SystemConfig):
+        self.config = config
+        self.detection_history = deque(maxlen=config.QR_DETECTION_CONFIDENCE)
+        self.last_qr_data = None
+        self.last_qr_bbox = None
+        self.detection_scales = [1.0]  # Only full resolution for 1080p
+        
+        # Adaptive preprocessing
+        self.brightness_history = deque(maxlen=30)
+        self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        
+    def adapt_preprocessing(self, frame: np.ndarray) -> np.ndarray:
+        """Adapt preprocessing based on lighting conditions"""
+        # Measure average brightness
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        avg_brightness = np.mean(gray)
+        self.brightness_history.append(avg_brightness)
+        
+        # Determine lighting condition
+        if len(self.brightness_history) >= 10:
+            mean_brightness = np.mean(self.brightness_history)
+            
+            if mean_brightness > 180:
+                # Bright sunlight - use CLAHE aggressively
+                clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+                enhanced = clahe.apply(gray)
+                # Additional noise reduction
+                enhanced = cv2.GaussianBlur(enhanced, (3, 3), 0)
+            elif mean_brightness < 80:
+                # Low light / evening - boost contrast heavily
+                clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
+                enhanced = clahe.apply(gray)
+                # Sharpen
+                kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+                enhanced = cv2.filter2D(enhanced, -1, kernel)
+            else:
+                # Normal lighting - standard CLAHE
+                enhanced = self.clahe.apply(gray)
+        else:
+            # Not enough data - use standard
+            enhanced = self.clahe.apply(gray)
+            
+        return enhanced
+        
+    def detect(self, frame: np.ndarray) -> Optional[dict]:
+        """
+        Detect QR code with 80px minimum width rule
+        Returns: dict with 'data', 'bbox', 'center', 'pixel_width' or None
+        """
+        if frame is None or frame.size == 0:
+            return None
+            
+        # Apply adaptive preprocessing
+        enhanced = self.adapt_preprocessing(frame)
+        
+        # Detect QR codes
+        barcodes = pyzbar.decode(enhanced)
+        
+        if barcodes:
+            for barcode in barcodes:
+                x = barcode.rect.left
+                y = barcode.rect.top
+                w = barcode.rect.width
+                h = barcode.rect.height
+                
+                # Apply 80px minimum width rule
+                if w < self.config.QR_MIN_PIXEL_WIDTH:
+                    logger.warning(f"QR too small: {w}px < {self.config.QR_MIN_PIXEL_WIDTH}px (drone too high)")
+                    continue
+                    
+                # Filter by minimum area
+                if w * h < self.config.QR_MIN_AREA:
+                    continue
+                    
+                data = barcode.data.decode('utf-8', errors='ignore')
+                
+                # Calculate center
+                cx = x + w // 2
+                cy = y + h // 2
+                
+                result = {
+                    'data': data,
+                    'bbox': (x, y, w, h),
+                    'center': (cx, cy),
+                    'area': w * h,
+                    'pixel_width': w,
+                    'pixel_height': h
+                }
+                
+                # Update history
+                self.detection_history.append(result)
+                self.last_qr_data = data
+                self.last_qr_bbox = (x, y, w, h)
+                
+                logger.info(f"QR detected: {w}x{h}px, data={data[:30]}")
+                return result
+                    
+        # No detection
+        self.detection_history.append(None)
+        return None
+        
+    def is_stable_detection(self) -> bool:
+        """Check if QR detection is stable"""
+        if len(self.detection_history) < self.config.QR_DETECTION_CONFIDENCE:
+            return False
+        return all(d is not None for d in self.detection_history)
+        
+    def estimate_distance_from_qr(self, qr_pixel_width: int, frame_width: int) -> float:
+        """
+        Dynamically estimate distance using actual QR pixel width
+        Better than assuming fixed QR size
+        """
+        # Focal length estimation (approximate for 1080p)
+        # This should be calibrated for your camera
+        focal_length_px = frame_width * 0.7  # Rough estimate
+        
+        # Real QR width in meters (A2 = 0.42m, but we measure dynamically)
+        real_qr_width_m = self.config.QR_SIZE_CM / 100.0
+        
+        # Distance = (Real_Width × Focal_Length) / Pixel_Width
+        distance = (real_qr_width_m * focal_length_px) / qr_pixel_width
+        
+        return distance
+
+
+# ============================================================================
+# CAMERA MANAGER
+# ============================================================================
+
+class CameraManager:
+    """Manages camera capture with Pi Camera 2 or OpenCV fallback"""
+    
+    def __init__(self, config: SystemConfig):
+        self.config = config
+        self.camera = None
+        self.use_picamera = False
+        self.cap = None
+        self.latest_frame = None
+        self.lock = threading.Lock()
+        self.running = False
+        self.camera_type = None
+        
+    def init_camera(self) -> bool:
+        """Initialize camera - Auto-detect and try all available options"""
+        logger.info("="*60)
+        logger.info("CAMERA INITIALIZATION - AUTO-DETECT MODE")
+        logger.info("="*60)
+        
+        # Priority 1: Try Picamera2 (Native Pi Camera) - ALWAYS TRY FIRST
+        if self._init_picamera2():
+            return True
+            
+        # Priority 2: Try OpenCV with V4L2 (USB or Pi Camera via V4L2)
+        if self._init_opencv_v4l2():
+            return True
+            
+        # Priority 3: Try libcamera via OpenCV
+        if self._init_opencv_libcamera():
+            return True
+            
+        # Priority 4: Try any available camera via OpenCV
+        if self._init_opencv_any():
+            return True
+            
+        logger.error("ALL CAMERA INITIALIZATION METHODS FAILED!")
+        return False
+    
+    def _init_picamera2(self) -> bool:
+        """Try to initialize Picamera2 (Raspberry Pi Camera Module)"""
+        try:
+            logger.info("Attempting Picamera2 (Native Pi Camera)...")
+            from picamera2 import Picamera2
+            
+            self.camera = Picamera2()
+            
+            # Configure camera with optimized settings
+            camera_config = self.camera.create_preview_configuration(
+                main={"size": self.config.CAMERA_RESOLUTION, "format": "RGB888"},
+                buffer_count=2
+            )
+            self.camera.configure(camera_config)
+            
+            # Start camera
+            self.camera.start()
+            logger.info("Picamera2 started, warming up...")
+            time.sleep(2.0)
+            
+            # CRITICAL: Set manual controls for optimal QR detection
+            # Following the optimization guide
+            controls = {
+                "AeEnable": False,  # Disable auto exposure
+                "AwbEnable": False,  # Disable auto white balance
+                "AnalogueGain": 1.0,  # ISO 100 equivalent
+                "ExposureTime": int(self.config.CAMERA_SHUTTER_US)  # Fast shutter
+            }
+            
+            # Adaptive exposure if enabled
+            if self.config.AUTO_EXPOSURE_ADAPT:
+                # Take test frame to check lighting
+                test_array = self.camera.capture_array("main")
+                avg_brightness = np.mean(test_array)
+                
+                if avg_brightness > 180:
+                    # Very bright - reduce exposure
+                    controls["ExposureTime"] = 400
+                    logger.info("Bright conditions detected - using 400µs exposure")
+                elif avg_brightness < 80:
+                    # Low light - increase exposure slightly
+                    controls["ExposureTime"] = 800
+                    logger.info("Low light detected - using 800µs exposure")
+                else:
+                    logger.info(f"Normal lighting - using {self.config.CAMERA_SHUTTER_US}µs exposure")
+            
+            self.camera.set_controls(controls)
+            time.sleep(1.0)
+            
+            # Test capture
+            test_array = self.camera.capture_array("main")
+            test_frame = cv2.cvtColor(test_array, cv2.COLOR_RGB2BGR)
+            
+            if test_frame is not None and test_frame.size > 0:
+                self.use_picamera = True
+                self.camera_type = "Picamera2"
+                logger.info(f"✓ Picamera2 SUCCESS! Resolution: {test_frame.shape}")
+                logger.info(f"  Settings: ISO={controls['AnalogueGain']*100:.0f}, Shutter={controls['ExposureTime']}µs")
+                logger.info("="*60)
+                return True
+            else:
+                logger.warning("Picamera2 opened but test frame invalid")
+                self.camera.stop()
+                self.camera.close()
+                self.camera = None
+                
+        except ImportError:
+            logger.info("Picamera2 library not available (not a Pi or not installed)")
+        except Exception as e:
+            logger.warning(f"Picamera2 failed: {e}")
+            if self.camera:
+                try:
+                    self.camera.stop()
+                    self.camera.close()
+                except:
+                    pass
+                self.camera = None
+                
+        return False
+    
+    def _init_opencv_v4l2(self) -> bool:
+        """Try OpenCV with V4L2 backend"""
+        try:
+            logger.info("Attempting OpenCV with V4L2 backend...")
+            
+            # Try multiple camera indices
+            for idx in [0, 1, 2]:
+                logger.info(f"  Trying /dev/video{idx}...")
+                
+                self.cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+                
+                if not self.cap.isOpened():
+                    if self.cap:
+                        self.cap.release()
+                    continue
+                
+                # Configure camera
+                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.CAMERA_RESOLUTION[0])
+                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.CAMERA_RESOLUTION[1])
+                self.cap.set(cv2.CAP_PROP_FPS, self.config.CAMERA_FPS)
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                
+                # Try MJPEG format for better compatibility
+                self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M','J','P','G'))
+                
+                time.sleep(2.0)
+                
+                # Test capture
+                ret, test_frame = self.cap.read()
+                
+                if ret and test_frame is not None and test_frame.size > 0:
+                    self.camera_type = f"OpenCV-V4L2 (video{idx})"
+                    logger.info(f"✓ V4L2 SUCCESS on /dev/video{idx}! Resolution: {test_frame.shape}")
+                    logger.info("="*60)
+                    return True
+                else:
+                    logger.info(f"  video{idx} opened but no valid frame")
+                    self.cap.release()
+                    self.cap = None
+                    
+        except Exception as e:
+            logger.warning(f"V4L2 backend failed: {e}")
+            if self.cap:
+                self.cap.release()
+                self.cap = None
+                
+        return False
+    
+    def _init_opencv_libcamera(self) -> bool:
+        """Try OpenCV with libcamera backend (Pi Camera via libcamera)"""
+        try:
+            logger.info("Attempting OpenCV with libcamera backend...")
+            
+            # Try libcamera pipeline for Raspberry Pi Camera
+            pipeline = f"libcamerasrc ! video/x-raw,width={self.config.CAMERA_RESOLUTION[0]},height={self.config.CAMERA_RESOLUTION[1]},framerate={self.config.CAMERA_FPS}/1 ! videoconvert ! appsink"
+            
+            self.cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+            
+            if self.cap.isOpened():
+                time.sleep(2.0)
+                ret, test_frame = self.cap.read()
+                
+                if ret and test_frame is not None and test_frame.size > 0:
+                    self.camera_type = "OpenCV-libcamera"
+                    logger.info(f"✓ libcamera SUCCESS! Resolution: {test_frame.shape}")
+                    logger.info("="*60)
+                    return True
+                    
+            if self.cap:
+                self.cap.release()
+                self.cap = None
+                
+        except Exception as e:
+            logger.warning(f"libcamera backend failed: {e}")
+            if self.cap:
+                self.cap.release()
+                self.cap = None
+                
+        return False
+    
+    def _init_opencv_any(self) -> bool:
+        """Try OpenCV with default backend (last resort)"""
+        try:
+            logger.info("Attempting OpenCV with default backend (last resort)...")
+            
+            for idx in [0, 1, 2]:
+                logger.info(f"  Trying camera index {idx}...")
+                
+                self.cap = cv2.VideoCapture(idx)
+                
+                if not self.cap.isOpened():
+                    if self.cap:
+                        self.cap.release()
+                    continue
+                
+                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.CAMERA_RESOLUTION[0])
+                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.CAMERA_RESOLUTION[1])
+                self.cap.set(cv2.CAP_PROP_FPS, self.config.CAMERA_FPS)
+                
+                time.sleep(1.0)
+                
+                ret, test_frame = self.cap.read()
+                
+                if ret and test_frame is not None and test_frame.size > 0:
+                    self.camera_type = f"OpenCV-Default (idx {idx})"
+                    logger.info(f"✓ Default backend SUCCESS! Resolution: {test_frame.shape}")
+                    logger.info("="*60)
+                    return True
+                else:
+                    self.cap.release()
+                    self.cap = None
+                    
+        except Exception as e:
+            logger.warning(f"Default backend failed: {e}")
+            if self.cap:
+                self.cap.release()
+                self.cap = None
+                
+        return False
+            
+    def capture_frame(self) -> Optional[np.ndarray]:
+        """Capture a single frame"""
+        try:
+            if self.use_picamera and self.camera:
+                array = self.camera.capture_array("main")
+                return cv2.cvtColor(array, cv2.COLOR_RGB2BGR)
+            elif self.cap and self.cap.isOpened():
+                ret, frame = self.cap.read()
+                if ret and frame is not None:
+                    return frame
+                else:
+                    logger.debug("OpenCV read() returned empty frame")
+                    return None
+        except Exception as e:
+            logger.debug(f"Frame capture error: {e}")
+        return None
+        
+    def start_capture_thread(self):
+        """Start background capture thread"""
+        self.running = True
+        threading.Thread(target=self._capture_loop, daemon=True).start()
+        
+    def _capture_loop(self):
+        """Background capture loop"""
+        logger.info(f"Camera capture thread started ({self.camera_type})")
+        frame_count = 0
+        error_count = 0
+        
+        while self.running:
+            frame = self.capture_frame()
+            if frame is not None:
+                with self.lock:
+                    self.latest_frame = frame
+                frame_count += 1
+                error_count = 0
+                
+                # Log every 100 frames
+                if frame_count % 100 == 0:
+                    logger.debug(f"Captured {frame_count} frames from {self.camera_type}")
+            else:
+                error_count += 1
+                if error_count % 50 == 0:
+                    logger.warning(f"Frame capture failures: {error_count}")
+                time.sleep(0.1)
+                
+            time.sleep(1.0 / self.config.CAMERA_FPS)
+            
+        logger.info("Camera capture thread stopped")
+        
+    def get_latest_frame(self) -> Optional[np.ndarray]:
+        """Get latest captured frame"""
+        with self.lock:
+            return self.latest_frame.copy() if self.latest_frame is not None else None
+            
+    def stop(self):
+        """Stop camera"""
+        self.running = False
+        time.sleep(0.5)
+        
+        if self.camera:
+            self.camera.stop()
+            self.camera.close()
+            logger.info("Picamera2 stopped")
+        if self.cap:
+            self.cap.release()
+            logger.info("OpenCV camera released")
+# ============================================================================
+# MAVLINK INTERFACE - Part 2
+# ============================================================================
+
+class MAVLinkInterface:
+    """MAVLink communication handler"""
+    
+    def __init__(self, config: SystemConfig):
+        self.config = config
+        self.master = None
+        self.target_system = None
+        self.target_component = 1
+        self.current_mode = None
+        self.mission_items = {}
+        self.current_waypoint = -1
+        
+    def connect(self) -> bool:
+        """Connect to flight controller"""
+        try:
+            connection_string = self.config.get_mavlink_connection()
+            logger.info(f"Connecting to MAVLink: {connection_string}")
+            
+            if self.config.USE_SITL:
+                self.master = mavutil.mavlink_connection(connection_string)
+            else:
+                self.master = mavutil.mavlink_connection(
+                    connection_string, 
+                    baud=self.config.MAVLINK_BAUD
+                )
+                
+            # Wait for heartbeat
+            logger.info("Waiting for heartbeat...")
+            msg = self.master.wait_heartbeat(timeout=10)
+            if not msg:
+                logger.error("No heartbeat received")
+                return False
+                
+            self.target_system = self.master.target_system
+            self.target_component = 1  # Autopilot
+            
+            logger.info(f"Connected to system {self.target_system}")
+            
+            # Request data streams
+            self.request_data_streams(rate_hz=10)
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"MAVLink connection failed: {e}")
+            return False
+            
+    def request_data_streams(self, rate_hz: int = 10):
+        """Request MAVLink data streams"""
+        self.master.mav.request_data_stream_send(
+            self.target_system,
+            self.target_component,
+            mavutil.mavlink.MAV_DATA_STREAM_ALL,
+            rate_hz,
+            1
+        )
+        
+    def get_mode(self) -> Optional[str]:
+        """Get current flight mode"""
+        return self.current_mode
+        
+    def set_mode(self, mode_name: str) -> bool:
+        """Set flight mode"""
+        mode_id = self.master.mode_mapping().get(mode_name)
+        if mode_id is None:
+            logger.error(f"Mode '{mode_name}' not found")
+            return False
+            
+        logger.info(f"Setting mode to {mode_name}")
+        self.master.mav.set_mode_send(
+            self.target_system,
+            mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+            mode_id
+        )
+        
+        # Wait for confirmation
+        for _ in range(20):
+            msg = self.master.recv_match(type='HEARTBEAT', blocking=True, timeout=0.5)
+            if msg:
+                mode_str = mavutil.mode_string_v10(msg)
+                if mode_str and mode_name.upper() in mode_str.upper():
+                    self.current_mode = mode_str
+                    logger.info(f"Mode confirmed: {mode_str}")
+                    return True
+                    
+        logger.error(f"Failed to set mode {mode_name}")
+        return False
+        
+    def send_ned_velocity(self, vx: float, vy: float, vz: float):
+        """Send velocity command in NED frame"""
+        self.master.mav.set_position_target_local_ned_send(
+            0,
+            self.target_system,
+            self.target_component,
+            mavutil.mavlink.MAV_FRAME_LOCAL_NED,
+            0b0000111111000111,  # type_mask (velocities only)
+            0, 0, 0,  # positions (not used)
+            vx, vy, vz,  # velocities in m/s
+            0, 0, 0,  # accelerations (not used)
+            0, 0  # yaw, yaw_rate (not used)
+        )
+        
+    def send_position_target(self, x: float, y: float, z: float):
+        """Send position target in NED frame"""
+        self.master.mav.set_position_target_local_ned_send(
+            0,
+            self.target_system,
+            self.target_component,
+            mavutil.mavlink.MAV_FRAME_LOCAL_NED,
+            0b0000111111111000,  # type_mask (positions only)
+            x, y, z,  # positions in meters
+            0, 0, 0,  # velocities (not used)
+            0, 0, 0,  # accelerations (not used)
+            0, 0  # yaw, yaw_rate (not used)
+        )
+        
+    def command_land(self):
+        """Send land command"""
+        logger.info("Commanding LAND")
+        self.master.mav.command_long_send(
+            self.target_system,
+            self.target_component,
+            mavutil.mavlink.MAV_CMD_NAV_LAND,
+            0, 0, 0, 0, 0, 0, 0, 0
+        )
+        
+    def command_rtl(self):
+        """Send RTL command"""
+        logger.info("Commanding RTL")
+        self.master.mav.command_long_send(
+            self.target_system,
+            self.target_component,
+            mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH,
+            0, 0, 0, 0, 0, 0, 0, 0
+        )
+        
+    def send_statustext(self, text: str, severity: int = 6):
+        """Send status text to GCS"""
+        self.master.mav.statustext_send(
+            severity,
+            text.encode('utf-8')[:50].ljust(50, b'\0')
+        )
+        logger.info(f"Status: {text}")
+        
+    def request_mission_item(self, seq: int):
+        """Request specific mission item"""
+        self.master.mav.mission_request_int_send(
+            self.target_system,
+            self.target_component,
+            seq
+        )
+        
+    def get_local_position(self) -> Optional[Tuple[float, float, float]]:
+        """Get current local position NED"""
+        msg = self.master.recv_match(type='LOCAL_POSITION_NED', blocking=False)
+        if msg:
+            return (msg.x, msg.y, msg.z)
+        return None
+        
+    def get_altitude(self) -> Optional[float]:
+        """Get altitude above ground"""
+        msg = self.master.recv_match(type='GLOBAL_POSITION_INT', blocking=False)
+        if msg:
+            return msg.relative_alt / 1000.0  # Convert to meters
+        return None
+        
+    def close(self):
+        """Close connection"""
+        if self.master:
+            self.master.close()
+            logger.info("MAVLink connection closed")
+
+
+# ============================================================================
+# MISSION MONITOR - Part 2
+# ============================================================================
+
+class MissionMonitor:
+    """Monitors mission progress and detects trigger commands"""
+    
+    def __init__(self, mavlink: MAVLinkInterface):
+        self.mavlink = mavlink
+        self.running = False
+        self.trigger_detected = False
+        self.trigger_callback = None
+        self.last_waypoint = -1
+        
+    def set_trigger_callback(self, callback):
+        """Set callback for when trigger is detected"""
+        self.trigger_callback = callback
+        
+    def start(self):
+        """Start monitoring thread"""
+        self.running = True
+        threading.Thread(target=self._monitor_loop, daemon=True).start()
+        logger.info("Mission monitor started")
+        
+    def _monitor_loop(self):
+        """Main monitoring loop - FIXED: Only trigger on DO_SPRAYER, not on waypoint 1"""
+        last_stream_request = time.time()
+        detected_sprayer_seq = set()  # Track which waypoints we've already processed
+        
+        while self.running:
+            # Keep-alive for data streams
+            if time.time() - last_stream_request > 2.0:
+                self.mavlink.request_data_streams(10)
+                last_stream_request = time.time()
+                
+            msg = self.mavlink.master.recv_match(blocking=True, timeout=0.05)
+            if msg is None:
+                continue
+                
+            msg_type = msg.get_type()
+            
+            # Update current mode
+            if msg_type == 'HEARTBEAT':
+                mode_str = mavutil.mode_string_v10(msg)
+                if mode_str and mode_str != self.mavlink.current_mode:
+                    # Filter out invalid mode strings
+                    if not mode_str.startswith("Mode(0x"):
+                        self.mavlink.current_mode = mode_str
+                        logger.info(f"Mode: {mode_str}")
+                    
+            # Track waypoint progress
+            elif msg_type == 'MISSION_CURRENT':
+                wp = msg.seq
+                if wp != self.last_waypoint:
+                    logger.info(f"Waypoint: {wp}")
+                    self.last_waypoint = wp
+                    
+                    # Peek ahead - check NEXT waypoint for DO_SPRAYER
+                    # This is the critical fix - we check wp+1, not wp
+                    self.mavlink.request_mission_item(wp + 1)
+                    
+            # Check reached waypoints
+            elif msg_type == 'MISSION_ITEM_REACHED':
+                reached = msg.seq
+                logger.info(f"Reached waypoint: {reached}")
+                
+                # Request next item to check for DO_SPRAYER
+                self.mavlink.request_mission_item(reached + 1)
+                
+            # Receive mission items
+            elif msg_type == 'MISSION_ITEM_INT':
+                seq = msg.seq
+                cmd = msg.command
+                self.mavlink.mission_items[seq] = cmd
+                
+                # CRITICAL FIX: Only trigger on DO_SPRAYER command
+                # AND only if we haven't processed this sequence before
+                if cmd == mavutil.mavlink.MAV_CMD_DO_SPRAYER:
+                    if seq not in detected_sprayer_seq:
+                        logger.warning(f"DO_SPRAYER detected at waypoint {seq}!")
+                        detected_sprayer_seq.add(seq)
+                        
+                        # Only trigger if we're in AUTO mode and haven't triggered yet
+                        if self.mavlink.current_mode == 'AUTO' and not self.trigger_detected:
+                            self._handle_trigger()
+                        else:
+                            logger.info(f"DO_SPRAYER at wp {seq} but already triggered or not in AUTO")
+                    
+            # Backup: text-based trigger detection
+            elif msg_type == 'STATUSTEXT':
+                try:
+                    text = msg.text.decode('utf-8', errors='ignore').strip() \
+                           if isinstance(msg.text, bytes) else str(msg.text).strip()
+                    
+                    # Only trigger on sprayer-specific text AND in AUTO mode
+                    if ('Sprayer' in text or 'SPRAYER' in text) and self.mavlink.current_mode == 'AUTO':
+                        if not self.trigger_detected:
+                            logger.info(f"Sprayer text trigger: {text}")
+                            self._handle_trigger()
+                        
+                except:
+                    pass
+                    
+    def _handle_trigger(self):
+        """Handle trigger detection"""
+        if not self.trigger_detected:
+            self.trigger_detected = True
+            logger.warning("TRIGGER ACTIVATED!")
+            
+            if self.trigger_callback:
+                self.trigger_callback()
+                
+    def reset_trigger(self):
+        """Reset trigger state"""
+        self.trigger_detected = False
+        
+    def stop(self):
+        """Stop monitoring"""
+        self.running = False
+# ============================================================================
+# AUTONOMOUS CONTROLLER - Part 3
+# ============================================================================
+
+class AutonomousController:
+    """Main autonomous control system"""
+    
+    def __init__(self, config: SystemConfig):
+        self.config = config
+        self.camera = CameraManager(config)
+        self.qr_detector = QRDetector(config)
+        self.mavlink = MAVLinkInterface(config)
+        self.monitor = MissionMonitor(self.mavlink)
+        
+        # PID controllers for X and Y alignment
+        self.pid_x = PIDController(config.PID_KP, config.PID_KI, config.PID_KD, config.PID_MAX_VEL)
+        self.pid_y = PIDController(config.PID_KP, config.PID_KI, config.PID_KD, config.PID_MAX_VEL)
+        
+        self.running = False
+        self.display_frame = None
+        self.display_lock = threading.Lock()
+        
+    def initialize(self) -> bool:
+        """Initialize all systems"""
+        logger.info("Initializing systems...")
+        
+        # Connect MAVLink
+        if not self.mavlink.connect():
+            return False
+            
+        # Initialize camera
+        if not self.camera.init_camera():
+            return False
+            
+        # Start camera capture
+        self.camera.start_capture_thread()
+        time.sleep(1.0)
+        
+        # Set up mission monitor
+        self.monitor.set_trigger_callback(self.on_trigger_detected)
+        self.monitor.start()
+        
+        logger.info("All systems initialized")
+        return True
+        
+    def on_trigger_detected(self):
+        """Callback when DO_SPRAYER trigger is detected"""
+        logger.warning("Trigger detected - starting autonomous sequence")
+        threading.Thread(target=self.execute_autonomous_sequence, daemon=True).start()
+        
+    def execute_autonomous_sequence(self):
+        """Main autonomous sequence"""
+        try:
+            logger.info("="*60)
+            logger.info("  AUTONOMOUS SEQUENCE STARTED")
+            logger.info("="*60)
+            
+            # Step 1: Switch to GUIDED mode
+            if not self.switch_to_guided():
+                logger.error("Failed to switch to GUIDED mode")
+                return
+                
+            # Step 2: Search for QR code (never abort, keep searching)
+            qr_data = self.search_for_qr()
+            # QR will always be found eventually - no need to check for None
+                
+            # Step 3: Center and descend with PID
+            if not self.center_on_qr():
+                logger.error("Failed to center on QR - aborting")
+                self.mavlink.send_statustext("CENTERING_FAILED")
+                self.mavlink.command_rtl()
+                return
+                
+            # Step 4: Land
+            self.execute_landing()
+            
+            # Step 5: Drop payload (simulated)
+            self.drop_payload()
+            
+            # Step 6: RTL
+            self.mavlink.command_rtl()
+            self.mavlink.send_statustext("MISSION_COMPLETE")
+            
+            logger.info("="*60)
+            logger.info("  AUTONOMOUS SEQUENCE COMPLETE")
+            logger.info("="*60)
+            
+            # Reset trigger for next mission
+            self.monitor.reset_trigger()
+            
+        except Exception as e:
+            logger.error(f"Autonomous sequence error: {e}")
+            import traceback
+            traceback.print_exc()
+            self.mavlink.command_rtl()
+            
+    def switch_to_guided(self) -> bool:
+        """Switch to GUIDED mode"""
+        logger.info("Switching to GUIDED mode...")
+        time.sleep(0.5)
+        return self.mavlink.set_mode('GUIDED')
+        
+    def search_for_qr(self) -> Optional[str]:
+        """Search for QR code with active scanning pattern"""
+        logger.info("Searching for QR code...")
+        self.mavlink.send_statustext("SEARCHING_QR")
+        
+        search_timeout = self.config.QR_SEARCH_TIMEOUT
+        start_time = time.time()
+        
+        # Search pattern: hover and scan, then move if not found
+        search_phase = 0  # 0=hover, 1=move_right, 2=move_left, 3=move_forward, 4=move_back
+        phase_duration = 5.0  # seconds per phase
+        phase_start = start_time
+        
+        consecutive_detections = 0
+        required_detections = 5  # Need 5 consecutive frames
+        
+        while time.time() - start_time < search_timeout:
+            frame = self.camera.get_latest_frame()
+            if frame is None:
+                logger.warning("No frame available from camera")
+                time.sleep(0.2)
+                continue
+            
+            # Verify frame is valid
+            if frame.size == 0:
+                logger.warning("Empty frame received")
+                time.sleep(0.2)
+                continue
+                
+            logger.debug(f"Frame shape: {frame.shape}, dtype: {frame.dtype}")
+            
+            # Detect QR
+            qr_result = self.qr_detector.detect(frame)
+            
+            # Update display
+            if self.config.SHOW_GUI:
+                self._update_display(frame, qr_result, 
+                                   status=f"SEARCHING Phase {search_phase}")
+            
+            # Check for stable detection
+            if qr_result:
+                consecutive_detections += 1
+                logger.info(f"QR detected ({consecutive_detections}/{required_detections})")
+                
+                if consecutive_detections >= required_detections:
+                    qr_data = qr_result['data']
+                    logger.info(f"QR CODE CONFIRMED: {qr_data}")
+                    self.mavlink.send_statustext(f"QR: {qr_data[:40]}")
+                    
+                    # Stop movement
+                    self.mavlink.send_ned_velocity(0, 0, 0)
+                    return qr_data
+            else:
+                consecutive_detections = 0
+            
+            # Execute search pattern if enabled
+            if self.config.QR_SEARCH_PATTERN_ENABLED:
+                elapsed_phase = time.time() - phase_start
+                
+                if elapsed_phase > phase_duration:
+                    # Move to next phase
+                    search_phase = (search_phase + 1) % 5
+                    phase_start = time.time()
+                    logger.info(f"Search pattern: Phase {search_phase}")
+                    self.mavlink.send_statustext(f"SEARCH_P{search_phase}")
+                
+                # Execute movement based on phase
+                if search_phase == 0:
+                    # Hover and scan
+                    self.mavlink.send_ned_velocity(0, 0, 0)
+                elif search_phase == 1:
+                    # Move right
+                    self.mavlink.send_ned_velocity(0, 0.2, 0)
+                elif search_phase == 2:
+                    # Move left
+                    self.mavlink.send_ned_velocity(0, -0.2, 0)
+                elif search_phase == 3:
+                    # Move forward
+                    self.mavlink.send_ned_velocity(0.2, 0, 0)
+                elif search_phase == 4:
+                    # Move back
+                    self.mavlink.send_ned_velocity(-0.2, 0, 0)
+            
+            time.sleep(0.1)
+        
+        # Timeout reached - stop and continue anyway
+        logger.warning(f"QR search timeout ({search_timeout}s) - continuing search...")
+        self.mavlink.send_ned_velocity(0, 0, 0)
+        self.mavlink.send_statustext("QR_SEARCH_TIMEOUT")
+        
+        # Don't abort - keep searching indefinitely until QR is found
+        return self.search_for_qr_continuous()
+    
+    def search_for_qr_continuous(self) -> Optional[str]:
+        """Continue searching for QR indefinitely until found"""
+        logger.info("Entering continuous QR search mode...")
+        self.mavlink.send_statustext("QR_CONTINUOUS_SEARCH")
+        
+        consecutive_detections = 0
+        required_detections = 5
+        
+        while True:  # Search forever until found
+            frame = self.camera.get_latest_frame()
+            if frame is None or frame.size == 0:
+                time.sleep(0.2)
+                continue
+            
+            # Detect QR
+            qr_result = self.qr_detector.detect(frame)
+            
+            # Update display
+            if self.config.SHOW_GUI:
+                self._update_display(frame, qr_result, 
+                                   status="CONTINUOUS SEARCH")
+            
+            if qr_result:
+                consecutive_detections += 1
+                logger.info(f"QR detected ({consecutive_detections}/{required_detections})")
+                
+                if consecutive_detections >= required_detections:
+                    qr_data = qr_result['data']
+                    logger.info(f"QR CODE FOUND: {qr_data}")
+                    self.mavlink.send_statustext(f"QR_FOUND: {qr_data[:40]}")
+                    self.mavlink.send_ned_velocity(0, 0, 0)
+                    return qr_data
+            else:
+                consecutive_detections = 0
+            
+            time.sleep(0.1)
+        
+    def center_on_qr(self) -> bool:
+        """Center drone on QR code using PID control with DYNAMIC distance estimation"""
+        logger.info("Centering on QR code with PID...")
+        self.mavlink.send_statustext("CENTERING")
+        
+        # Reset PID controllers
+        self.pid_x.reset()
+        self.pid_y.reset()
+        
+        start_time = time.time()
+        centered_count = 0
+        required_centered_frames = 20  # Reduced from 30
+        
+        # Track movement for SITL debugging
+        last_velocity_time = time.time()
+        velocity_send_interval = 0.2  # Send velocity commands every 200ms
+        
+        while time.time() - start_time < self.config.CENTERING_TIMEOUT:
+            frame = self.camera.get_latest_frame()
+            if frame is None:
+                time.sleep(0.05)
+                continue
+                
+            # Detect QR
+            qr_result = self.qr_detector.detect(frame)
+            
+            if qr_result is None:
+                # Lost QR - stop and search
+                self.mavlink.send_ned_velocity(0, 0, 0)
+                logger.warning("Lost QR during centering")
+                centered_count = 0  # Reset counter
+                time.sleep(0.1)
+                continue
+                
+            # Get frame center and QR center
+            frame_h, frame_w = frame.shape[:2]
+            frame_center_x = frame_w / 2
+            frame_center_y = frame_h / 2
+            
+            qr_center_x, qr_center_y = qr_result['center']
+            
+            # Calculate errors in pixels
+            error_x_px = qr_center_x - frame_center_x
+            error_y_px = qr_center_y - frame_center_y
+            
+            # IMPROVED: Use dynamic distance estimation
+            qr_width_px = qr_result['pixel_width']
+            distance_m = self.qr_detector.estimate_distance_from_qr(qr_width_px, frame_w)
+            
+            # Log QR size for debugging
+            if int(time.time()) % 3 == 0:
+                logger.debug(f"QR size: {qr_width_px}x{qr_result['pixel_height']}px")
+            
+            # Convert pixel errors to metric errors using estimated distance
+            # Field of View (FOV) estimation
+            fov_horizontal_rad = np.radians(62.2)  # Typical Pi Camera FOV
+            px_to_m_ratio = (2 * distance_m * np.tan(fov_horizontal_rad / 2)) / frame_w
+            
+            error_x_m = error_x_px * px_to_m_ratio
+            error_y_m = error_y_px * px_to_m_ratio
+            
+            # Check if centered
+            error_distance = np.sqrt(error_x_m**2 + error_y_m**2)
+            if error_distance < (self.config.LANDING_THRESHOLD_CM / 100.0):
+                centered_count += 1
+                if centered_count >= required_centered_frames:
+                    logger.info("QR centered successfully!")
+                    self.mavlink.send_ned_velocity(0, 0, 0)
+                    time.sleep(0.5)
+                    return True
+            else:
+                centered_count = 0
+                
+            # PID control - only send commands at intervals
+            current_time = time.time()
+            if current_time - last_velocity_time >= velocity_send_interval:
+                vx = self.pid_y.update(error_y_m, current_time)  # Forward/backward (NED X)
+                vy = self.pid_x.update(error_x_m, current_time)  # Left/right (NED Y)
+                vz = 0.1  # Slow descent during centering
+                
+                # Send velocity command
+                self.mavlink.send_ned_velocity(vx, vy, vz)
+                last_velocity_time = current_time
+                
+                # Debug log
+                logger.debug(f"Vel cmd: vx={vx:.2f} vy={vy:.2f} vz={vz:.2f}")
+                
+            # Update display
+            if self.config.SHOW_GUI:
+                self._update_display(frame, qr_result, error_x_m, error_y_m, distance_m)
+                
+            # Log progress every 2 seconds
+            if int(time.time()) % 2 == 0 and time.time() - start_time > 1.0:
+                logger.info(f"Centering: error={error_distance*100:.1f}cm, dist={distance_m:.2f}m, QR={qr_width_px}px")
+                
+            time.sleep(0.05)
+            
+        logger.error("Centering timeout")
+        self.mavlink.send_ned_velocity(0, 0, 0)
+        return False
+        
+    def execute_landing(self):
+        """Execute landing sequence"""
+        logger.info("Landing...")
+        self.mavlink.send_statustext("LANDING")
+        self.mavlink.command_land()
+        time.sleep(10)  # Wait for landing
+        
+    def drop_payload(self):
+        """Simulate payload drop"""
+        logger.info("Dropping payload...")
+        self.mavlink.send_statustext("PAYLOAD_DROP")
+        # TODO: Add servo command for real payload release
+        # self.mavlink.master.mav.command_long_send(...)
+        time.sleep(2)
+        
+    def _update_display(self, frame, qr_result, error_x=None, error_y=None, distance=None, status=None):
+        """Update display frame with overlays (matching gemmav1.txt style) + QR diagnostics"""
+        if not self.config.SHOW_GUI:
+            return
+        
+        # Verify frame is valid
+        if frame is None or frame.size == 0:
+            logger.warning("Invalid frame for display")
+            return
+            
+        display = frame.copy()
+        h, w = display.shape[:2]
+        
+        # Calculate detection rate (like gemmav1.txt)
+        det_history = list(self.qr_detector.detection_history)
+        det_rate = sum(1 for d in det_history if d is not None) / len(det_history) if det_history else 0
+        
+        # Top-left: Detection rate (gemmav1.txt style)
+        cv2.putText(display, f"Detection Rate: {det_rate:.1%}", (10, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        
+        # Camera settings info with adaptive exposure indicator
+        avg_brightness = np.mean(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+        lighting_condition = "BRIGHT" if avg_brightness > 180 else "LOW" if avg_brightness < 80 else "NORMAL"
+        settings_text = f"ISO:{self.config.CAMERA_ISO} Shutter:{self.config.CAMERA_SHUTTER_US}us Light:{lighting_condition}"
+        cv2.putText(display, settings_text, (10, h - 50), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        # Camera type
+        cv2.putText(display, f"Cam: {self.camera.camera_type}", (10, h - 20), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        # Status text if provided
+        if status:
+            cv2.putText(display, f"Status: {status}", (10, 60), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        
+        # Draw center crosshair (larger, more visible)
+        cv2.line(display, (w//2 - 30, h//2), (w//2 + 30, h//2), (0, 255, 0), 2)
+        cv2.line(display, (w//2, h//2 - 30), (w//2, h//2 + 30), (0, 255, 0), 2)
+        cv2.circle(display, (w//2, h//2), 50, (0, 255, 0), 2)
+        
+        # Draw QR detection (gemmav1.txt style)
+        if qr_result:
+            x, y, qw, qh = qr_result['bbox']
+            cx, cy = qr_result['center']
+            pixel_w = qr_result.get('pixel_width', qw)
+            
+            # Color code based on size
+            if pixel_w >= self.config.QR_MIN_PIXEL_WIDTH:
+                color = (0, 255, 0)  # Green - good size
+            else:
+                color = (0, 165, 255)  # Orange - too small
+            
+            # QR bounding box
+            cv2.rectangle(display, (x, y), (x + qw, y + qh), color, 3)
+            
+            # QR center marker
+            cv2.circle(display, (cx, cy), 8, (0, 0, 255), -1)
+            cv2.circle(display, (cx, cy), 15, (0, 0, 255), 2)
+            
+            # Line from frame center to QR center
+            cv2.line(display, (w//2, h//2), (cx, cy), (255, 0, 255), 2)
+            
+            # QR data text (yellow like gemmav1.txt)
+            data_text = qr_result['data'][:20] + ('...' if len(qr_result['data']) > 20 else '')
+            text_y = y - 10 if y > 20 else y + qh + 20
+            cv2.putText(display, data_text, (x, text_y), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            
+            # QR pixel size indicator (CRITICAL INFO)
+            size_text = f"{pixel_w}x{qh}px"
+            size_color = (0, 255, 0) if pixel_w >= self.config.QR_MIN_PIXEL_WIDTH else (0, 165, 255)
+            cv2.putText(display, size_text, (x, y + qh + 25), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, size_color, 2)
+            
+            # 80px rule warning
+            if pixel_w < self.config.QR_MIN_PIXEL_WIDTH:
+                warning = f"QR TOO SMALL! Need >={self.config.QR_MIN_PIXEL_WIDTH}px"
+                cv2.putText(display, warning, (10, 90), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+                       
+        # Display PID errors and distance
+        info_y = 120
+        if error_x is not None and error_y is not None:
+            error_total = np.sqrt(error_x**2 + error_y**2)
+            info_text = f"Error: X={error_x*100:.1f}cm Y={error_y*100:.1f}cm Total={error_total*100:.1f}cm"
+            cv2.putText(display, info_text, (10, info_y), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+            info_y += 30
+                       
+        if distance is not None:
+            dist_text = f"Distance to QR: {distance:.2f}m"
+            cv2.putText(display, dist_text, (10, info_y), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                   
+        with self.display_lock:
+            self.display_frame = display
+            
+    def start_display(self):
+        """Start display window (GUI mode) - gemmav1.txt style"""
+        if not self.config.SHOW_GUI:
+            return
+            
+        logger.info("Starting display window...")
+        window_name = "Aerial QR Scanner - 720p"
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(window_name, 1280, 720)
+        
+        no_frame_count = 0
+        
+        # Print controls (gemmav1.txt style)
+        print("\n" + "="*60)
+        print("  Controls in preview window:")
+        print("    'q'      : Quit the program")
+        print("    'c'      : Capture screenshot")
+        print("    '+' / '=': Increase ISO (brighter)")
+        print("    '-'      : Decrease ISO (darker)")
+        print("    's'      : Slower shutter (more motion blur)")
+        print("    'f'      : Faster shutter (less motion blur)")
+        print("="*60 + "\n")
+        
+        while self.running:
+            with self.display_lock:
+                frame = self.display_frame
+            
+            # Show camera feed even if no processing overlay yet
+            if frame is None:
+                frame = self.camera.get_latest_frame()
+                
+            if frame is not None and frame.size > 0:
+                cv2.imshow(window_name, frame)
+                no_frame_count = 0
+            else:
+                no_frame_count += 1
+                if no_frame_count > 50:
+                    logger.warning(f"No frames for display ({no_frame_count} iterations)")
+                
+            key = cv2.waitKey(1) & 0xFF
+            
+            # Handle key presses (gemmav1.txt style)
+            if key == ord('q'):
+                logger.info("User pressed 'q' - shutting down")
+                self.running = False
+                break
+            elif key == ord('c'):
+                # Capture screenshot
+                if frame is not None:
+                    filename = f"qr_drone_capture_{int(time.time())}.jpg"
+                    cv2.imwrite(filename, frame)
+                    logger.info(f"Screenshot saved: {filename}")
+            elif key == ord('+') or key == ord('='):
+                # Increase ISO
+                new_iso = min(3200, self.config.CAMERA_ISO + 200)
+                self.config.CAMERA_ISO = new_iso
+                logger.info(f"ISO increased to {new_iso}")
+                # TODO: Apply to camera if possible
+            elif key == ord('-'):
+                # Decrease ISO
+                new_iso = max(100, self.config.CAMERA_ISO - 200)
+                self.config.CAMERA_ISO = new_iso
+                logger.info(f"ISO decreased to {new_iso}")
+            elif key == ord('f'):
+                # Faster shutter
+                new_shutter = max(100, self.config.CAMERA_SHUTTER_US - 500)
+                self.config.CAMERA_SHUTTER_US = new_shutter
+                logger.info(f"Shutter speed: {new_shutter}us (faster)")
+            elif key == ord('s'):
+                # Slower shutter
+                new_shutter = min(33000, self.config.CAMERA_SHUTTER_US + 500)
+                self.config.CAMERA_SHUTTER_US = new_shutter
+                logger.info(f"Shutter speed: {new_shutter}us (slower)")
+                
+        cv2.destroyAllWindows()
+        
+    def run(self):
+        """Main run loop"""
+        if not self.initialize():
+            logger.error("Initialization failed")
+            return
+            
+        self.running = True
+        
+        print("\n" + "="*60)
+        print("  QR-GUIDED AUTONOMOUS DRONE SYSTEM")
+        print("="*60)
+        print(f"  Camera: {self.camera.camera_type}")
+        print(f"  Resolution: {self.config.CAMERA_RESOLUTION[0]}x{self.config.CAMERA_RESOLUTION[1]}")
+        print(f"  Display: {'GUI' if self.config.SHOW_GUI else 'Headless'}")
+        print("="*60)
+        print("  System Status: READY")
+        print("  Waiting for DO_SPRAYER trigger in AUTO mission...")
+        print("  Add DO_SPRAYER command to your mission waypoints")
+        print("="*60 + "\n")
+        
+        try:
+            if self.config.SHOW_GUI:
+                # Run display in main thread
+                self.start_display()
+            else:
+                # Headless - just wait
+                while self.running:
+                    time.sleep(1)
+        except KeyboardInterrupt:
+            logger.info("Keyboard interrupt")
+        finally:
+            self.shutdown()
+            
+    def shutdown(self):
+        """Shutdown all systems"""
+        logger.info("Shutting down...")
+        self.running = False
+        
+        self.monitor.stop()
+        self.camera.stop()
+        self.mavlink.close()
+        
+        cv2.destroyAllWindows()
+        logger.info("Shutdown complete")
+
+
+# ============================================================================
+# MAIN ENTRY POINT
+# ============================================================================
+
+def main():
+    """Main entry point"""
+    # Configuration
+    config = SystemConfig()
+    
+    # Parse command line arguments (optional)
+    if len(sys.argv) > 1:
+        if '--sitl' in sys.argv:
+            config.USE_SITL = True
+        if '--real' in sys.argv:
+            config.USE_SITL = False
+        if '--headless' in sys.argv:
+            config.SHOW_GUI = False
+        if '--gui' in sys.argv:
+            config.SHOW_GUI = True
+            
+    # Create and run controller
+    controller = AutonomousController(config)
+    controller.run()
+
+
+if __name__ == "__main__":
+    main()

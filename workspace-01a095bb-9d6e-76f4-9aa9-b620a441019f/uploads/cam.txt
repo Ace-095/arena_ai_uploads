@@ -1,0 +1,380 @@
+Yes. Below is a **full side-by-side specification sheet** for the two exact cameras you're considering:
+
+1. **Raspberry Pi Camera Module 3 Standard**
+2. **Waveshare IMX477 IR-CUT Camera (B), 113°**
+
+I’m using the current manufacturer documentation rather than the reseller listing. ([Raspberry Pi Docs][1])
+
+---
+
+# 1. Raspberry Pi Camera Module 3 — Standard
+
+![Image](https://images.openai.com/static-rsc-4/wPocY581a0gNBMHbkVmaHTqnTLI1gwAsucK8adBnN0amZfCb8xVQL32cSHPKsibL-edL5KsZdiprvPPtwmt1n9nAgBGQsdwuWVugBw7iZYIA9fnqowN2cOIZyg0bi76ep6Sd5gmEhF8Xft3uNUCKZ4T2KrnZmfAhxcKPhS7VG6KYHSDxPitT1uTo4VhOVh-R?purpose=fullsize)
+
+![Image](https://images.openai.com/static-rsc-4/kkPVpo8HCxZ-k2gi8ROHKN4hSN3xwwzY3YWsVT4wRzZRKSiBvrGij3Rly4nz4aCp40kk6RvXcpNorZ04IlEi_O1AFi1qhgEC_e8g64dH71elEYVOmbF7H0NBAic3wQUHByYP3m6Pr1jRdEigvVVdirxAuxtW-e38-FnROXWM2hM7wJ3045N8IS8xQFJRdKpD?purpose=fullsize)
+
+![Image](https://images.openai.com/static-rsc-4/hqo9Smd9423LANQYOjFvef5kzHy18IubZX6aihPpuCLZPeuTpkBjQ6kfQaOMz_Pp2H2hpPwPEWoUUKyPbBIXazvbzraWosBGkP67P8ndBzFpwvyX3drgg865SyUO92t206FCPIuRsrpbHt_EZ6UaG5cPQHwJveImMgbrSD79hRzBSHA5DP3SvFsoAbYHVYAo?purpose=fullsize)
+
+### Sensor
+
+| Specification                 | Camera Module 3 Standard      |
+| ----------------------------- | ----------------------------- |
+| **Sensor**                    | Sony IMX708                   |
+| **Sensor type**               | Back-illuminated stacked CMOS |
+| **Effective resolution**      | **11.9 MP**                   |
+| **Maximum resolution**        | **4608 × 2592**               |
+| **Sensor diagonal**           | **7.4 mm**                    |
+| **Pixel size**                | **1.4 × 1.4 µm**              |
+| **Pixel architecture**        | Quad Bayer / QBC              |
+| **Shutter**                   | Rolling shutter               |
+| **Output**                    | RAW10                         |
+| **Interface**                 | MIPI CSI-2                    |
+| **HDR**                       | Yes                           |
+| **HDR output**                | Up to 3 MP                    |
+| **Dynamic defect correction** | 2D DPC                        |
+| **SNR**                       | High SNR                      |
+
+Raspberry Pi specifies the IMX708 as a 7.4-mm-diagonal, 11.9-MP sensor with 1.4-µm pixels and RAW10 output. ([Raspberry Pi Docs][1])
+
+---
+
+## Lens / optics
+
+| Specification      |                Standard |
+| ------------------ | ----------------------: |
+| **Focal length**   |             **4.74 mm** |
+| **Aperture**       |               **f/1.8** |
+| **Diagonal FoV**   |                 **75°** |
+| **Horizontal FoV** |                    ~66° |
+| **Vertical FoV**   |                    ~41° |
+| **Focus**          | **Motorised autofocus** |
+| **AF technology**  |                **PDAF** |
+| **Focus control**  | Software/I²C controlled |
+
+The official Camera Module 3 Standard is the ~75° diagonal-FoV version; the Wide version is a separate 120° variant. ([Raspberry Pi][2])
+
+---
+
+## Autofocus
+
+This is one of the major advantages of Camera Module 3.
+
+**PDAF = Phase Detection Autofocus**
+
+The camera has:
+
+* Phase-detection autofocus
+* Motorised lens actuator
+* Software-controlled focus
+* Continuous/automatic focusing capability
+
+This is particularly useful for your drone because the distance to the target changes during the approach.
+
+```text
+15 m
+ ↓
+Detection
+ ↓
+10 m
+ ↓
+5 m
+ ↓
+2 m
+ ↓
+Target
+```
+
+The camera can adjust focus rather than relying on a fixed-focus lens. ([Raspberry Pi Docs][1])
+
+---
+
+# Video modes
+
+Official Raspberry Pi documentation lists these principal modes:
+
+| Mode                | Maximum FPS |
+| ------------------- | ----------: |
+| **2304 × 1296**     |  **56 fps** |
+| **2304 × 1296 HDR** |  **30 fps** |
+| **1536 × 864**      | **120 fps** |
+| 1920 × 1080         |     ~50 fps |
+| 1280 × 720          |    ~100 fps |
+| 640 × 480           |    ~120 fps |
+
+The official hardware table specifically lists 2304×1296p56, 2304×1296p30 HDR and 1536×864p120. ([Raspberry Pi][2])
+
+---
+
+# Exposure
+
+| Parameter            | Camera Module 3 |
+| -------------------- | --------------: |
+| **Maximum exposure** | **112 seconds** |
+| Auto exposure        |             Yes |
+| Manual exposure      |             Yes |
+| HDR                  |             Yes |
+| Gain control         |             Yes |
+| White balance        |             Yes |
+
+Raspberry Pi explicitly specifies exposure capability up to 112 seconds. ([Raspberry Pi][2])
+
+---
+
+# Physical
+
+| Parameter             | Camera Module 3 Standard |
+| --------------------- | -----------------------: |
+| **Dimensions**        |    **25 × 24 × 11.5 mm** |
+| **Weight**            |                 **~4 g** |
+| Cable                 |                   200 mm |
+| Connector             |            15 × 1 mm FPC |
+| Operating temperature |               **0–50°C** |
+| IR filter             |           **Integrated** |
+| NoIR                  |         Separate version |
+
+([Raspberry Pi Docs][1])
+
+---
+
+# Software
+
+Official Raspberry Pi ecosystem:
+
+* `libcamera`
+* `rpicam-apps`
+* **Picamera2**
+* Python
+* OpenCV
+* GStreamer integration
+* AI/computer-vision pipelines
+
+The Camera Module 3 is directly supported by the Raspberry Pi camera software stack. ([Raspberry Pi][2])
+
+---
+
+# 2. Waveshare IMX477 IR-CUT Camera (B)
+
+![Image](https://images.openai.com/static-rsc-4/dcpOZgx10Usm1qeZHd_lGL7BSn6Ybid13QDSEC5uwA16XOvGsnanCF0zm5zOQ2X_PGzHkidEJIwZZvnIK_ceEPBSZjcq75b2XDKKK5kr0YxyYARzyEs6fSlEP6uXcgDoaXxgQTFhI4s7mW3xOlMrb-_IgRxSGoMlNkWz-JRzrn3UH4cjOyiy1whAnDLwqAX2?purpose=fullsize)
+
+![Image](https://images.openai.com/static-rsc-4/Nz1FLZSHDwQktW-FkFhTedcgkpEE0ZIBHsqXcloRXf0v-y-9k7Yq7ZVPvyLxY8CM9_aZHIy8QF9LngXtBrAyNPKctxfZovTP50GdFhT5elFHIEhmRBPSBF78PA_wbaQog-4TLeBrX8fdsEyDEcGyFWfcOfS6d4WZuQfM7E3FohUIwxRlPa8NYJDxyTnPxDM-?purpose=fullsize)
+
+![Image](https://images.openai.com/static-rsc-4/3qhlErM506ibzNKRfeDItwpgjwhp1XCig5vCdghykK4IKD5KNOxuDd3F_mjTQaPLw5tLH7SIxI-b-Pv1csWRvjphp6VVchqU1vB9ujVHXG7WT5IZMFGSElDCvuCSFL56HbMwqRK1AWWTDoyDt-ti7n9cfHGBWmUvnBF98YWT3OUJneI5G-6kq_x3BhKGFZVu?purpose=fullsize)
+
+This is the exact **113° IR-CUT B** you showed.
+
+### Sensor
+
+| Specification           | Waveshare IMX477 B             |
+| ----------------------- | ------------------------------ |
+| **Sensor**              | Sony IMX477                    |
+| **Sensor type**         | Back-illuminated CMOS          |
+| **Resolution**          | **12.3 MP**                    |
+| **Maximum resolution**  | **4056 × 3040**                |
+| **Sensor diagonal**     | **7.9 mm**                     |
+| **Pixel size**          | **1.55 × 1.55 µm**             |
+| **Shutter**             | **Rolling shutter**            |
+| **Output**              | RAW10 / sensor-dependent modes |
+| **Interface**           | MIPI CSI-2                     |
+| **Sensor aspect ratio** | **4:3**                        |
+
+Waveshare specifies 12.3 MP, 4056×3040, 7.9-mm sensor diagonal and 1.55-µm pixels. ([WaveShare][3])
+
+---
+
+# Lens / optics
+
+| Specification    | IMX477 IR-CUT B |
+| ---------------- | --------------: |
+| **Focal length** |      **2.7 mm** |
+| **Aperture**     |       **f/2.8** |
+| **Diagonal FoV** |        **113°** |
+| **Distortion**   |     **< −1.5%** |
+| **Focus**        |       **Fixed** |
+| **Autofocus**    |          **No** |
+
+This is an important difference: the Waveshare B uses a very wide 2.7-mm lens and Waveshare does not specify autofocus for this module. ([WaveShare][3])
+
+---
+
+# IR-CUT system
+
+This is the major special feature.
+
+The module has an onboard **IR-CUT dual-bandpass filter** that can be switched according to the application. ([WaveShare][3])
+
+### Day
+
+```text
+Visible light
+      ↓
+   IR-CUT ON
+      ↓
+ Normal colour image
+```
+
+### Night + IR illuminator
+
+```text
+IR illumination
+      ↓
+   IR-CUT OFF
+      ↓
+ Infrared image
+```
+
+Waveshare notes that an external IR light source is required for night vision. ([Waveshare][4])
+
+---
+
+# Video modes
+
+The underlying IMX477 supports several important sensor modes:
+
+| Resolution      | Approx. maximum |
+| --------------- | --------------: |
+| **4056 × 3040** |      **10 fps** |
+| **2028 × 1520** |      **40 fps** |
+| **2028 × 1080** |      **50 fps** |
+| **1332 × 990**  |     **120 fps** |
+
+These modes are also reflected in Raspberry Pi's hardware documentation for the IMX477-based HQ Camera. ([Raspberry Pi][2])
+
+---
+
+# Electrical / compatibility
+
+| Parameter         | IMX477 B                        |
+| ----------------- | ------------------------------- |
+| Operating voltage | **3.3 V**                       |
+| Interface         | MIPI CSI                        |
+| Raspberry Pi      | Supported                       |
+| Compute Module    | Supported                       |
+| Jetson            | Supported with dedicated driver |
+| RDK               | Supported                       |
+| Raspberry Pi 5    | Supported                       |
+| Raspberry Pi 4    | Supported                       |
+| Pi Zero series    | Supported                       |
+
+Waveshare explicitly lists Raspberry Pi series, Compute Modules, Jetson and RDK boards as supported platforms, with Jetson requiring its dedicated driver. ([Waveshare][5])
+
+---
+
+# 3. Direct specification comparison
+
+This is the important table for your project.
+
+| Specification             | **Camera Module 3 Standard** |           **Waveshare IMX477 B** |
+| ------------------------- | ---------------------------: | -------------------------------: |
+| **Sensor**                |                  Sony IMX708 |                      Sony IMX477 |
+| **Resolution**            |                  **11.9 MP** |                      **12.3 MP** |
+| **Resolution pixels**     |                    4608×2592 |                        4056×3040 |
+| **Sensor diagonal**       |                       7.4 mm |                       **7.9 mm** |
+| **Pixel size**            |                       1.4 µm |                      **1.55 µm** |
+| **Aspect ratio**          |                         16:9 |                          **4:3** |
+| **Shutter**               |                      Rolling |                          Rolling |
+| **Focal length**          |                      4.74 mm |                       **2.7 mm** |
+| **Aperture**              |                    **f/1.8** |                            f/2.8 |
+| **Diagonal FoV**          |                      **75°** |                         **113°** |
+| **Horizontal FoV**        |                         ~66° |                        Very wide |
+| **Autofocus**             |                      **YES** |                           **NO** |
+| **PDAF**                  |                      **YES** |                               No |
+| **Motorised lens**        |                      **YES** |                               No |
+| **HDR**                   |                      **YES** |       Not specified by Waveshare |
+| **IR-CUT**                |                   Integrated |            **Switchable IR-CUT** |
+| **Night IR**              |                 Standard: No |        **Yes + IR illumination** |
+| **Max exposure**          |                    **112 s** |        Sensor/pipeline dependent |
+| **RAW10**                 |                      **Yes** |                 Sensor supported |
+| **High-FPS mode**         |            **1536×864 @120** |                **1332×990 @120** |
+| **Dimensions**            |                25×24×11.5 mm | See Waveshare mechanical drawing |
+| **Weight**                |                         ~4 g |                                — |
+| **Operating temperature** |                   **0–50°C** |                                — |
+| **Pi 5**                  |                 **Official** |                        Supported |
+| **Picamera2**             |                 **Official** |   Driver/configuration dependent |
+
+([Raspberry Pi Docs][1])
+
+---
+
+# 4. The biggest differences
+
+### Camera Module 3
+
+**IMX708**
+
+```text
+11.9 MP
+4608×2592
+75° FoV
+f/1.8
+PDAF
+AUTOFOCUS
+HDR
+```
+
+### IMX477 B
+
+**IMX477**
+
+```text
+12.3 MP
+4056×3040
+113° FoV
+f/2.8
+FIXED FOCUS
+IR-CUT
+```
+
+So don't let **12.3 MP vs 11.9 MP** make you think the IMX477 automatically has higher useful resolution.
+
+For your application, **optics and pixels-on-target matter much more than the MP number**.
+
+---
+
+# 5. One correction from my previous answer
+
+I want to correct one thing from the earlier comparison.
+
+I previously treated the IMX477's **113° diagonal FoV** as though we could directly derive its horizontal/vertical FoV with a simple geometric conversion. That's not sufficiently precise without knowing the exact lens/sensor geometry and distortion model.
+
+Waveshare officially specifies:
+
+> **113° diagonal FoV**
+
+and **< −1.5% distortion**.
+
+So for engineering calculations, I'd use Waveshare's 113° diagonal figure and the actual calibrated camera intrinsics rather than assuming exact horizontal/vertical FoV. ([WaveShare][3])
+
+---
+
+## For your drone project, the specs I'd pay attention to
+
+Given your **Pi 5 + AI accelerator + A3 target + ~15 m search altitude**, the shortlist is:
+
+**Camera Module 3 Standard**
+
+* ⭐ **PDAF autofocus**
+* ⭐ **f/1.8**
+* ⭐ **75° FoV**
+* ⭐ **HDR**
+* ⭐ Official Pi software support
+* ⭐ Very compact/light
+* ⭐ Easier Picamera2 integration
+
+**IMX477 B**
+
+* ⭐ **12.3 MP**
+* ⭐ **Larger 7.9-mm sensor**
+* ⭐ **1.55 µm pixels**
+* ⭐ **113° FoV**
+* ⭐ **Switchable IR-CUT**
+* ⭐ 4:3 image
+* ⭐ 120-fps sensor mode
+* ⭐ Better option if you specifically need IR/night capability
+
+For the **actual target-search system**, however, the next step should be comparing these at **10 m / 15 m / 20 m** using the *actual target dimensions*, because that will tell us much more than the raw camera specifications.
+
+[1]: https://datasheets.raspberrypi.com/camera/camera-module-3-product-brief.pdf?utm_source=chatgpt.com "Specification"
+[2]: https://www.raspberrypi.com/documentation/accessories/camera.html?utm_source=chatgpt.com "Camera - Raspberry Pi Documentation"
+[3]: https://docs.waveshare.com/IMX477_IR-CUT_Camera_B?utm_source=chatgpt.com "IMX477 IR-CUT Camera (B) Product Overview | WaveShare Documentation"
+[4]: https://www.waveshare.com/product/ai/cameras/imx477-ir-cut-camera-b.htm?utm_source=chatgpt.com "IMX477 IR-CUT 12.3MP Camera (B), Applicable For Raspberry Pi / Jetson / RDK Series Boards | IMX477 IR-CUT Camera (B)"
+[5]: https://www.waveshare.com/imx477-ir-cut-camera-b.htm?utm_source=chatgpt.com "IMX477 IR-CUT 12.3MP Camera (B), Applicable For Raspberry Pi / Jetson / RDK Series Boards | IMX477 IR-CUT Camera (B)"
