@@ -279,6 +279,8 @@ Kill everything with Ctrl-C (Terminal 1 SITL, Terminal 2 mission).
 | mission_pi cam1/cam2 503 on gazebo config | Browser-test the MJPEG URLs first (dark = bridge/Gazebo side; live = cv2 ffmpeg http reader — reinstall `opencv-python`) |
 | QR never found in Gazebo | Confirm the panel is IN the flown box (world pose vs home box/fence); confirm size story §10.3 (A3 + classical = expected fail); fly lower once (`sweep_alt_m: 10`) to prove detection, then diagnose altitude |
 | Sim runs slower than realtime | Normal on iGPU with 2 cameras: headless `-s`, `<update_rate>10</update_rate>`, close the Gazebo GUI render loop; mission timeouts are wall-clock so slowness only stretches the run |
+| Gazebo GUI segfaults (`Unable to create the rendering window ... GLXWindow::create`) | Wayland + Ogre/Qt interaction (verbatim-known per [official docs](https://gazebosim.org/docs/harmonic/troubleshooting)). Fix ladder: 1) `QT_QPA_PLATFORM=xcb gz sim ...` 2) `env -u WAYLAND_DISPLAY QT_QPA_PLATFORM=xcb gz sim ...` 3) PRIME offload `__NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia ...` 4) `LIBGL_ALWAYS_SOFTWARE=1 ...` (slow, always shows). Persist fix 1 scoped to gz: `alias gz='QT_QPA_PLATFORM=xcb gz'` in `~/.bashrc`. Last resort: headless `-s` + bridge panes (mission needs no window) |
+| libEGL `driver (null)` / `failed to create dri2 screen` warnings | BENIGN per official docs (Ogre probing devices at init) — ignore unless paired with the segfault above, in which case follow the Wayland row |
 
 ## 10. Gazebo phase (closed loop — sim physics + sim cameras + UI)
 
@@ -351,11 +353,9 @@ Terminal A — the world (Linux, ~30 s to load):
 cd mission_pi
 gz sim -v4 -r sim/worlds/mission_world.sdf
 # want: iris on the ground at the origin, white QR panel ~8 m away on +X.
-# NO WINDOW / GUI SEGFAULT (ogre2 "Unable to create the rendering window",
-# libEGL "driver (null)" on NVIDIA)? The mission doesn't need the window —
-# cameras are server-side sensors. Run headless instead and verify pixels
-# via the bridge (Terminal C): the GUI is optional chrome.
-#   gz sim -s -r sim/worlds/mission_world.sdf
+# NO WINDOW / GUI SEGFAULT? Almost always Wayland: prefix the command
+# with QT_QPA_PLATFORM=xcb (see §9 for the full ladder). Headless -s is
+# the last resort — the mission needs no window.
 # weak GPU? -s also halves render load (sensors still publish).
 ```
 
@@ -452,15 +452,6 @@ bandwidth ever matters (it won't — the pixels never leave the laptop).
 ## 11. Moving to the Pi 5 (when the bench is green)
 
 1. Same repo/branch on the Pi; system deps per `README.md`
-   (picamera2 stack instead of §2).
-2. `cp config.example.yaml config.yaml`, set your lens HFOVs.
-3. Drop the fine-tuned `qr_yolov8n.hef` into `models/`
-   (`training/compile_hef.md`), detector `kind: auto` picks it up.
-4. Run without `--device` (USB auto-detect) — or keep `--device` for
-   an explicit `/dev/serial/by-id/...` path.
-
-Bench green + air test = done. Good hunting.
-i; system deps per `README.md`
    (picamera2 stack instead of §2).
 2. `cp config.example.yaml config.yaml`, set your lens HFOVs.
 3. Drop the fine-tuned `qr_yolov8n.hef` into `models/`
