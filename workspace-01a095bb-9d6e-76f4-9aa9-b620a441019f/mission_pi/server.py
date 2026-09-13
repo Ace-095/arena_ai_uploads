@@ -147,6 +147,13 @@ def create_app(rig, mission, fc):
     return app
 
 
-def serve_forever(app, host="0.0.0.0", port=8000):
+def create_server(app, host="0.0.0.0", port=8000):
+    """A stoppable uvicorn Server (lets main shut the loop down cleanly —
+    killing the process with a live uvloop in a daemon thread segfaults)."""
     _require_api()
-    uvicorn.run(app, host=host, port=port, log_level="warning")
+    return uvicorn.Server(uvicorn.Config(app, host=host, port=port,
+                                         log_level="warning"))
+
+
+def serve_forever(app, host="0.0.0.0", port=8000):
+    create_server(app, host, port).run()

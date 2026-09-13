@@ -94,14 +94,15 @@ def find_fc(bauds=(115200, 57600, 921600), hb_timeout=3.0, device=None):
             except Exception:
                 hb = None
             if hb is not None:
-                log.info("FC found: %s @ %d (sysid=%d compid=%d)", dev, baud,
+                log.info("FC found: %s @ %s (sysid=%d compid=%d)", dev,
+                         baud if baud else "net",
                          hb.get_srcSystem(), hb.get_srcComponent())
                 return conn, dev
             try:
                 conn.close()
             except Exception:
                 pass
-            errors.append("%s@%d: no heartbeat" % (dev, baud))
+            errors.append("%s@%s: no heartbeat" % (dev, baud if baud else "net"))
     raise RuntimeError("no FC heartbeat; tried: %s" % "; ".join(errors[:8]))
 
 
@@ -260,20 +261,28 @@ class FCLink:
         return None
 
     def request_message(self, msgid, ack_timeout=2.0):
+        """Returns the COMMAND_ACK result, or None if unacked/failed."""
         try:
-            self._cmd_long(mavutil.mavlink.MAV_CMD_REQUEST_MESSAGE, float(msgid),
-                           ack_timeout=ack_timeout)
+            return self._cmd_long(mavutil.mavlink.MAV_CMD_REQUEST_MESSAGE,
+                                  float(msgid), ack_timeout=ack_timeout)
         except FCError:
-            pass  # some builds don't ACK requests; the message may still come
+            return None  # some builds don't ACK requests; the message may still come
 
     def get_home(self, timeout=4.0):
-        self.request_message(242)  # HOME_POSITION
+        ack = self.request_message(242)  # HOME_POSITION
+        log.info("HOME_POSITION request ack: %r", ack)
         m = self.wait_for(["HOME_POSITION"], lambda m: True, timeout)
-        if m is None:
-            raise FCError("no HOME_POSITION from FC")
-        if m.latitude == 0 and m.longitude == 0:
-            raise FCError("FC home is zero/unset")
-        return (m.latitude / 1e7, m.longitude / 1e7, m.altitude / 1e3)
+        if m is not None and not (m.latitude == 0 and m.longitude == 0):
+            return (m.latitude / 1e7, m.longitude / 1e7, m.altitude / 1e3)
+        # fallback: disarmed on the ground => current position IS home
+        # (covers FCs that don't answer the explicit home request).
+        try:
+            pos = self.get_position(timeout=3.0)
+        except FCError:
+            raise FCError("no HOME_POSITION from FC (req ack=%r)" % (ack,))
+        log.warning("no HOME_POSITION (req ack=%r) — using current position as home",
+                    ack)
+        return (pos["lat"], pos["lon"], pos["alt_msl"])
 
     def get_position(self, timeout=4.0):
         m = self.wait_for(["GLOBAL_POSITION_INT"], lambda m: True, timeout)

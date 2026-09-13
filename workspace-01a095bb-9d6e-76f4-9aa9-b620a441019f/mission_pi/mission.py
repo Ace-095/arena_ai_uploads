@@ -270,10 +270,14 @@ class Mission:
             self._log("WARN", "fence read failed: %s" % e)
             self.fence = []
         if len(self.fence) < 3:
-            self._set_phase("FAILSAFE", "no geofence on FC — nothing to search")
-            return
-        w, h = geo.polygon_size_m(self.fence)
-        self._log("INFO", "search area: %d fence verts, ~%.0f x %.0m" % (len(self.fence), w, h))
+            # no fence is fine on the bench (and off-nominal in the field):
+            # the grid sweep falls back to a home-centered box.
+            self._log("WARN", "no geofence on FC — grid sweep will use home box")
+            self.fence = []
+        else:
+            w, h = geo.polygon_size_m(self.fence)
+            self._log("INFO", "search area: %d fence verts, ~%.0f x %.0f m" % (
+                len(self.fence), w, h))
         try:
             self.fc.set_message_interval(33, 5.0)    # GLOBAL_POSITION_INT
             self.fc.set_message_interval(147, 1.0)   # BATTERY_STATUS

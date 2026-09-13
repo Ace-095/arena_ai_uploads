@@ -91,7 +91,7 @@ def main():
     from fc_link import FCLink
     from cameras import CameraRig
     from detector import get_detector
-    from server import create_app, serve_forever
+    from server import create_app, create_server
     from mission import Mission
 
     fc = FCLink()
@@ -112,8 +112,8 @@ def main():
     app = create_app(rig, mission, fc)
     mission.hub = app.state.hub
     port = int(cfg.get("server", {}).get("port", 8000))
-    srv = threading.Thread(target=serve_forever, args=(app, "0.0.0.0", port),
-                           name="http", daemon=True)
+    server = create_server(app, "0.0.0.0", port)
+    srv = threading.Thread(target=server.run, name="http", daemon=True)
     srv.start()
     print("UI: http://<this-pi>:%d  (paste as Pi link)" % port)
     try:
@@ -121,6 +121,11 @@ def main():
     except KeyboardInterrupt:
         print("stopped by user")
     finally:
+        try:
+            server.should_exit = True
+            srv.join(timeout=6.0)
+        except Exception:
+            pass
         try:
             rig.stop_all()
         except Exception:

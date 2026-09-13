@@ -63,14 +63,14 @@ cd ~/arena_ai_uploads/workspace-*/mission_pi    # Tab-complete the middle dir
 python3 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
-pip install -r requirements.txt   # pymavlink numpy opencv-python pillow
-pip install fastapi uvicorn pyzbar pyyaml qrcode
+pip install -r requirements.txt   # pymavlink numpy fastapi uvicorn ...
+pip install opencv-python pyzbar pillow qrcode   # laptop vision stack
 ```
 
 Notes:
 
-* `requirements.txt` is the Pi set; the extra line adds the server +
-  QR stack the bench needs (harmless on the Pi too).
+* `requirements.txt` is the core set; the extra line adds the laptop
+  vision stack (Pi gets its opencv via apt instead — see README).
 * If `pip install pyzbar` later fails at *import*, you missed
   `libzbar0` above. If `cv2` fails at import with `libGL.so`, you
   missed `libgl1`. See §9.
