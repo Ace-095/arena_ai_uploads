@@ -1,0 +1,44 @@
+# mission_pi config — copy to config.yaml and tune. All sections optional.
+server:
+  port: 8000
+
+cameras:
+  front:  { size: [1920, 1080], hfov_deg: 66.0, rotation_deg: 0, jpeg_quality: 80 }
+  bottom: { size: [2028, 1520], hfov_deg: 63.0, rotation_deg: 0, jpeg_quality: 80 }
+  # bottom hfov depends on YOUR HQ lens — measure and set it (affects approach
+  # geometry!). 6mm lens ~63 deg, 16mm lens ~21 deg. Rotation: physical mount
+  # twist of the bottom cam (0/90/180/270) so "image up" == nose direction.
+  single_cam_role: bottom   # if only one CSI cam is found, treat it as this
+
+detector:
+  kind: auto                # auto | hailo | classical | custom | none
+  hef_path: models/qr_yolov8n.hef
+  input_size: 640
+  conf_thr: 0.35
+  iou_thr: 0.5
+  tile_bottom: true         # 2x2 tiled inference on bottom cam (the 15 m answer)
+  full_decode_every_n: 5    # full-frame decode attempt every Nth frame
+  cue_frames: 2             # consecutive bbox frames to raise a flight cue
+  custom_module: myqr.det   # kind=custom only: module with Detector/create_detector
+
+decode:
+  required_streak: 3        # matching decodes to CONFIRM a payload
+  miss_tolerance: 1         # blank/disagreeing frames tolerated mid-streak
+
+mission:
+  sweep_alt_m: 15.0
+  approach_stair_m: [12.0, 9.0, 7.0]  # descend while centered on the cue
+  grid_overlap: 0.5
+  yaw_steps: 12
+  yaw_settle_s: 1.0
+  trigger_timeout_s: 600
+  search_timeout_s: 600
+  approach_timeout_s: 240
+  min_batt_pct: 25
+  arrive_m: 2.0
+  post_action: RTL          # RTL | AUTO (resume mission) | LOITER | LAND
+  trigger_seq: null         # fallback if the plan has no DO_SPRAYER item
+
+relay:
+  interval_s: 2.0           # STATUSTEXT QR:<payload> resend cadence to MP
+  window_s: 15.0            # ... for this long (plus instant ws event to UI)
