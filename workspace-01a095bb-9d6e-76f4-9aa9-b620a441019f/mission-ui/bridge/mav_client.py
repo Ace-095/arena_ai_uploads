@@ -137,6 +137,7 @@ class MavClient:
         self.rx_msgs = 0
         self.tx_msgs = 0
         self.rx_rate = 0.0
+        self._last_ack_src = {}
         self._rx_window = 0
         self._rx_window_t = time.time()
 
@@ -238,7 +239,7 @@ class MavClient:
                     except queue.Empty:
                         pass
 
-    def _pull_until(self, q, predicate, deadline):
+    def _pull_until(self, q, predicate, deadline, vehicle_only=True):
         while True:
             remaining = deadline - time.time()
             if remaining <= 0:
@@ -247,6 +248,8 @@ class MavClient:
                 m = q.get(timeout=remaining)
             except queue.Empty:
                 continue
+            if vehicle_only and len(m) > 2 and self.veh_sysid is not None and m[2] != self.veh_sysid:
+                continue  # MP mirrors its own traffic too — only trust the vehicle
             if predicate(m):
                 return m
 
@@ -311,7 +314,9 @@ class MavClient:
                     "level": "INFO",
                     "msg": "MAVLink link up: receiving from %s:%d" % (addr[0], addr[1])})
             name = M.name_of(msgid)
-            self._fanout(name, (name, fields))
+            self._fanout(name, (name, fields, src_sys))
+            if name in ("MISSION_ACK", "COMMAND_ACK"):
+                self._last_ack_src[name] = src_sys
             self._dispatch(name, src_sys, fields)
 
     def _update_rx_rate(self, addr):
@@ -336,8 +341,14 @@ class MavClient:
                 self.veh_type = f["type"]
                 self.last_hb = time.time()
                 self.mode_num = f["custom_mode"]
-                self.mode = M.ARDU_COPTER_MODES.get(f["custom_mode"], "MODE(%d)" % f["custom_mode"])
-                self.armed = bool(f["base_mode"] & M.MAV_MODE_FLAG_SAFETY_ARMED)
+                new_mode = M.ARDU_COPTER_MODES.get(f["custom_mode"], "MODE(%d)" % f["custom_mode"])
+                new_armed = bool(f["base_mode"] & M.MAV_MODE_FLAG_SAFETY_ARMED)
+                if self.mode is not None and (new_mode != self.mode or new_armed != self.armed):
+                    self.hub.emit_threadsafe("log", {
+                        "level": "WARN",
+                        "msg": "vehicle mode: %s -> %s (armed=%s)" % (self.mode, new_mode, new_armed)})
+                self.mode = new_mode
+                self.armed = new_armed
                 self.veh_state = f["system_status"]
                 if not self.connected:
                     self.connected = True
@@ -529,7 +540,9 @@ class MavClient:
         if ack is None:
             raise MavError("fence upload timed out (FC not responding — check MP forwarding)")
         if ack["type"] != M.MAV_MISSION_ACCEPTED:
-            raise MavError("fence upload REJECTED by FC (MAV_MISSION type=%d)" % ack["type"])
+            raise MavError("fence upload REJECTED by FC (MAV_MISSION type=%d [%s], from sysid %s)" % (
+                ack["type"], M.MAV_MISSION_RESULT.get(ack["type"], "?"),
+                self._last_ack_src.get("MISSION_ACK", "?")))
 
         # 3) readback verify
         confirmed = True
@@ -804,7 +817,7 @@ class MavClient:
             self._unsubscribe(q)
         if ack is None:
             raise MavError("timeout waiting for COMMAND_ACK (mode set)")
-        return ack[1]["result"] == 0
+        return int(ack[1]["result"])
 
     def send_statustext(self, text, severity=M.MAV_SEVERITY_INFO):
         self._send(M.MSG_ID['STATUSTEXT'], {"severity": severity, "text": text.encode("utf-8")[:50]})

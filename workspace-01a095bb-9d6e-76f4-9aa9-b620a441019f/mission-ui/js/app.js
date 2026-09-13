@@ -390,13 +390,13 @@ function boot() {
   $('btnAbort').addEventListener('click', () => {
     if (!window.confirm('ABORT → send RTL to the vehicle via MP?')) return;
     postJson('/api/mp/mode', { mode: 'RTL' })
-      .then((d) => log('WARN', 'RTL commanded (' + d.status + ')'))
+      .then((d) => log('WARN', 'RTL commanded (' + d.status + (d.result_name ? ', ' + d.result_name + ' [' + d.result + ']' : '') + ')'))
       .catch((e) => log('ERROR', 'RTL failed: ' + e.message));
   });
   $('btnLand').addEventListener('click', () => {
     if (!window.confirm('Send LAND to the vehicle via MP?')) return;
     postJson('/api/mp/mode', { mode: 'LAND' })
-      .then((d) => log('WARN', 'LAND commanded (' + d.status + ')'))
+      .then((d) => log('WARN', 'LAND commanded (' + d.status + (d.result_name ? ', ' + d.result_name + ' [' + d.result + ']' : '') + ')'))
       .catch((e) => log('ERROR', 'LAND failed: ' + e.message));
   });
   $('btnMockRestart').addEventListener('click', () => {

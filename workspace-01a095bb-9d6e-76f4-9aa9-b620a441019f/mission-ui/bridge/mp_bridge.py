@@ -984,16 +984,18 @@ class Server:
             return self.json(status)
         if p == "/api/mp/mode" and method == "POST":
             mode = str(jbody.get("mode", "")).upper()
-            from _mavlink_v2 import MODE_RTL, MODE_LAND
+            from _mavlink_v2 import MODE_RTL, MODE_LAND, COMMAND_ACK_RESULT
             mnum = {"RTL": MODE_RTL, "LAND": MODE_LAND}.get(mode)
             if mnum is None:
                 return self.json({"detail": "mode must be RTL|LAND"}, 400)
             try:
-                ok = await asyncio.to_thread(self.mav.set_mode, mnum, 3.0)
+                res = await asyncio.to_thread(self.mav.set_mode, mnum, 3.0)
             except Exception as e:
                 return self.json({"detail": "mode set failed: %s" % e}, 503)
-            await self.hub.emit("log", {"level": "WARN", "msg": "UI sent mode %s via MAVLink (via MP) — accepted=%s" % (mode, ok)})
-            return self.json({"status": "ok" if ok else "rejected", "mode": mode})
+            rname = COMMAND_ACK_RESULT.get(res, "?")
+            await self.hub.emit("log", {"level": "WARN", "msg": "UI sent mode %s via MAVLink (via MP) — result=%d (%s)" % (mode, res, rname)})
+            return self.json({"status": "ok" if res == 0 else "rejected", "mode": mode,
+                              "result": res, "result_name": rname})
         if p == "/api/mp/param" and method == "POST":
             name = str(jbody.get("name", "")).strip().upper()
             if not re.fullmatch(r"[A-Z0-9_]{1,15}", name):
@@ -1206,7 +1208,7 @@ async def run_selftest(args) -> int:
         check("DO_SPRAYER at #2", plan and plan["do_sprayer_seq"] == 2, str(plan and plan["do_sprayer_seq"]))
 
         okm = await asyncio.to_thread(client.set_mode, 6, 3.0)   # RTL
-        check("set_mode RTL (COMMAND_ACK)", okm is True)
+        check("set_mode RTL (COMMAND_ACK result=0)", okm == 0)
         check("mock FC saw override", vehicle.mode_override in (None, 6))  # consumed by mock pi or pending
 
         await asyncio.to_thread(client.fence_clear, 4.0)
