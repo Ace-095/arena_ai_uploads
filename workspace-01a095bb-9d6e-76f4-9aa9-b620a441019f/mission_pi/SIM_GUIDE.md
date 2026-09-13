@@ -160,7 +160,13 @@ On Windows Mission Planner (same WiFi):
    home set (somewhere in Australia by default — normal).
 
 If MP won't connect: SITL console must say "Waiting for connection";
-check the IP, and on Linux `sudo ufw allow 5760/tcp` if ufw is active.
+check the IP. If `sudo ufw status` says active, open our three ports:
+
+```bash
+sudo ufw allow 5760/tcp   # MP -> SITL
+sudo ufw allow 5763/tcp   # mission_pi -> SITL
+sudo ufw allow 8000/tcp   # UI browser -> mission_pi
+```
 
 ## 7. Run day, part 2 — the test mission in MP
 
