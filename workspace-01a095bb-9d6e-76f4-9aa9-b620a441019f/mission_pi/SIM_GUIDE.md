@@ -281,6 +281,7 @@ Kill everything with Ctrl-C (Terminal 1 SITL, Terminal 2 mission).
 | Sim runs slower than realtime | Normal on iGPU with 2 cameras: headless `-s`, `<update_rate>10</update_rate>`, close the Gazebo GUI render loop; mission timeouts are wall-clock so slowness only stretches the run |
 | Gazebo GUI segfaults (`Unable to create the rendering window ... GLXWindow::create`) | Wayland + Ogre/Qt interaction (verbatim-known per [official docs](https://gazebosim.org/docs/harmonic/troubleshooting)). Fix ladder: 1) `QT_QPA_PLATFORM=xcb gz sim ...` 2) `env -u WAYLAND_DISPLAY QT_QPA_PLATFORM=xcb gz sim ...` 3) PRIME offload `__NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia ...` 4) `LIBGL_ALWAYS_SOFTWARE=1 ...` (slow, always shows). Persist fix 1 scoped to gz: `alias gz='QT_QPA_PLATFORM=xcb gz'` in `~/.bashrc`. Last resort: headless `-s` + bridge panes (mission needs no window) |
 | libEGL `driver (null)` / `failed to create dri2 screen` warnings | BENIGN per official docs (Ogre probing devices at init) — ignore unless paired with the segfault above, in which case follow the Wayland row |
+| headless bridge panes BLACK but ages fresh | Server-side ogre2 got no GL context either. Try PRIME offload vars on the server line; last resort CPU render `LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe gz sim -s -r ...` (slow but proves the loop) |
 
 ## 10. Gazebo phase (closed loop — sim physics + sim cameras + UI)
 
