@@ -31,19 +31,26 @@ def load_config(path):
 
 def run_check(args):
     print("== mission_pi bring-up check ==")
-    print("[fc] probing serial ...")
+    cfg = load_config(args.config)
+    dev_arg = args.device or cfg.get("fc", {}).get("conn")
+    print("[fc] probing %s ..." % (dev_arg or "serial auto-detect"))
     try:
         from fc_link import find_fc
-        conn, dev = find_fc(device=args.device)
+        conn, dev = find_fc(device=dev_arg)
         print("[fc] OK: %s (sysid=%d)" % (dev, conn.target_system))
         conn.close()
     except Exception as e:
         print("[fc] FAIL: %s" % e)
-    print("[cam] probing CSI ...")
+    print("[cam] probing per %s ..." % args.config)
     try:
-        from cameras import list_cameras
-        cams = list_cameras()
-        print("[cam] %d camera(s): %s" % (len(cams), [(i, m) for i, m, _ in cams]))
+        from cameras import CameraRig, list_video_devices
+        rig = CameraRig(cfg)
+        rig.detect()
+        for name, cam in rig.cams.items():
+            print("[cam] %s: kind=%s model=%s facing=%s size=%s" % (
+                name, cam.kind, cam.model, cam.facing, cam.size))
+        if not rig.cams:
+            print("[cam] none assigned (v4l2 nodes: %s)" % list_video_devices())
     except Exception as e:
         print("[cam] FAIL: %s" % e)
     print("[hailo] probing runtime ...")
@@ -62,7 +69,9 @@ def main():
     ap = argparse.ArgumentParser(description="mission_pi — QR hunt companion")
     ap.add_argument("--config", default="config.yaml")
     ap.add_argument("--port", type=int, default=8000)
-    ap.add_argument("--device", default=None, help="FC serial (default: auto-detect)")
+    ap.add_argument("--device", default=None,
+                        help="FC link (default: fc.conn in config, else serial "
+                             "auto-detect; e.g. tcp:127.0.0.1:5763 for SITL)")
     ap.add_argument("--baud", type=int, default=None)
     ap.add_argument("--check", action="store_true", help="probe hardware and exit")
     ap.add_argument("--hef", default=None, help="HEF path override for --check")
@@ -86,7 +95,7 @@ def main():
     from mission import Mission
 
     fc = FCLink()
-    dev = fc.connect(device=args.device,
+    dev = fc.connect(device=args.device or cfg.get("fc", {}).get("conn"),
                      bauds=(args.baud,) if args.baud else (115200, 57600, 921600))
     print("FC link: %s" % dev)
 

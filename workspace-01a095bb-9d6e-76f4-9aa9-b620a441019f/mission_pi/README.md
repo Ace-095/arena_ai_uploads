@@ -66,6 +66,9 @@ verify 15 m sharpness with `tools/cam_probe.py` snaps before trusting
 far decodes, and leave the IR-CUT in day mode (no illuminator onboard).
 Set `rotation_deg` so "image up" == nose direction.
 
+> **No Pi yet?** Run the whole stack on a Linux laptop against SITL:
+> `SIM_GUIDE.md` (webcam + printed QR + Mission Planner, Gazebo later).
+
 ## Install (Pi 5, Pi OS)
 
 ```

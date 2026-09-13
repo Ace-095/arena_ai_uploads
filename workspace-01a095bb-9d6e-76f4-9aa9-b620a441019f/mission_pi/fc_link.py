@@ -1,8 +1,8 @@
-"""Flight-controller link over USB (pymavlink).
+"""Flight-controller link over USB or TCP/UDP (SITL bench) via pymavlink.
 
-- Auto-detects the Pixhawk: /dev/serial/by-id/*, /dev/ttyACM*, /dev/ttyUSB*,
-  probing bauds until a heartbeat answers. Explicit --device also accepts
-  pymavlink strings (udp:/tcp:) for SITL bench tests.
+  probing bauds until a heartbeat answers. Explicit --device (or fc.conn in
+  config) also accepts pymavlink network strings — tcp:/udp:/udpin: — for
+  SITL bench runs (single attempt, no baud probing on network links).
 - Single reader thread + subscribe/wait_for fanout (same proven pattern as
   mission-ui's bridge): nothing else touches recv_match().
 - Pi presents as system 51 / ONBOARD_CONTROLLER so it never collides with
@@ -62,6 +62,11 @@ def candidate_devices():
     return devs
 
 
+def _is_network_device(dev):
+    return str(dev).lower().startswith(
+        ("tcp:", "udp:", "udpin:", "udpout:", "udpbcast:"))
+
+
 def find_fc(bauds=(115200, 57600, 921600), hb_timeout=3.0, device=None):
     """Return (conn, device) for the first FC that answers a heartbeat."""
     _require_pymavlink()
@@ -73,13 +78,16 @@ def find_fc(bauds=(115200, 57600, 921600), hb_timeout=3.0, device=None):
             raise RuntimeError("no serial candidates (no /dev/ttyACM* or /dev/ttyUSB*)")
     errors = []
     for dev in devs:
-        for baud in bauds:
+        attempt_bauds = (None,) if _is_network_device(dev) else bauds
+        for baud in attempt_bauds:
             try:
-                conn = mavutil.mavlink_connection(
-                    dev, baud=baud, source_system=51,
-                    source_component=mavutil.mavlink.MAV_COMP_ID_ONBOARD_COMPUTER)
+                kw = dict(source_system=51,
+                          source_component=mavutil.mavlink.MAV_COMP_ID_ONBOARD_COMPUTER)
+                if baud is not None:
+                    kw["baud"] = baud
+                conn = mavutil.mavlink_connection(dev, **kw)
             except Exception as e:
-                errors.append("%s@%d: %s" % (dev, baud, e))
+                errors.append("%s@%s: %s" % (dev, baud, e))
                 continue
             try:
                 hb = conn.wait_heartbeat(timeout=hb_timeout)

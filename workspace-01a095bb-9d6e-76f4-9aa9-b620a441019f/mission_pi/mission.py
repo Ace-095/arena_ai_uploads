@@ -430,7 +430,18 @@ class Mission:
         from geo import footprint_m
         fw, fh = footprint_m(self.sweep_alt, cam.hfov_deg, cam.size[0], cam.size[1])
         spacing = max(2.0, min(fw, fh) * (1.0 - self.grid_overlap))
-        rows = geo.lawnmower_rows(self.fence, spacing,
+        fence = self.fence
+        if len(fence) < 3:
+            # bench fallback (SITL has no fence): cover a home-centered box
+            import math as _m
+            half = float(self.cfg.get("mission", {}).get("nofence_half_m", 20.0))
+            lat0, lon0 = self.home[0], self.home[1]
+            dlat = half / 111320.0
+            dlon = half / (111320.0 * max(0.2, _m.cos(_m.radians(lat0))))
+            fence = [(lat0 - dlat, lon0 - dlon), (lat0 - dlat, lon0 + dlon),
+                     (lat0 + dlat, lon0 + dlon), (lat0 + dlat, lon0 - dlon)]
+            self._log("WARN", "no fence — covering %.0f m home box" % (half * 2))
+        rows = geo.lawnmower_rows(fence, spacing,
                                   origin=(self.home[0], self.home[1]))
         self._set_phase("SWEEP_GRID", "%d legs, %.1fm spacing @ %.0fm" % (
             len(rows), spacing, self.sweep_alt))

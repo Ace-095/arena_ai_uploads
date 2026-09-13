@@ -1,0 +1,20 @@
+Drop the QR panel into a Gazebo world (Harmonic).
+Works two ways — pick one:
+
+A) GUI (quickest): with the world open in gz sim, use the Component
+   Inspector / Insert tab — the model appears as "qr_panel_a3" once
+   GZ_SIM_RESOURCE_PATH includes mission_pi/sim (see SIM_GUIDE.md).
+   Drag it onto the runway, ~8-10 m from the iris home point.
+
+B) World file (repeatable): copy the runway world and add inside <world>:
+
+  <include>
+    <uri>model://qr_panel_a3</uri>
+    <name>qr_target</name>
+    <pose>8 0 0 0 0 0</pose>   <!-- x y z roll pitch yaw, metres -->
+  </include>
+
+  Example:
+    cp ~/ardupilot_gazebo/worlds/iris_runway.sdf ~/mission_world.sdf
+    # paste the block above inside <world>...</world>, then:
+    gz sim -v4 -r ~/mission_world.sdf

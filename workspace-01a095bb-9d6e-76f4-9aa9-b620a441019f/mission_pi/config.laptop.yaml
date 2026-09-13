@@ -1,0 +1,63 @@
+# Laptop (Linux) bench config — Pop!_OS + SITL + laptop webcam.
+# Copy to config.yaml or run:  python3 main.py --config config.laptop.yaml
+#
+# Topology for bench runs:
+#   SITL (this laptop) : MP on Windows takes TCP 5760,
+#                        mission_pi takes TCP 5763 (SITL --serial1).
+#   Webcam             : /dev/video0, pointed at the printed A3 QR panel.
+#   UI                 : http://<this-laptop-ip>:8000
+
+server: { host: 0.0.0.0, port: 8000 }
+
+fc:
+  conn: "tcp:127.0.0.1:5763"   # SITL 2nd port (--device CLI flag overrides)
+
+cameras:
+  # Only ONE camera on a laptop: declare just it. The mission uses
+  # cam2-or-cam1 everywhere, so a single cam works in either role.
+  bottom: { kind: usb, device: 0, size: [1280, 720], hfov_deg: 68.0,
+            rotation_deg: 0, jpeg_quality: 80, fps: 30 }
+  # hfov_deg: measure YOUR webcam (most laptop cams are 60-75 deg).
+  #   Wrong HFOV only skews approach geometry on the bench — the printed
+  #   QR is found by pixels, not by geometry.
+  #
+  # Gazebo closed-loop (later): point bottom at the RTP stream instead —
+  #   bottom: { kind: url, backend: gstreamer, size: [1280, 720],
+  #             hfov_deg: 90.0, device: "udpsrc port=5600 caps=... ! ... ! appsink" }
+  #   see SIM_GUIDE.md section 10. File playback for vision tests:
+  #   bottom: { kind: file, path: bench_frames/, size: [1280, 720], fps: 5 }
+
+detector:
+  kind: classical            # laptop has no Hailo; stock YOLO knows no QR class
+  conf_thr: 0.35
+  iou_thr: 0.5
+  tile_bottom: true          # skipped automatically for classical
+  tile_grid: [3, 3]
+  full_decode_every_n: 5
+  cue_frames: 2
+
+decode:
+  required_streak: 3
+  miss_tolerance: 1
+
+mission:
+  sweep_alt_m: 15.0
+  approach_stair_m: [12.0, 9.0, 7.0]
+  grid_overlap: 0.5
+  yaw_steps: 12
+  yaw_settle_s: 1.0
+  trigger_timeout_s: 900
+  search_timeout_s: 240
+  approach_timeout_s: 240
+  min_batt_pct: 0            # SITL battery game is silly; don't failsafe on it
+  arrive_m: 2.0
+  post_action: RTL
+  trigger_seq: null
+  trigger_cmds: [216, 222, 42600]
+  trigger_require_auto: true
+  trigger_peek_ahead: false
+  nofence_half_m: 20.0       # SITL has no fence: cover a 40x40 m home box
+
+relay:
+  interval_s: 2.0
+  window_s: 15.0
