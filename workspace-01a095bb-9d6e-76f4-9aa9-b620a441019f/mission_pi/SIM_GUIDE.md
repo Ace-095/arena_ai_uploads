@@ -351,7 +351,12 @@ Terminal A — the world (Linux, ~30 s to load):
 cd mission_pi
 gz sim -v4 -r sim/worlds/mission_world.sdf
 # want: iris on the ground at the origin, white QR panel ~8 m away on +X.
-# weak GPU? add -s (server only, no GUI window): sensors still publish.
+# NO WINDOW / GUI SEGFAULT (ogre2 "Unable to create the rendering window",
+# libEGL "driver (null)" on NVIDIA)? The mission doesn't need the window —
+# cameras are server-side sensors. Run headless instead and verify pixels
+# via the bridge (Terminal C): the GUI is optional chrome.
+#   gz sim -s -r sim/worlds/mission_world.sdf
+# weak GPU? -s also halves render load (sensors still publish).
 ```
 
 Terminal B — SITL on the iris (Linux). Note `--model JSON` + frame
@@ -447,6 +452,15 @@ bandwidth ever matters (it won't — the pixels never leave the laptop).
 ## 11. Moving to the Pi 5 (when the bench is green)
 
 1. Same repo/branch on the Pi; system deps per `README.md`
+   (picamera2 stack instead of §2).
+2. `cp config.example.yaml config.yaml`, set your lens HFOVs.
+3. Drop the fine-tuned `qr_yolov8n.hef` into `models/`
+   (`training/compile_hef.md`), detector `kind: auto` picks it up.
+4. Run without `--device` (USB auto-detect) — or keep `--device` for
+   an explicit `/dev/serial/by-id/...` path.
+
+Bench green + air test = done. Good hunting.
+i; system deps per `README.md`
    (picamera2 stack instead of §2).
 2. `cp config.example.yaml config.yaml`, set your lens HFOVs.
 3. Drop the fine-tuned `qr_yolov8n.hef` into `models/`
