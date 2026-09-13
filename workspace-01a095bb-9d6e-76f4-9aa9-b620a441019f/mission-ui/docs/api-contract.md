@@ -79,7 +79,7 @@ UI → bridge → MP → FC over MAVLink.
 | GET/POST | `/api/mp/mavlink` | mavlink-state / `{port}` → rebind + state |
 | POST/DELETE | `/api/mp/fence` | `{vertices:[{lat,lon}], mission_type:'fence', fence_action?}` → GeofenceStatus |
 | GET | `/api/mp/plan` | plan (fresh read from FC) |
-| POST | `/api/mp/mode` | `{mode:'RTL'|'LAND'}` → `{status, mode, result, result_name, from_sysid}` |
+| POST | `/api/mp/mode` | `{mode:'RTL'|'LAND'}` → `{status, mode, result, result_name, from_sysid, home_set, home}` (`home_set`/`home` filled only when RTL is rejected — FC home query) |
 | POST | `/api/mp/param` | `{name}` → `{name, value}` |
 | POST | `/api/mp/qr` | `{payload}` → `{status, qr:{payload, source:'manual', ts, line}}` |
 | POST | `/api/mp/watch` | `{path}` → `{watching}` |

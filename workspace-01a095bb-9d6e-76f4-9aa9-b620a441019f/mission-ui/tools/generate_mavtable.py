@@ -46,6 +46,7 @@ NAMES = [
     "MISSION_ACK",               # 47   in
     "MISSION_REQUEST_INT",       # 51   in/out
     "GPS_GLOBAL_ORIGIN",         # 49   in
+    "HOME_POSITION",             # 242  in (RTL pre-check: home set?)
     "MISSION_ITEM_INT",          # 73   in/out
     "COMMAND_LONG",              # 76   out
     "COMMAND_ACK",               # 77   in

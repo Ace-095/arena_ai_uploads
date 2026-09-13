@@ -19,6 +19,7 @@ TABLE = {
     47: ('MISSION_ACK', 153, [('target_system', 'B'), ('target_component', 'B'), ('type', 'B'), ('mission_type', 'B')], ['target_system', 'target_component', 'type', 'mission_type']),
     51: ('MISSION_REQUEST_INT', 196, [('seq', 'H'), ('target_system', 'B'), ('target_component', 'B'), ('mission_type', 'B')], ['target_system', 'target_component', 'seq', 'mission_type']),
     49: ('GPS_GLOBAL_ORIGIN', 39, [('latitude', 'i'), ('longitude', 'i'), ('altitude', 'i'), ('time_usec', 'Q')], ['latitude', 'longitude', 'altitude', 'time_usec']),
+    242: ('HOME_POSITION', 104, [('latitude', 'i'), ('longitude', 'i'), ('altitude', 'i'), ('x', 'f'), ('y', 'f'), ('z', 'f'), ('q', '4f'), ('approach_x', 'f'), ('approach_y', 'f'), ('approach_z', 'f'), ('time_usec', 'Q')], ['latitude', 'longitude', 'altitude', 'x', 'y', 'z', 'q', 'approach_x', 'approach_y', 'approach_z', 'time_usec']),
     73: ('MISSION_ITEM_INT', 38, [('param1', 'f'), ('param2', 'f'), ('param3', 'f'), ('param4', 'f'), ('x', 'i'), ('y', 'i'), ('z', 'f'), ('seq', 'H'), ('command', 'H'), ('target_system', 'B'), ('target_component', 'B'), ('frame', 'B'), ('current', 'B'), ('autocontinue', 'B'), ('mission_type', 'B')], ['target_system', 'target_component', 'seq', 'frame', 'command', 'current', 'autocontinue', 'param1', 'param2', 'param3', 'param4', 'x', 'y', 'z', 'mission_type']),
     76: ('COMMAND_LONG', 152, [('param1', 'f'), ('param2', 'f'), ('param3', 'f'), ('param4', 'f'), ('param5', 'f'), ('param6', 'f'), ('param7', 'f'), ('command', 'H'), ('target_system', 'B'), ('target_component', 'B'), ('confirmation', 'B')], ['target_system', 'target_component', 'command', 'confirmation', 'param1', 'param2', 'param3', 'param4', 'param5', 'param6', 'param7']),
     77: ('COMMAND_ACK', 143, [('command', 'H'), ('result', 'B'), ('progress', 'B'), ('result_param2', 'i'), ('target_system', 'B'), ('target_component', 'B')], ['command', 'result', 'progress', 'result_param2', 'target_system', 'target_component']),
@@ -53,5 +54,6 @@ ID_TO_NAME = {
     77: 'COMMAND_ACK',
     147: 'BATTERY_STATUS',
     162: 'FENCE_STATUS',
+    242: 'HOME_POSITION',
     253: 'STATUSTEXT',
 }

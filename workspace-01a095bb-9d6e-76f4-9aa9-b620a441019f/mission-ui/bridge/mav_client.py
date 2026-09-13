@@ -527,33 +527,68 @@ class MavClient:
             origin_lon = sum(v[1] for v in vertices) / n
             origin_reason = "EKF origin unavailable — using polygon mean"
 
-        # 2) upload (subscribe-before-send; FC drives per-seq requests)
+        # 2) upload (subscribe-before-send; FC drives per-seq requests).
+        # Every protocol event is logged with running counts so a field log
+        # alone shows which leg failed: COUNT UI->FC, REQUESTs FC->UI, or
+        # ITEMs UI->FC.
         deadline = time.time() + timeout
         q = self._subscribe(["MISSION_REQUEST_INT", "MISSION_ACK"])
-        try:
+        count_sends = 0
+        last_count_t = 0.0
+        req_seen = 0
+        items_sent = 0
+        ignored_other_type = set()
+
+        def _send_count():
+            nonlocal count_sends, last_count_t
             self._send(M.MSG_ID['MISSION_COUNT'], {  # MISSION_COUNT
                 "count": n, "target_system": ts, "target_component": 1,
                 "mission_type": M.MAV_MISSION_TYPE_FENCE,
             })
+            count_sends += 1
+            last_count_t = time.time()
+
+        try:
+            _send_count()
+            self.hub.emit_threadsafe("log", {"level": "INFO",
+                "msg": "fence: COUNT n=%d sent to sysid %d (try %d)" % (n, ts, count_sends)})
             sent = set()
             ack = None
             retries = 0
             while (len(sent) < n or ack is None) and time.time() < deadline:
                 msg = self._pull_until(q, lambda m: True, time.time() + 0.5)
+                now = time.time()
                 if msg is None:
+                    # GCS-side COUNT retry (mission protocol: every message
+                    # needing a response must be resent). Only while nothing
+                    # has been heard — never resets a live upload.
+                    if req_seen == 0 and ack is None and now - last_count_t > 1.5 \
+                            and count_sends < 5 and now < deadline - 0.6:
+                        _send_count()
+                        self.hub.emit_threadsafe("log", {"level": "WARN",
+                            "msg": "fence: no REQUEST yet — resending COUNT (try %d)" % count_sends})
                     continue
                 name, f = msg[0], msg[1]
                 if f.get("mission_type") != M.MAV_MISSION_TYPE_FENCE:
+                    key = (name, f.get("mission_type"))
+                    if key not in ignored_other_type:
+                        ignored_other_type.add(key)
+                        self.hub.emit_threadsafe("log", {"level": "WARN",
+                            "msg": "fence: ignoring %s with mission_type=%s (want FENCE=1)" % key})
                     continue
                 if name == "MISSION_REQUEST_INT":
                     seq = f["seq"]
                     if seq >= n:
                         raise MavError("FC requested out-of-range fence seq %d (n=%d)" % (seq, n))
+                    req_seen += 1
                     if seq in sent:
                         retries += 1
                         if retries <= 5 or retries % 10 == 0:
                             self.hub.emit_threadsafe("log", {"level": "WARN",
                                 "msg": "fence item seq %d re-requested by FC (retry %d) — resending" % (seq, retries)})
+                    elif req_seen <= 3 or req_seen % 25 == 0:
+                        self.hub.emit_threadsafe("log", {"level": "INFO",
+                            "msg": "fence: REQUEST seq=%d (req #%d)" % (seq, req_seen)})
                     lat, lon = vertices[seq]
                     self._send(M.MSG_ID['MISSION_ITEM_INT'], {  # MISSION_ITEM_INT
                         "param1": float(n), "param2": 0.0, "param3": 0.0, "param4": 0.0,
@@ -564,17 +599,28 @@ class MavClient:
                         "mission_type": M.MAV_MISSION_TYPE_FENCE,
                     })
                     time.sleep(0.03)  # pace the burst: MP's mirror socket drops rapid-fire UDP
+                    items_sent += 1
                     sent.add(seq)
                 elif name == "MISSION_ACK":
                     ack = f
+                    self.hub.emit_threadsafe("log", {"level": "WARN",
+                        "msg": "fence: ACK type=%d (%s) from sysid %s — COUNT x%d, %d REQUESTs, %d items sent" % (
+                            ack["type"], M.MAV_MISSION_RESULT.get(ack["type"], "?"),
+                            self._last_ack_src.get("MISSION_ACK", "?"),
+                            count_sends, req_seen, items_sent)})
         finally:
             self._unsubscribe(q)
+        xfer = "COUNT x%d, %d REQUESTs, %d items sent" % (count_sends, req_seen, items_sent)
         if ack is None:
-            raise MavError("fence upload timed out (FC not responding — check MP forwarding)")
+            raise MavError("fence upload timed out (%s — %s)" % (
+                xfer, "FC never answered: COUNT lost UI->FC or REQUESTs lost FC->UI"
+                if req_seen == 0 else "FC asked, then went silent mid-upload"))
         if ack["type"] != M.MAV_MISSION_ACCEPTED:
-            raise MavError("fence upload REJECTED by FC (MAV_MISSION type=%d [%s], from sysid %s)" % (
+            raise MavError("fence upload REJECTED by FC (MAV_MISSION type=%d [%s], from sysid %s; %s — %s)" % (
                 ack["type"], M.MAV_MISSION_RESULT.get(ack["type"], "?"),
-                self._last_ack_src.get("MISSION_ACK", "?")))
+                self._last_ack_src.get("MISSION_ACK", "?"), xfer,
+                "FC never asked for items: COUNT lost UI->FC or REQUESTs lost FC->UI"
+                if req_seen == 0 else "FC asked but starved: our ITEMs are being dropped UI->FC"))
 
         # 3) readback verify
         confirmed = True
@@ -740,6 +786,36 @@ class MavClient:
         if f["latitude"] == 0 and f["longitude"] == 0:
             raise MavError("FC returned zero EKF origin")
         return (f["latitude"] / 1e7, f["longitude"] / 1e7)
+
+    def get_home(self, timeout=1.5):
+        """Return (lat, lon, alt_msl) of the FC's home, or None if unset.
+
+        Never raises: a missing/zero HOME_POSITION *is* the answer (it is
+        exactly when ArduPilot denies RTL — ModeRTL::init fails iff
+        !home_is_set())."""
+        if self.sender is None:
+            return None
+        ts = self.veh_sysid or 1
+        q = self._subscribe(["HOME_POSITION"])
+        try:
+            self._send(M.MSG_ID['COMMAND_LONG'], {
+                "param1": float(M.MAVLINK_MSG_ID_HOME_POSITION),
+                "param2": 0, "param3": 0, "param4": 0,
+                "param5": 0, "param6": 0, "param7": 0,
+                "command": M.MAV_CMD_REQUEST_MESSAGE,
+                "target_system": ts, "target_component": 1, "confirmation": 0,
+            })
+            msg = self._pull_until(q, lambda m: m[0] == "HOME_POSITION", time.time() + timeout)
+        except MavError:
+            return None
+        finally:
+            self._unsubscribe(q)
+        if msg is None:
+            return None
+        f = msg[1]
+        if f["latitude"] == 0 and f["longitude"] == 0:
+            return None
+        return (f["latitude"] / 1e7, f["longitude"] / 1e7, f["altitude"] / 1e3)
 
     def read_plan(self, timeout=6.0):
         if self.sender is None:

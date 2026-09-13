@@ -997,8 +997,22 @@ class Server:
             rname = COMMAND_ACK_RESULT.get(res, "?")
             ack_src = self.mav._last_ack_src.get("COMMAND_ACK", "?")
             await self.hub.emit("log", {"level": "WARN", "msg": "UI sent mode %s via MAVLink (via MP) — result=%d (%s, from sysid %s)" % (mode, res, rname, ack_src)})
+            home = None
+            if mode == "RTL" and res != 0:
+                # ArduPilot denies RTL iff home is unset — ask the FC directly
+                # so the log states the cause instead of guessing it.
+                try:
+                    home = await asyncio.to_thread(self.mav.get_home, 1.5)
+                except Exception:
+                    home = None
+                if home is None:
+                    await self.hub.emit("log", {"level": "ERROR", "msg": "RTL %s (from sysid %s) — HOME IS UNSET on the FC (no HOME_POSITION). Fix: GPS 3D lock, then disarm + re-arm (or MP: right-click map -> Set Home Point -> vehicle location), then press RTL again." % (rname, ack_src)})
+                else:
+                    await self.hub.emit("log", {"level": "WARN", "msg": "RTL %s but home IS set (%.5f, %.5f) — denial came from sysid %s, not the home check; report this line." % (rname, home[0], home[1], ack_src)})
             return self.json({"status": "ok" if res == 0 else "rejected", "mode": mode,
-                              "result": res, "result_name": rname, "from_sysid": ack_src})
+                              "result": res, "result_name": rname, "from_sysid": ack_src,
+                              "home_set": (home is not None) if mode == "RTL" and res != 0 else None,
+                              "home": home})
         if p == "/api/mp/param" and method == "POST":
             name = str(jbody.get("name", "")).strip().upper()
             if not re.fullmatch(r"[A-Z0-9_]{1,15}", name):
