@@ -144,8 +144,13 @@ Terminal 1 (Linux):
 cd ~/ardupilot
 Tools/autotest/sim_vehicle.py -v ArduCopter -f quad --no-mavproxy \
     -A "--serial1=tcp:5763"
-# wait for: "Serial port 0 on TCP port 5760" ... "Waiting for connection"
+# wait for: "SERIAL0 on TCP port 5760" ... "Waiting for connection"
 ```
+
+Normal at this point: **no SERIAL1 line yet**. Serial0 blocks the boot
+at "Waiting for connection" until the first client connects to 5760 —
+only then does `SERIAL1 on TCP port 5763` (mission_pi's port) appear.
+So connect MP first, mission_pi second.`
 
 On Windows Mission Planner (same WiFi):
 
@@ -229,7 +234,7 @@ Kill everything with Ctrl-C (Terminal 1 SITL, Terminal 2 mission).
 | Symptom | Fix |
 |---|---|
 | `waf`/prereqs fail | Re-run `install-prereqs-ubuntu.sh -y`, fresh terminal, retry; needs ~5 GB disk |
-| MP TCP won't connect | Same WiFi? Right IP (`hostname -I`)? `ss -ltn \| grep 5760` on Linux; `sudo ufw allow 5760/tcp` |
+| MP "connection failed" on 5760 | SITL listens on all interfaces (verified in source) — it's network/typing: Linux `ss -ltn \| grep 5760` must show LISTEN; `hostname -I` for the WiFi IP (not 127.0.0.1); Windows `ping <ip>` then PowerShell `Test-NetConnection <ip> -Port 5760`; `sudo ufw allow 5760/tcp` if ufw is active; in MP put IP and port in SEPARATE fields |
 | SITL console lacks "Serial port 1 on TCP port 5763" | Quote `-A "--serial1=tcp:5763"` exactly; fallback: `-A "--serial1=udpclient:127.0.0.1:14555"` + `fc.conn: "udpin:0.0.0.0:14555"` |
 | `[fc] FAIL: no heartbeat` on 5763 | SITL up? (Terminal 1). Port shared/IPC clash: nothing else may hold 5763 |
 | `[cam] none assigned` | `ls /dev/video*`; close apps holding the cam; `device: 1`; video-group perms (§2); `--verbose` |
