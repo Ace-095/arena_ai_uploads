@@ -158,7 +158,7 @@ class MockFc(threading.Thread):
             self._send(M.MSG_ID['HEARTBEAT'], {
                 "custom_mode": v.mode_num, "type": 2, "autopilot": 3,
                 "base_mode": (128 if v.armed else 0) | 1,
-                "system_status": 4 if v.armed else 0, "mavlink_version": 3,
+                "system_status": M.MAV_STATE_ACTIVE if v.armed else M.MAV_STATE_STANDBY, "mavlink_version": 3,
             })
         if now - self._last_tel < 0.2:   # telemetry 5 Hz
             return

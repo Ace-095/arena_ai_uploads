@@ -127,7 +127,7 @@ if known).
   `MAV_CMD_NAV_FENCE_POLYGON_VERTEX_INCLUSION` = 5001, frame GLOBAL,
   **param1 = vertex_count on every item**), readback verify (1e-7° ≈ 1 cm),
   `FENCE_ENABLE=1` + `FENCE_ACTION` + `FENCE_TYPE|=0x4`,
-  `MISSION_REQUEST_LIST` (plan + DO_SPRAYER=310 discovery),
+  `MISSION_REQUEST_LIST` (plan + DO_SPRAYER=216 discovery),
   `PARAM_REQUEST_READ`/`PARAM_SET`, `COMMAND_LONG DO_SET_MODE` (**RTL/LAND
   only** — arming/takeoff stay in MP), `STATUSTEXT` notices.
 - Discipline (ported from validated hehe logic): **subscribe-before-send** on
