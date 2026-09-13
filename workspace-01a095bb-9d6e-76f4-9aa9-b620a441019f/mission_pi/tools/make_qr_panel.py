@@ -44,6 +44,9 @@ def main():
     d.rectangle([bw // 2, bw // 2, w - bw // 2 - 1, h - bw // 2 - 1],
                 outline="black", width=bw)
     d.text((w // 2 - len(args.text) * 4, int(h * 0.90)), args.text, fill="black")
+    out_dir = os.path.dirname(args.out)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     panel.save(args.out, dpi=(args.dpi, args.dpi))
     print("wrote %s (%dx%d px, %.0fx%.0f mm @ %d dpi): %r" % (
         args.out, w, h, A3_W_MM, A3_H_MM, args.dpi, args.text))
