@@ -67,6 +67,35 @@ def _is_network_device(dev):
         ("tcp:", "udp:", "udpin:", "udpout:", "udpbcast:"))
 
 
+def _wait_vehicle_heartbeat(conn, timeout):
+    """First non-GCS heartbeat on the wire (sysid < 200, type != GCS).
+
+    Bench links also carry Mission Planner's forwarded heartbeats
+    (sysid 255, custom_mode=0). Accepting one of those here would route
+    every command at MP and poison mode tracking, so the vehicle
+    heartbeat is filtered the same way the ADDC reference stack does.
+    Falls back to ANY heartbeat when no vehicle one appears.
+    """
+    t_end = time.time() + timeout
+    fallback = None
+    while time.time() < t_end:
+        try:
+            hb = conn.wait_heartbeat(timeout=max(0.5, t_end - time.time()))
+        except Exception:
+            hb = None
+        if hb is None:
+            break
+        if fallback is None:
+            fallback = hb
+        try:
+            sysid = hb.get_srcSystem()
+        except Exception:
+            sysid = 0
+        if sysid and sysid < 200 and hb.type != mavutil.mavlink.MAV_TYPE_GCS:
+            return hb
+    return fallback
+
+
 def find_fc(bauds=(115200, 57600, 921600), hb_timeout=3.0, device=None):
     """Return (conn, device) for the first FC that answers a heartbeat."""
     _require_pymavlink()
@@ -89,11 +118,12 @@ def find_fc(bauds=(115200, 57600, 921600), hb_timeout=3.0, device=None):
             except Exception as e:
                 errors.append("%s@%s: %s" % (dev, baud, e))
                 continue
-            try:
-                hb = conn.wait_heartbeat(timeout=hb_timeout)
-            except Exception:
-                hb = None
+            hb = _wait_vehicle_heartbeat(conn, hb_timeout)
             if hb is not None:
+                # wait_heartbeat() retargets the connection on EVERY heartbeat
+                # it sees — pin routing back to the heartbeat we selected.
+                conn.target_system = hb.get_srcSystem()
+                conn.target_component = hb.get_srcComponent()
                 log.info("FC found: %s @ %s (sysid=%d compid=%d)", dev,
                          baud if baud else "net",
                          hb.get_srcSystem(), hb.get_srcComponent())
@@ -119,6 +149,8 @@ class FCLink:
         self.veh_sysid = None
         self.mode = None
         self.mode_num = None
+        self._mode_ts = 0.0      # last VEHICLE heartbeat (mode tracking input)
+        self._hb_sources = {}    # (sysid, type) -> count; proves who is on the wire
         self.armed = False
         self.last_hb = 0.0
         self._subs = {}
@@ -127,6 +159,7 @@ class FCLink:
         self._stop = threading.Event()
         self._reader = None
         self._hb_thread = None
+        self._stream_thread = None
 
     # -- lifecycle ------------------------------------------------------
     def connect(self, device=None, bauds=(115200, 57600, 921600)):
@@ -141,11 +174,13 @@ class FCLink:
         self._reader.start()
         self._hb_thread = threading.Thread(target=self._hb_loop, name="fc-hb", daemon=True)
         self._hb_thread.start()
+        self._stream_thread = threading.Thread(target=self._stream_loop, name="fc-streams", daemon=True)
+        self._stream_thread.start()
         return dev
 
     def close(self):
         self._stop.set()
-        for t in (self._reader, self._hb_thread):
+        for t in (self._reader, self._hb_thread, self._stream_thread):
             if t:
                 t.join(timeout=2.0)
         try:
@@ -206,10 +241,23 @@ class FCLink:
                 continue
             t = m.get_type()
             if t == "HEARTBEAT" and m.get_srcSystem() != 51:
-                if m.type != mavutil.mavlink.MAV_TYPE_GCS:
-                    self.veh_sysid = m.get_srcSystem()
+                try:
+                    hbsys = m.get_srcSystem()
+                    hbtype = m.type
+                except Exception:
+                    hbsys, hbtype = -1, -1
+                key = (hbsys, hbtype)
+                self._hb_sources[key] = self._hb_sources.get(key, 0) + 1
+                # VEHICLE heartbeats only. GCS heartbeats (MP, sysid 255,
+                # custom_mode=0) ride this wire too and used to drag
+                # fc.mode to STABILIZE, silently vetoing the AUTO-gated
+                # trigger for the whole flight. Same fix as the ADDC
+                # reference: a separate vehicle-only heartbeat cache.
+                if hbsys == self.target_system and \
+                        hbtype != mavutil.mavlink.MAV_TYPE_GCS:
+                    self.veh_sysid = hbsys
                     self.last_hb = time.time()
-                self._track_mode(m)
+                    self._track_mode(m)
             with self._subs_lock:
                 targets = list(self._subs.get(t, [])) + list(self._subs.get("*", []))
             for q in targets:
@@ -232,10 +280,25 @@ class FCLink:
             name = {v: k for k, v in COPTER_MODES.items()}.get(hb.custom_mode,
                                                               "MODE(%d)" % hb.custom_mode)
         if name != self.mode:
-            log.info("FC mode: %s -> %s", self.mode, name)
+            try:
+                sysid = hb.get_srcSystem()
+            except Exception:
+                sysid = -1
+            log.info("FC mode: %s -> %s (sysid=%d)", self.mode, name, sysid)
         self.mode = name
         self.mode_num = hb.custom_mode
+        self._mode_ts = time.time()
         self.armed = bool(hb.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+
+    def mode_age(self):
+        """Seconds since the last VEHICLE heartbeat (inf if never seen)."""
+        if not self._mode_ts:
+            return float("inf")
+        return time.time() - self._mode_ts
+
+    def hb_sources(self):
+        """Heartbeat census {(sysid, type): count} — who is on this wire."""
+        return dict(self._hb_sources)
 
     def _hb_loop(self):
         while not self._stop.is_set():
@@ -247,6 +310,22 @@ class FCLink:
             except Exception:
                 pass
             time.sleep(1.0)
+
+    def _stream_loop(self):
+        """Re-assert stream rates every 15 s (reference-stack keep-alive).
+
+        SET_MESSAGE_INTERVAL persists, but a late FC reboot, a GCS rate
+        reset, or a flaky first request can silently starve the mission
+        of MISSION_CURRENT/HOME. Best-effort, DEBUG-quiet.
+        """
+        while not self._stop.wait(15.0):
+            if self.conn is None:
+                continue
+            try:
+                self.start_streams()
+                log.debug("stream rates re-asserted")
+            except Exception:
+                pass
 
     # -- ops ------------------------------------------------------------
     def _cmd_long(self, cmd, p1=0, p2=0, p3=0, p4=0, p5=0, p6=0, p7=0, ack_timeout=4.0):
@@ -340,7 +419,7 @@ class FCLink:
             mavutil.mavlink.MAV_MISSION_TYPE_FENCE, timeout)
         return [(m.x / 1e7, m.y / 1e7) for m in items]
 
-    def find_sprayer_seqs(self, plan, cmds=(216, 222, 42600)):
+    def find_sprayer_seqs(self, plan, cmds=(216, 222, 223, 42600)):
         """All mission seqs whose command is a sprayer/trigger command.
 
         216 = DO_SPRAYER; 222/42600 are the fallbacks the field-tested
@@ -378,20 +457,25 @@ class FCLink:
     STREAM_DEFAULTS = ((242, 1.0),    # HOME_POSITION
                        (33, 5.0),     # GLOBAL_POSITION_INT
                        (147, 1.0),    # BATTERY_STATUS
-                       (42, 2.0))     # MISSION_CURRENT
+                       (42, 4.0),     # MISSION_CURRENT (4 Hz: finer trigger timing)
+                       (245, 2.0),    # EXTENDED_SYS_STATE (landed state)
+                       (74, 2.0))     # VFR_HUD (throttle/alt cross-check)
 
     def start_streams(self, specs=None):
         for msgid, hz in (specs or self.STREAM_DEFAULTS):
             self.set_message_interval(msgid, hz)
 
     def set_mode(self, mode, timeout=5.0):
+        """DO_SET_MODE with canonical encoding: param1=1 (custom enabled),
+        param2=mode number — the MAVLink-spec form the ADDC reference
+        stack uses. Retries until COMMAND_ACK 0 or timeout."""
         num = COPTER_MODES.get(str(mode).upper(), mode) if isinstance(mode, str) else mode
         t0 = time.time()
         last = None
         while time.time() - t0 < timeout:
             try:
                 last = self._cmd_long(mavutil.mavlink.MAV_CMD_DO_SET_MODE,
-                                      float(num), ack_timeout=3.0)
+                                      1.0, float(num), ack_timeout=3.0)
             except FCError as e:
                 last = "timeout: %s" % e
             if last == 0:

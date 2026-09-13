@@ -43,7 +43,7 @@ mission:
   arrive_m: 2.0
   post_action: RTL          # RTL | AUTO (resume mission) | LOITER | LAND
   trigger_seq: null         # fallback if the plan has no sprayer item
-  trigger_cmds: [216, 222, 42600]  # DO_SPRAYER + ftest fallbacks
+  trigger_cmds: [216, 222, 223, 42600]  # DO_SPRAYER + ftest/ADDC fallbacks
   trigger_require_auto: true       # take over only out of AUTO
   trigger_peek_ahead: false        # true = fire when NEXT item is sprayer
                                    # (ftest/claude3 style; may pre-empt 15 m)

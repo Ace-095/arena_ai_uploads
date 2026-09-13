@@ -48,9 +48,12 @@ class Mission:
         self.min_batt_pct = float(m.get("min_batt_pct", 25))
         self.post_action = str(m.get("post_action", "RTL")).upper()
         self.arrive_m = float(m.get("arrive_m", 2.0))
-        self.trigger_cmds = set(m.get("trigger_cmds", [216, 222, 42600]))
+        # 216 = DO_SPRAYER (what MP writes), 222 = ftest fallback,
+        # 223 = ADDC reference stack's sprayer marker, 42600 = ftest custom.
+        self.trigger_cmds = set(m.get("trigger_cmds", [216, 222, 223, 42600]))
         self.trigger_peek_ahead = bool(m.get("trigger_peek_ahead", False))
         self.trigger_require_auto = bool(m.get("trigger_require_auto", True))
+        self._advancing = False  # latched by _wait_trigger when CURRENT moves
         d = cfg.get("detector", {})
         self.tile_bottom = bool(d.get("tile_bottom", True))
         tg = d.get("tile_grid", [3, 3])
@@ -314,15 +317,24 @@ class Mission:
             self._set_phase("FAILSAFE", "GUIDED refused: %s" % e)
             return
         t1 = time.time()
-        while time.time() - t1 < 6.0 and self.fc.mode != "GUIDED":
+        while time.time() - t1 < 8.0 and self.fc.mode != "GUIDED":
             time.sleep(0.5)
         if self.fc.mode != "GUIDED":
-            self._set_phase("FAILSAFE", "GUIDED not confirmed (mode=%s)" % self.fc.mode)
-            return
+            # DO_SET_MODE was ACKed above — the FC accepted GUIDED. A missing
+            # heartbeat echo must not brick the mission the way the stale
+            # AUTO gate bricked the trigger, so proceed: the hold-arrival
+            # check below is the real confirmation that GUIDED is live.
+            log.warning("GUIDED not echoed by heartbeat (mode=%s age=%.1fs) — "
+                        "proceeding on COMMAND_ACK; hold arrival is the check",
+                        self.fc.mode, self.fc.mode_age())
         # hold + normalize to sweep altitude (takeover may precede 15 m)
         try:
             pos = self.fc.get_position()
-            self._goto_hold(pos["lat"], pos["lon"], self.sweep_alt, 25.0, arrive_m=3.0)
+            arrived = self._goto_hold(pos["lat"], pos["lon"], self.sweep_alt, 25.0, arrive_m=3.0)
+            if not arrived:
+                log.warning("takeover hold did not converge (mode=%s) — "
+                            "GUIDED may be inactive; continuing to SEARCH anyway",
+                            self.fc.mode)
         except Exception as e:
             log.warning("hold failed: %r", e)
         if self._abort.is_set():
@@ -336,17 +348,63 @@ class Mission:
         # found nothing in the pattern — one last transmit-less exit
         self._finish(found=False)
 
+    def _gate_state(self):
+        """Trigger gate state: (gate_open, gate_name).
+
+        - AUTO: vehicle heartbeat says AUTO and is fresh (< 5 s) — the
+          ADDC reference shape.
+        - DEADMAN: vehicle heartbeats are stale/missing BUT the mission
+          visibly advanced since WAIT began. An advancing mission IS an
+          executing mission, so a sprayer cue is trustworthy even when
+          the mode channel is broken (this exact failure cost us a full
+          bench flight: MP heartbeats held fc.mode off AUTO throughout).
+        - override: trigger_require_auto=false (bench escape hatch).
+        """
+        fresh_auto = (self.fc.mode == "AUTO" and self.fc.mode_age() < 5.0)
+        if not self.trigger_require_auto:
+            return True, "override"
+        if fresh_auto:
+            return True, "AUTO"
+        if self.fc.mode_age() >= 5.0 and self._advancing:
+            return True, "DEADMAN"
+        return False, "closed(mode=%s age=%.1fs advancing=%s)" % (
+            self.fc.mode, self.fc.mode_age(), self._advancing)
+
+    def _fire_trigger(self, why):
+        self._log("WARN", "trigger: %s" % why)
+        try:
+            self.fc.send_statustext("TRIGGER: %s" % why[:40])
+        except Exception:
+            pass
+        self._log("WARN", "hb sources: %s" % (self.fc.hb_sources(),))
+        return True
+
     def _wait_trigger(self):
-        """Multi-cue trigger (aligned with the ftest references):
-        1. MISSION_CURRENT reaches/passes a plan-scanned sprayer seq.
-        2. Current item's command is a sprayer cmd (DO items don't emit
+        """Multi-cue trigger (shaped after the ADDC reference MONITOR_AUTO):
+        1. PRIMARY: autopilot STATUSTEXT "Mission: N Sprayer" (vehicle
+           sysid only) — ArduPilot broadcasts this when DO_SPRAYER fires.
+        2. MISSION_CURRENT reaches/passes a plan-scanned sprayer seq.
+        3. Current item's command is a sprayer cmd (DO items don't emit
            ITEM_REACHED, so CURRENT + fetch is the reliable path).
-        3. Optional peek-ahead: NEXT item is a sprayer cmd (claude3 style).
-        4. STATUSTEXT sprayer backup. All gated on AUTO unless configured
-           otherwise; manual POST /takeover always works."""
+        4. Optional peek-ahead: NEXT item is a sprayer cmd (claude3 style).
+        Cues fire through the AUTO gate (fresh vehicle heartbeat) or the
+        DEADMAN gate (stale mode channel + visibly advancing mission);
+        manual POST /takeover always works."""
         first = min(self.sprayer_seqs) if self.sprayer_seqs else None
         if first is None:
             self._log("WARN", "no trigger seq — waiting for manual takeover only")
+        # Mid-flight-reboot safety (reference MONITOR_AUTO entry): booting
+        # into an already-GUIDED FC means a prior run died mid-takeover.
+        if self.fc.mode == "GUIDED" and self.fc.mode_age() < 5.0:
+            self._log("ERROR", "FC already GUIDED at boot (prior run died?) — commanding RTL")
+            try:
+                self.fc.set_mode("RTL", timeout=5.0)
+            except Exception as e:
+                self._log("ERROR", "reboot-RTL failed: %s" % e)
+            self._set_phase("FAILSAFE", "reboot in GUIDED — RTL commanded")
+            return False
+        self._log("INFO", "hb sources at WAIT: %s" % (self.fc.hb_sources(),))
+        self._advancing = False  # latched once CURRENT visibly moves
         t0 = time.time()
         q = self.fc.subscribe(["MISSION_CURRENT", "MISSION_ITEM_REACHED", "STATUSTEXT"])
         last_seq = None
@@ -368,23 +426,38 @@ class Mission:
                 if m.get_type() == "STATUSTEXT":
                     raw = m.text
                     txt = raw.decode("utf-8", "ignore") if isinstance(raw, bytes) else str(raw)
-                    auto = (not self.trigger_require_auto) or self.fc.mode == "AUTO"
-                    if "sprayer" in txt.lower() and auto:
-                        self._log("WARN", "trigger: sprayer STATUSTEXT %r" % txt.strip()[:60])
-                        return True
+                    if "sprayer" in txt.lower():
+                        try:
+                            src = m.get_srcSystem()
+                        except Exception:
+                            src = -1
+                        if src != self.fc.target_system:
+                            self._log("INFO", "sprayer text from non-vehicle sysid %d: %r" % (
+                                src, txt.strip()[:60]))
+                            continue
+                        gate_open, gate = self._gate_state()
+                        self._log("WARN", "sprayer STATUSTEXT %r (gate=%s)" % (
+                            txt.strip()[:60], gate))
+                        if gate_open:
+                            return self._fire_trigger("sprayer STATUSTEXT @seq %s" % last_seq)
                     continue
                 seq = getattr(m, "seq", None)
                 if seq is None:
                     continue
                 if m.get_type() == "MISSION_CURRENT" and seq != last_seq:
                     self._log("INFO", "mission current: %d" % seq)
-                auto = (not self.trigger_require_auto) or self.fc.mode == "AUTO"
-                if first is not None and seq >= first and auto:
-                    self._log("WARN", "trigger: mission seq %d >= sprayer %d" % (seq, first))
-                    return True
-                if seq != last_seq:
+                changed = (seq != last_seq)
+                if changed:
+                    if last_seq is not None and not self._advancing:
+                        self._advancing = True
+                        self._log("INFO", "mission advancing (%s -> %d)" % (last_seq, seq))
                     last_seq = seq
-                    if not auto:
+                gate_open, gate = self._gate_state()
+                if first is not None and seq >= first and gate_open:
+                    return self._fire_trigger("mission seq %d >= sprayer %d (gate=%s)" % (
+                        seq, first, gate))
+                if changed:
+                    if not gate_open:
                         continue
                     probe = [seq] + ([seq + 1] if self.trigger_peek_ahead else [])
                     for pr in probe:
@@ -393,9 +466,8 @@ class Mission:
                         except Exception:
                             continue
                         if it is not None and it.command in self.trigger_cmds:
-                            self._log("WARN", "trigger: item %d is sprayer cmd %d%s" % (
+                            return self._fire_trigger("item %d is sprayer cmd %d%s" % (
                                 pr, it.command, " (peek-ahead)" if pr != seq else ""))
-                            return True
             self._set_phase("FAILSAFE", "trigger timeout")
             return False
         finally:

@@ -53,7 +53,7 @@ mission:
   arrive_m: 2.0
   post_action: RTL
   trigger_seq: null
-  trigger_cmds: [216, 222, 42600]
+  trigger_cmds: [216, 222, 223, 42600]
   trigger_require_auto: true
   trigger_peek_ahead: false
   nofence_half_m: 20.0       # SITL has no fence: cover a 40x40 m home box
