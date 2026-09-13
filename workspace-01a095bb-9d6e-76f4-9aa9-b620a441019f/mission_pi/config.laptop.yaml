@@ -13,10 +13,22 @@ fc:
   conn: "tcp:127.0.0.1:5762"   # SITL serial1 spare MAVLink port
 
 cameras:
-  # Only ONE camera on a laptop: declare just it. The mission uses
-  # cam2-or-cam1 everywhere, so a single cam works in either role.
+  # Only ONE physical camera on a laptop: the webcam is the bottom/search
+  # eye (cam2), and cam1 ("Pi Cam 3" tile in the UI) MIRRORS it — no second
+  # device open (a 2nd VideoCapture on the same webcam fails on Windows).
+  front: { kind: mirror, source: cam2 }
   bottom: { kind: usb, device: 0, size: [1280, 720], hfov_deg: 68.0,
-            rotation_deg: 0, jpeg_quality: 80, fps: 30 }
+            rotation_deg: 0, jpeg_quality: 80, fps: 30, backend: any,
+            fourcc: MJPEG }
+  # backend: any | dshow | msmf | v4l2 — if the tile stays dark, try dshow
+  #   (Windows) or v4l2 (Linux). fourcc MJPEG keeps 720p30 inside USB2
+  #   bandwidth; drop the line if your cam dislikes it.
+  # Webcam tuning (contrast etc.): ranges are DRIVER-specific, so query
+  #   first, tune live, then bake the winners here, e.g.
+  #   controls: { contrast: 40, saturation: 64, brightness: 128 }
+  #   curl http://localhost:8000/api/camera/cam2/controls
+  #   curl -X POST http://localhost:8000/api/camera/cam2/controls \
+  #     -H "Content-Type: application/json" -d '{"contrast":40}'
   # hfov_deg: measure YOUR webcam (most laptop cams are 60-75 deg).
   #   Wrong HFOV only skews approach geometry on the bench — the printed
   #   QR is found by pixels, not by geometry.

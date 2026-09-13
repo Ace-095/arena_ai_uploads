@@ -99,11 +99,27 @@ python main.py --check --config config.laptop.yaml
 If `model=usb` didn't appear: wrong `device:` index (try `1`), or the
 cam is held by another app (close Cheese/Zoom/browser), or perms §2.
 
-Live-view the bench cam any time while the stack runs:
+Live-view the bench cams any time while the stack runs (cam1 "Pi Cam 3"
+is a display-only mirror of the webcam — same picture, both UI tiles lit):
 
 ```
+http://127.0.0.1:8000/api/camera/frame/cam1
 http://127.0.0.1:8000/api/camera/frame/cam2
 ```
+
+Tune the webcam (contrast etc.) live, then bake the winners into
+`cameras.bottom.controls` in the yaml. Ranges are driver-specific —
+query first:
+
+```bash
+curl http://127.0.0.1:8000/api/camera/cam2/controls
+curl -X POST http://127.0.0.1:8000/api/camera/cam2/controls \
+  -H "Content-Type: application/json" -d '{"contrast":40,"saturation":64}'
+```
+
+Bench trick: during SEARCH, hold the printed A3 panel (or a phone showing
+a big QR) up to the webcam — the detector decodes it like a real sighting
+and you get to watch TRACK → APPROACH → TRANSMIT end to end.
 
 ## 4. Print the A3 QR panel (5 min)
 

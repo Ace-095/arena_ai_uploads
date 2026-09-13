@@ -301,6 +301,8 @@ class Mission:
             self._log("INFO", "sprayer seqs: %s" % (self.sprayer_seqs,))
         # start detection workers + stream overlays
         for cam in self.rig.cams.values():
+            if getattr(cam, "display_only", False):
+                continue  # mirror tiles are UI-only; the source cam feeds detection
             t = threading.Thread(target=self._worker, args=(cam,),
                                  name="det-" + cam.name, daemon=True)
             t.start()

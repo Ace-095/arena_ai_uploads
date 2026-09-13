@@ -7,9 +7,17 @@ Backends (per-camera `kind` in config):
         http/mjpeg/rtsp URL, or a GStreamer pipeline (Gazebo RTP stream).
   url   alias of usb (makes stream configs self-documenting).
   file  bench playback: a video file or a directory of images, looped.
+  mirror  display-only alias of another camera (no device of its own):
+          bench use is cam1 mirroring the single laptop webcam so the
+          UI's CAM1 ("Pi Cam 3") tile lights up without a second
+          VideoCapture on the same device (fails on Windows, races V4L2).
 
 Each camera runs a capture thread holding the latest BGR frame + an
-annotated JPEG for the UI poll endpoint.
+annotated JPEG for the UI poll endpoint. Mirror cams are skipped by
+detection workers (display_only) and forward control tuning to their
+source. `usb` cameras accept an optional `controls:` map of V4L2/DShow
+properties (brightness/contrast/saturation/hue/gain/exposure/...) —
+best-effort per driver, with set-vs-actual logged.
 """
 import glob
 import logging
@@ -69,6 +77,7 @@ class _BaseCamera:
         self.rotation_deg = int(rotation_deg)
         self.jpeg_quality = int(jpeg_quality)
         self.model = "?"
+        self.display_only = False  # True for mirrors: UI tile only, no detector worker
         self._lock = threading.Lock()
         self._frame = None
         self._frame_ts = 0.0
@@ -253,13 +262,37 @@ class USBCamera(_BaseCamera):
     """OpenCV source: V4L2 index, /dev/videoN, URL, or GStreamer pipeline."""
     kind = "usb"
 
+    #: Friendly control name -> cv2 CAP_PROP attribute. Ranges are
+    #: DRIVER-specific (V4L2 vs DShow vs MSMF all differ) — query with
+    #: get_controls() before baking numbers into config.
+    CONTROL_PROPS = {
+        "brightness": "CAP_PROP_BRIGHTNESS",
+        "contrast": "CAP_PROP_CONTRAST",
+        "saturation": "CAP_PROP_SATURATION",
+        "hue": "CAP_PROP_HUE",
+        "gain": "CAP_PROP_GAIN",
+        "exposure": "CAP_PROP_EXPOSURE",
+        "autoexposure": "CAP_PROP_AUTO_EXPOSURE",
+        "auto_exposure": "CAP_PROP_AUTO_EXPOSURE",
+        "autofocus": "CAP_PROP_AUTOFOCUS",
+        "auto_focus": "CAP_PROP_AUTOFOCUS",
+        "focus": "CAP_PROP_FOCUS",
+        "sharpness": "CAP_PROP_SHARPNESS",
+        "autowb": "CAP_PROP_AUTO_WB",
+        "auto_wb": "CAP_PROP_AUTO_WB",
+        "zoom": "CAP_PROP_ZOOM",
+    }
+
     def __init__(self, name, source, size, hfov_deg, facing,
-                 rotation_deg=0, jpeg_quality=80, backend=None, fps=30):
+                 rotation_deg=0, jpeg_quality=80, backend=None, fps=30,
+                 controls=None, fourcc=None):
         super().__init__(name, source if isinstance(source, int) else -1,
                          size, hfov_deg, facing, rotation_deg, jpeg_quality)
         self.source = source
         self.backend = (backend or "").lower() or None
         self.fps = float(fps or 30)
+        self.controls = dict(controls or {})
+        self.fourcc = (fourcc or "").upper() or None
         self._cap = None
 
     def _api(self):
@@ -268,6 +301,8 @@ class USBCamera(_BaseCamera):
                 and "!" in self.source):
             return getattr(cv2, "CAP_GSTREAMER", cv2.CAP_ANY)
         return {"v4l2": getattr(cv2, "CAP_V4L2", cv2.CAP_ANY),
+                "dshow": getattr(cv2, "CAP_DSHOW", cv2.CAP_ANY),
+                "msmf": getattr(cv2, "CAP_MSMF", cv2.CAP_ANY),
                 "ffmpeg": getattr(cv2, "CAP_FFMPEG", cv2.CAP_ANY),
                 "any": cv2.CAP_ANY}.get(self.backend or "any", cv2.CAP_ANY)
 
@@ -278,8 +313,12 @@ class USBCamera(_BaseCamera):
         cap = cv2.VideoCapture(self.source, api) if api != cv2.CAP_ANY \
             else cv2.VideoCapture(self.source)
         if not cap.isOpened():
-            raise RuntimeError("cannot open video source %r" % (self.source,))
+            raise RuntimeError("cannot open video source %r (backend=%s)" % (
+                self.source, self.backend or "any"))
         try:
+            if self.fourcc:
+                cap.set(cv2.CAP_PROP_FOURCC,
+                        cv2.VideoWriter_fourcc(*self.fourcc[:4]))
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.size[0])
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.size[1])
             cap.set(cv2.CAP_PROP_FPS, self.fps)
@@ -290,6 +329,68 @@ class USBCamera(_BaseCamera):
             cap.release()
             raise RuntimeError("no frames from video source %r" % (self.source,))
         self._cap = cap
+        try:
+            aw = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+            ah = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+            afps = cap.get(cv2.CAP_PROP_FPS)
+            log.info("%s actual: %.0fx%.0f @ %.0f fps (want %s @ %s)",
+                     self.name, aw, ah, afps, self.size, self.fps)
+        except Exception:
+            pass
+        if self.controls:
+            self.apply_controls(self.controls, loud=True)
+
+    def apply_controls(self, controls, loud=False):
+        """Best-effort property set. Returns {name: actual-or-None}."""
+        out = {}
+        if not _HAVE_CV2 or self._cap is None:
+            return out
+        say = log.info if loud else log.debug
+        for name, val in (controls or {}).items():
+            key = str(name).lower()
+            attr = self.CONTROL_PROPS.get(key)
+            prop = getattr(cv2, attr, None) if attr else None
+            if prop is None:
+                say("%s control %s: unsupported (want one of %s)",
+                    self.name, name, sorted(self.CONTROL_PROPS))
+                out[name] = None
+                continue
+            try:
+                ok = self._cap.set(prop, float(val))
+                actual = self._cap.get(prop)
+            except Exception as e:
+                say("%s control %s=%s failed: %r", self.name, name, val, e)
+                out[name] = None
+                continue
+            self.controls[key] = val
+            say("%s control %s=%s (set_ok=%s actual=%s)",
+                self.name, name, val, ok, actual)
+            out[name] = actual
+        return out
+
+    def get_controls(self):
+        """Read back every supported property (driver ranges included)."""
+        out = {}
+        if not _HAVE_CV2 or self._cap is None:
+            return out
+        seen = set()
+        for name, attr in self.CONTROL_PROPS.items():
+            if attr in seen:
+                continue
+            seen.add(attr)
+            prop = getattr(cv2, attr, None)
+            if prop is None:
+                continue
+            try:
+                out[name] = self._cap.get(prop)
+            except Exception:
+                pass
+        return out
+
+    def status(self):
+        st = super().status()
+        st["controls"] = dict(self.controls)
+        return st
 
     def _grab(self):
         if self._cap is None:
@@ -375,6 +476,62 @@ class FileCamera(_BaseCamera):
         self._cap = None
 
 
+class MirrorCamera(_BaseCamera):
+    """Display-only alias of another camera (kind: mirror).
+
+    No device of its own — each grab returns the source's latest frame
+    (resized when our size differs). Bench use: the single laptop webcam
+    (cam2/bottom, the search eye) ALSO feeds the UI's CAM1 ("Pi Cam 3")
+    tile without opening the device twice. Detection workers skip
+    mirrors (Mission checks display_only); the source's detection
+    overlay is copied onto our JPEG so both tiles show the boxes.
+    Control tuning forwards to the real device.
+    """
+    kind = "mirror"
+
+    def __init__(self, name, source_cam, size, hfov_deg, facing,
+                 rotation_deg=0, jpeg_quality=80):
+        super().__init__(name, source_cam.index if source_cam else -1,
+                         size, hfov_deg, facing, rotation_deg, jpeg_quality)
+        self.display_only = True
+        self._src = source_cam
+        self.model = "mirror:%s" % (source_cam.name if source_cam else "?")
+
+    def _open(self):
+        if self._src is None:
+            raise RuntimeError("mirror %s has no source camera" % self.name)
+
+    def _grab(self):
+        if self._src is None:
+            return None
+        frame, _, _ = self._src.latest()
+        return frame
+
+    def jpeg(self, max_width=960):
+        try:
+            with self._src._lock:
+                ov = list(self._src._overlay)
+            with self._lock:
+                self._overlay = ov
+        except Exception:
+            pass
+        return super().jpeg(max_width)
+
+    def apply_controls(self, controls, loud=False):
+        fn = getattr(self._src, "apply_controls", None)
+        return fn(controls, loud=loud) if fn else {}
+
+    def get_controls(self):
+        fn = getattr(self._src, "get_controls", None)
+        return fn() if fn else {}
+
+    def status(self):
+        st = super().status()
+        st["mirrors"] = self._src.name if self._src else None
+        st["display_only"] = True
+        return st
+
+
 class CameraRig:
     """Owns cam1 (front) + cam2 (bottom); tolerates 0/1/2 cameras."""
 
@@ -398,7 +555,9 @@ class CameraRig:
             if isinstance(src, str) and src.isdigit():
                 src = int(src)
             c = USBCamera(name, src, size, hfov, facing, rot, q,
-                          backend=ccfg.get("backend"), fps=ccfg.get("fps", 30))
+                          backend=ccfg.get("backend"), fps=ccfg.get("fps", 30),
+                          controls=ccfg.get("controls"),
+                          fourcc=ccfg.get("fourcc"))
             c.model = ("usb" if isinstance(src, int) or str(src).startswith("/dev/")
                        else "url")
             log.info("assigned %s -> %s %r (%s)", name, c.model, src, facing)
@@ -457,6 +616,27 @@ class CameraRig:
                     if name not in assigned and rest:
                         i, m = rest.pop(0)
                         assigned[name] = _mk(name, i, m, ccfg, facing)
+
+        # 3) mirrors (display-only aliases; source must be assigned first)
+        for name, ccfg, facing in (("cam1", front_cfg, "front"),
+                                   ("cam2", bottom_cfg, "bottom")):
+            if name in assigned:
+                continue
+            kind = str(ccfg.get("kind", "") or "").lower()
+            if kind != "mirror":
+                continue
+            src = ccfg.get("source", "cam2" if name == "cam1" else "cam1")
+            src_cam = assigned.get(src)
+            if src_cam is None or getattr(src_cam, "display_only", False):
+                log.error("%s mirror source %r unavailable — skipping", name, src)
+                continue
+            c = MirrorCamera(name, src_cam,
+                             ccfg.get("size", src_cam.size),
+                             ccfg.get("hfov_deg", src_cam.hfov_deg),
+                             facing, ccfg.get("rotation_deg", 0),
+                             ccfg.get("jpeg_quality", 80))
+            assigned[name] = c
+            log.info("assigned %s -> mirror of %s (%s)", name, src, facing)
 
         # single rpi camera: role comes from config (explicit kinds keep theirs)
         if len(assigned) == 1:

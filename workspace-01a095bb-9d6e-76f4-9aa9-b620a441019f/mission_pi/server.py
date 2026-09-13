@@ -25,7 +25,7 @@ import time
 log = logging.getLogger("server")
 
 try:
-    from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+    from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
     from fastapi.responses import JSONResponse, Response
     import uvicorn
     _HAVE_API = True
@@ -108,6 +108,35 @@ def create_app(rig, mission, fc):
             return JSONResponse({"detail": "no frame yet from %s" % cam}, 503)
         return Response(jpg, media_type="image/jpeg",
                         headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/camera/{cam}/controls")
+    async def get_controls(cam: str):
+        c = rig.get(cam) if rig else None
+        if c is None:
+            return JSONResponse({"detail": "unknown camera (want cam1|cam2)"}, 404)
+        fn = getattr(c, "get_controls", None)
+        if fn is None:
+            return JSONResponse({"detail": "%s has no tunable controls" % cam}, 400)
+        return {"cam": cam, "controls": fn()}
+
+    @app.post("/api/camera/{cam}/controls")
+    async def set_controls(cam: str, req: Request):
+        """BENCH/SSH-LOCAL tuning (like /takeover — the flight UI never
+        calls this): POST {"contrast": 40, "saturation": 60} and watch the
+        tile. Mirrors forward to their source device."""
+        c = rig.get(cam) if rig else None
+        if c is None:
+            return JSONResponse({"detail": "unknown camera (want cam1|cam2)"}, 404)
+        fn = getattr(c, "apply_controls", None)
+        if fn is None:
+            return JSONResponse({"detail": "%s has no tunable controls" % cam}, 400)
+        try:
+            body = await req.json()
+        except Exception:
+            body = None
+        if not isinstance(body, dict):
+            return JSONResponse({"detail": "want a JSON object {name: value}"}, 400)
+        return {"cam": cam, "applied": fn(body)}
 
     @app.get("/api/mission/status")
     async def mission_status():
