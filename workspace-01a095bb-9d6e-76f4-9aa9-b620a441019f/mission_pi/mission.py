@@ -8,6 +8,9 @@ Flow (drone is at ~15 m over home in AUTO when we take over):
                 motion blur); any fresh bbox cue jumps to TRACK
   SWEEP_GRID    serpentine over the geofence polygon at sweep_alt, then a
                 best-effort re-sweep at resweep_alt_m; cue jumps to TRACK
+  FALLBACK      blob hypotheses (top-3, verified on descent, own 60 s
+                cap): steer-only, never transmits; a real cue hands back
+                to TRACK, a decode to TRANSMIT
   TRACK         bottom-cam bbox -> ground offset -> guided goto above the
                 candidate (target clamped INSIDE the fence, always)
   APPROACH      descend the altitude stair while the cue is fresh; decode
@@ -85,6 +88,15 @@ class Mission:
         self.stats = {"frames": 0, "cues": 0, "decodes": 0}
         self._search_t0 = None     # search-budget clock (yaw+grid+resweep share it)
         self._wpnav_orig = None    # WPNAV_SPEED to restore after the search
+        b = cfg.get("blob", {})
+        self.blob_enabled = bool(b.get("enabled", True))
+        self.blob_top_k = int(b.get("top_k", 3))
+        self.blob_per_s = float(b.get("per_candidate_s", 20.0))
+        self.blob_cap_s = float(b.get("global_cap_s", 60.0))
+        self.blob_observe_s = float(b.get("observe_every_s", 2.0))
+        self.blob_cfg = dict(b)
+        self._blob_obs = []        # passive ground-projected sightings
+        self._blob_last_obs = 0.0
 
     # -- helpers --------------------------------------------------------
     def _set_phase(self, phase, detail=""):
@@ -374,6 +386,9 @@ class Mission:
                 self.sweep_alt, self.resweep_alt_m))
             if not self._sweep_grid(alt=self.resweep_alt_m):
                 return
+        if not self.payload and self.blob_enabled:
+            if not self._blob_fallback():
+                return
         # found nothing in the pattern — one last transmit-less exit
         self._finish(found=False)
 
@@ -584,9 +599,204 @@ class Mission:
                 except Exception:
                     time.sleep(1.0)
                     continue
+                self._blob_observe(cam, pos, alt)
                 if geo.haversine_m(pos["lat"], pos["lon"], lat, lon) <= self.arrive_m:
                     break
                 time.sleep(1.0)
+        return True
+
+    def _blob_observe(self, cam, pos, alt_cmd):
+        """Passive hypothesis logging (runs during grid legs, throttled).
+
+        Scores the bottom frame for QR-ish rectangles and ground-projects
+        each into _blob_obs. Front-cam frames can't be ranged, so they are
+        skipped — the bottom cam is the localizing eye.
+        """
+        if not self.blob_enabled or cam is None or cam.facing != "bottom":
+            return
+        now = time.time()
+        if now - self._blob_last_obs < self.blob_observe_s:
+            return
+        self._blob_last_obs = now
+        try:
+            from blob_fallback import find_candidates
+            frame, _ts, _cnt = cam.latest()
+            if frame is None:
+                return
+            alt = max(float(pos.get("alt_rel") or alt_cmd or self.sweep_alt), 1.0)
+            ctx = {"alt_m": alt, "hfov_deg": cam.hfov_deg,
+                   "img_w": cam.size[0], "img_h": cam.size[1]}
+            for (x, y, w, h, score, _m) in find_candidates(frame, self.blob_cfg, ctx):
+                try:
+                    ex, ny = geo.nadir_pixel_to_ground_m(
+                        x + w / 2.0, y + h / 2.0, cam.size[0], cam.size[1],
+                        cam.hfov_deg, alt, pos.get("hdg") or 0.0, cam.rotation_deg)
+                    ox, oy = self.home[0], self.home[1]
+                    ex0, ny0 = geo.latlon_to_enu(pos["lat"], pos["lon"], ox, oy)
+                    self._blob_obs.append({"e": ex0 + ex, "n": ny0 + ny,
+                                           "score": float(score), "ts": now})
+                except Exception:
+                    continue
+            if len(self._blob_obs) > 3000:
+                del self._blob_obs[:1500]
+        except Exception as e:
+            log.debug("blob observe failed: %r", e)
+
+    def _blob_stage_score(self, cam, cl):
+        """Score the hypothesis at the current viewpoint.
+
+        Returns (score, offset_m): best nearby candidate's score and its
+        ground distance from the drone (the re-centering check). (0.0, None)
+        when nothing re-found near expectation.
+        """
+        from blob_fallback import find_candidates
+        try:
+            frame, _ts, _cnt = cam.latest()
+            pos = self.fc.get_position(timeout=1.5)
+        except Exception:
+            return 0.0, None
+        if frame is None:
+            return 0.0, None
+        try:
+            alt = max(float(pos.get("alt_rel") or 1.0), 1.0)
+            ctx = {"alt_m": alt, "hfov_deg": cam.hfov_deg,
+                   "img_w": cam.size[0], "img_h": cam.size[1]}
+            cands = find_candidates(frame, self.blob_cfg, ctx)
+        except Exception:
+            return 0.0, None
+        if not cands:
+            return 0.0, None
+        olat, olon = self.home[0], self.home[1]
+        ex0, ny0 = geo.latlon_to_enu(pos["lat"], pos["lon"], olat, olon)
+        rad = float(self.blob_cfg.get("cluster_radius_m", 2.0)) * 1.5 + 1.0
+        best, best_d = None, 1e9
+        for (x, y, w, h, score, _m) in cands:
+            try:
+                ex, ny = geo.nadir_pixel_to_ground_m(
+                    x + w / 2.0, y + h / 2.0, cam.size[0], cam.size[1],
+                    cam.hfov_deg, alt, pos.get("hdg") or 0.0, cam.rotation_deg)
+            except Exception:
+                continue
+            d = ((ex0 + ex - cl["e"]) ** 2 + (ny0 + ny - cl["n"]) ** 2) ** 0.5
+            if d < best_d:
+                best, best_d = (score, (ex ** 2 + ny ** 2) ** 0.5), d
+        if best is None or best_d > rad:
+            return 0.0, None
+        return best
+
+    def _blob_fallback(self):
+        """Last resort: visit top-3 blob hypotheses with descent verification.
+
+        STEER/DESCEND/CENTER only — this path can NEVER transmit. A real
+        detector cue hands to TRACK; a decoder payload (+consensus) hands
+        to TRANSMIT. Budgets: per-candidate blob_per_s, global blob_cap_s
+        on its own clock (independent of the spent search budget).
+        """
+        if self.payload:
+            return self._transmit_and_finish()
+        cam = self.rig.get("cam2")
+        if cam is None or cam.facing != "bottom":
+            self._log("WARN", "blob fallback: no bottom cam — skipping")
+            return True
+        from blob_fallback import cluster_observations
+        clusters = cluster_observations(
+            self._blob_obs, self.blob_cfg)[:max(1, self.blob_top_k)]
+        if not clusters:
+            self._log("WARN", "blob fallback: no ground-stable hypotheses (%d raw sightings)"
+                      % len(self._blob_obs))
+            return True
+        self._set_phase("FALLBACK", "%d hypotheses, %.0fs cap" % (len(clusters), self.blob_cap_s))
+        t_cap = time.time() + self.blob_cap_s
+        for ci, cl in enumerate(clusters):
+            if self._abort.is_set() or not self._battery_ok():
+                return self._aborted()
+            if self.payload:
+                return self._transmit_and_finish()
+            if time.time() >= t_cap:
+                break
+            if not self._blob_visit(cl, ci, len(clusters), t_cap):
+                return False
+        return True
+
+    def _blob_visit(self, cl, idx, total, t_cap):
+        """One hypothesis: center above it, descend stages, verify the
+        QR-structure trajectory. Returns False only when the mission must
+        stop (transmit/abort happened inside); True = try the next one."""
+        from blob_fallback import trend_ok
+        cam = self.rig.get("cam2")
+        olat, olon = self.home[0], self.home[1]
+        tlat, tlon = geo.enu_to_latlon(cl["e"], cl["n"], olat, olon)
+        try:
+            pos0 = self.fc.get_position(timeout=2.0)
+        except Exception:
+            return True
+        tlat, tlon, inside = self._clamp_to_fence(tlat, tlon, pos0["lat"], pos0["lon"])
+        if not inside:
+            self._log("WARN", "blob #%d: outside fence — skipping" % (idx + 1))
+            return True
+        t_end = min(t_cap, time.time() + self.blob_per_s)
+        entry_alt = max(float(pos0.get("alt_rel") or self.sweep_alt), 3.0)
+        stages = [entry_alt] + [a for a in self.approach_stair if a < entry_alt - 1.0]
+        commit = float(self.blob_cfg.get("commit_score", 0.7))
+        tol = float(self.blob_cfg.get("center_tol_m", 3.0))
+        settle = float(self.blob_cfg.get("settle_s", 2.0))
+        max_miss = int(self.blob_cfg.get("max_misses", 2))
+        self._log("WARN", "blob #%d/%d: visiting (score %.2f, x%d) stages %s" % (
+            idx + 1, total, cl["score"], cl["support"],
+            ",".join("%.0f" % a for a in stages)))
+        traj, misses = [], 0
+        for salt in stages:
+            arrived = False
+            while time.time() < t_end:
+                if self._abort.is_set() or not self._battery_ok():
+                    return self._aborted()
+                if self.payload:
+                    return self._transmit_and_finish()
+                if self._fresh_cue():
+                    self._log("WARN", "blob #%d: real cue — handing to TRACK" % (idx + 1))
+                    return self._track_and_approach()
+                try:
+                    self.fc.goto_global(tlat, tlon, salt)
+                    pos = self.fc.get_position(timeout=1.5)
+                except Exception:
+                    time.sleep(1.0)
+                    continue
+                d = geo.haversine_m(pos["lat"], pos["lon"], tlat, tlon)
+                a = abs(float(pos.get("alt_rel") or salt) - salt)
+                if d <= max(self.arrive_m, 1.0) and a <= 1.5:
+                    arrived = True
+                    break
+                time.sleep(1.0)
+            if not arrived or time.time() >= t_end:
+                self._log("WARN", "blob #%d: time — next" % (idx + 1))
+                return True
+            time.sleep(settle)
+            if self.payload:
+                return self._transmit_and_finish()
+            if self._fresh_cue():
+                self._log("WARN", "blob #%d: real cue — handing to TRACK" % (idx + 1))
+                return self._track_and_approach()
+            sc, off = self._blob_stage_score(cam, cl)
+            if off is None:
+                misses += 1
+                self._log("INFO", "blob #%d @ %.0fm: not re-found (miss %d)" % (idx + 1, salt, misses))
+                if misses >= max_miss:
+                    self._log("WARN", "blob #%d: keeps disappearing — abort" % (idx + 1))
+                    return True
+                continue
+            misses = 0
+            traj.append(sc)
+            self._log("INFO", "blob #%d @ %.0fm: score %.2f (off %.1fm)" % (idx + 1, salt, sc, off))
+            if off > tol * 2.0:
+                self._log("WARN", "blob #%d: won't stay centered (%.1fm) — abort" % (idx + 1, off))
+                return True
+            if len(traj) >= 2 and not trend_ok(traj, self.blob_cfg):
+                self._log("WARN", "blob #%d: flat trajectory %s — abort" % (
+                    idx + 1, ",".join("%.2f" % s for s in traj)))
+                return True
+            if sc >= commit:
+                self._log("WARN", "blob #%d: score %.2f — committed, descending" % (idx + 1, sc))
+        self._log("WARN", "blob #%d: stages exhausted, no decode — next" % (idx + 1))
         return True
 
     def _track_and_approach(self):

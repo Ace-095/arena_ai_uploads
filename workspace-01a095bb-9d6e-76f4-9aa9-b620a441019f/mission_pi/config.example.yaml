@@ -7,6 +7,21 @@ stream:
   width: 960       # stream pixels only — capture/detect stay full-res
   quality: 70
 
+blob:
+  enabled: true      # last-resort hypotheses after resweep (false = skip FALLBACK)
+  top_k: 3           # visit at most 3 ground-stable hypotheses
+  per_candidate_s: 20
+  global_cap_s: 60   # own clock, independent of the spent search budget
+  observe_every_s: 2.0   # passive scoring cadence during grid legs
+  min_support: 2         # sightings at one ground spot to form a hypothesis
+  cluster_radius_m: 2.0
+  commit_score: 0.7
+  trend_gain: 0.03   # trajectory must beat entry by this…
+  trend_slack: 0.05  # …while staying near the best so far (dips recover)
+  center_tol_m: 3.0
+  settle_s: 2.0
+  max_misses: 2
+
 cameras:
   front:  { size: [1920, 1080], hfov_deg: 66.0, rotation_deg: 0, jpeg_quality: 80 }
   bottom: { size: [2028, 1520], hfov_deg: 100.0, rotation_deg: 0, jpeg_quality: 80 }
