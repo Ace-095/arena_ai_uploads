@@ -20,10 +20,13 @@ fc:
 
 cameras:
   # Sim lenses are 68 deg (model.sdf) to match the bench geometry math.
-  front: { kind: url, backend: mjpeg, size: [1280, 720], hfov_deg: 68.0,
+  # size MUST equal the sim render (2560x1440): mission_pi resizes every
+  # grabbed frame to size, so 720p here would silently discard the pixels
+  # the A3 panel needs (SIM_GUIDE.md section 10.3).
+  front: { kind: url, backend: mjpeg, size: [2560, 1440], hfov_deg: 68.0,
            rotation_deg: 0, jpeg_quality: 80,
            device: "http://127.0.0.1:8099/front.mjpg" }
-  bottom: { kind: url, backend: mjpeg, size: [1280, 720], hfov_deg: 68.0,
+  bottom: { kind: url, backend: mjpeg, size: [2560, 1440], hfov_deg: 68.0,
             rotation_deg: 0, jpeg_quality: 80,
             device: "http://127.0.0.1:8099/bottom.mjpg" }
   # backend mjpeg = ffmpeg http reader. If a tile stays dark, open the

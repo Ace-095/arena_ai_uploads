@@ -10,6 +10,11 @@ alias, `GZ_SIM_*` paths, QR textures.
 
 ```bash
 cd ~/arena_ai_uploads && git pull
+# A3 panel texture (first time only; re-run harmless):
+cd ~/arena_ai_uploads/workspace-01a095bb-9d6e-76f4-9aa9-b620a441019f/mission_pi
+test -f sim/models/qr_panel_a3/materials/textures/qr.png || \
+  (source .venv/bin/activate && python tools/make_qr_panel.py \
+    --text MISSION-QR-001 --out sim/models/qr_panel_a3/materials/textures/qr.png)
 ss -ltn | grep -E '5760|5762|8000|8099'   # want: EMPTY (nothing stale)
 hostname -I                               # note the WiFi IP for MP + UI
 ```
@@ -46,7 +51,7 @@ python3 tools/gz_cam_bridge.py --port 8099
 Verify pixels (any spare terminal / browser):
 
 ```bash
-curl -s http://127.0.0.1:8099/health   # want: both ages < 1 s, 1280x720
+curl -s http://127.0.0.1:8099/health   # want: both ages < 1 s, 2560x1440
 # browser: http://127.0.0.1:8099/ — front = horizon, bottom = ground.
 ```
 

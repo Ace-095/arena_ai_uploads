@@ -383,7 +383,7 @@ python3 tools/gz_cam_bridge.py --port 8099
 Check the pictures BEFORE starting the mission (saves a wasted flight):
 
 ```bash
-curl -s http://127.0.0.1:8099/health   # both ages < 1 s, sizes [1280, 720]
+curl -s http://127.0.0.1:8099/health   # both ages < 1 s, sizes [2560, 1440]
 # and in a browser:  http://127.0.0.1:8099/
 #   front pane = horizon/runway, bottom pane = ground + (after takeoff) panel.
 ```
@@ -406,17 +406,16 @@ pixels steer sim motion, and `QR:MISSION-QR-001` lands in MP Messages.
 ### 10.3 The QR target (shipped in the world — nothing to drag)
 
 `mission_world.sdf` already includes the target at (8, 0) — inside the
-40x40 m home search box the mission flies without a fence. Two sizes
-ship; be honest about which one you are running:
-
-- `qr_panel_big` (594x840 mm, 2x-A3 linear) — DEFAULT. The classical
-  bench detector needs the code ~80+ px to decode; from 15 m this is
-  ~53 px (cue) growing past 100 px down the approach stair. First
-  closed-loop success runs on this panel.
-- `qr_panel_a3` (true 297x420 mm) — ~26 px from 15 m. The classical
-  detector will NOT reliably close the loop on it; it is the YOLO
-  model's graduation exam (see §11). Swap it in by uncommenting the
-  second `<include>` in `sim/worlds/mission_world.sdf`.
+40x40 m home search box the mission flies without a fence. DEFAULT is
+true A3 (`qr_panel_a3`, 297x420 mm, EC-M v1 21x21 code) with sim cameras
+at 2560x1440: from 15 m the code shows ~38 ideal px (GSD ~7.9 mm/px @
+68 deg) — same detectability class as the real Cam3's ~70 px (4608 px
+wide, GSD ~4.2 mm/px), and sim pixels carry no blur/noise, so the
+classical path (full-frame + ROI/tile upscaling) is in range. Pixels
+grow fast down the stair: ~47 @ 12 m, ~63 @ 9 m, ~81 @ 7 m. Fallback:
+`qr_panel_big` (594x840 mm, 2x-A3) by swapping the commented `<include>`
+— easy mode if the laptop can't hold 1440p (try sensor `<update_rate>`
+10 first; it halves transport for free).
 
 Both textures were generated in §10.1. If the panel renders BLACK in
 Gazebo, the PNG is missing — re-run the two `make_qr_panel.py` lines.
@@ -427,18 +426,21 @@ flat ground (z = 0).
 ### 10.4 How the video path works (and its knobs)
 
 - The iris carries two FIXED mounts (`front_cam_link` pitched 20° down,
-  `bottom_cam_link` straight down), each with a 1280x720 R8G8B8 camera
+  `bottom_cam_link` straight down), each with a 2560x1440 R8G8B8 camera
   at 15 Hz publishing `/iris/front/image` + `/iris/bottom/image`
   (explicit `<topic>` tags in `sim/models/iris_dualcam/model.sdf`, so
-  topic names never depend on world/model renames).
+  topic names never depend on world/model renames). 1440p is what puts
+  ~38 px on the true-A3 target from 15 m (§10.3) — don't drop it to
+  "save CPU" without swapping the big panel back in.
 - `tools/gz_cam_bridge.py` subscribes via the gz python bindings and
   re-serves MJPEG at `:8099/front.mjpg` + `:8099/bottom.mjpg` (+ `/`
   for humans, `/health` for scripts). No ROS, no GStreamer, no numpy.
 - `mission_pi` opens both as `url`/`mjpeg` cameras — plain OpenCV http
   readers, the same code path the UI tiles already use.
 
-Knobs: sensor rate lives in the model's `<update_rate>` (15 Hz keeps a
-laptop happy next to SITL + detector; raise to 30 with headroom);
+Knobs: sensor rate lives in the model's `<update_rate>` (15 Hz at 1440p
+is ~330 MB/s over localhost transport — fine on this laptop, but drop
+to 10 Hz if `/health` ages climb; raise to 30 only with headroom);
 bridge JPEG quality is `--jpeg-quality`; sim lens HFOV is 68° in both
 `model.sdf` (`<horizontal_fov>` 1.1868 rad) and `config.gazebo.yaml` —
 change both together or the approach geometry lies.
