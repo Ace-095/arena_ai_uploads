@@ -114,6 +114,7 @@ class MavClient:
         self.sender = None            # (ip, port) of the forwarder (MP / mock FC)
         self.veh_sysid = None
         self.veh_type = None
+        self._latch_ignored = set()   # (sysid, type) already logged as non-vehicle
         self.connected = False
         self.last_hb = 0.0
 
@@ -348,7 +349,11 @@ class MavClient:
 
     def _dispatch(self, name, src_sys, f):
         if name == "HEARTBEAT":
-            if f["type"] != M.MAV_TYPE_GCS:
+            # Vehicle latch: companions (mission_pi = sysid 51/type 18) and any
+            # GCS heartbeat on the same mirror must NEVER become "the vehicle"
+            # — every outbound request (params, fence, mode, plan) is addressed
+            # to veh_sysid, and _pull_until drops replies from anyone else.
+            if f["type"] not in (M.MAV_TYPE_GCS, M.MAV_TYPE_ONBOARD_CONTROLLER):
                 self.veh_sysid = src_sys
                 self.veh_type = f["type"]
                 self.last_hb = time.time()
@@ -371,6 +376,13 @@ class MavClient:
                         "msg": "VEHICLE CONNECTED: sysid=%d type=%s mode=%s" % (
                             src_sys, f["type"], self.mode)})
                 self._maybe_emit_state()
+            else:
+                key = (src_sys, f["type"])
+                if key not in self._latch_ignored:
+                    self._latch_ignored.add(key)
+                    self.hub.emit_threadsafe("log", {"level": "INFO", "msg": (
+                        "ignoring heartbeat sysid=%d type=%d for vehicle latch "
+                        "(companion/GCS, not the vehicle)") % (src_sys, f["type"])})
         elif name == "GLOBAL_POSITION_INT":
             hdg = None if f["hdg"] == 65535 else f["hdg"] / 100.0
             if self.pos and hdg is None:
