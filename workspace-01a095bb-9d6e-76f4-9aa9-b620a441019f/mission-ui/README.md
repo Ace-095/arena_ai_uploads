@@ -12,6 +12,10 @@ Pi 5 (FSM/cams/QR) <==WS receive-only==> browser UI
 > Status: UI v2 rebuilt 2026-09-13 (see `ui-spec.md` v2 changelog). Backend
 > verified: `tests/test_mavcodec.py` 23/23 byte-identical, `mp_bridge.py
 > --selftest` PASS. Nothing is "trusted" until bench → SITL (our-mission.md §6).
+>
+> Field laptop? Read the full guide first:
+> [`docs/LAPTOP_SETUP_MP_UI_OFFLINE_MAPS.md`](docs/LAPTOP_SETUP_MP_UI_OFFLINE_MAPS.md)
+> (MP + UI setup, both offline-map systems, field-day checklist).
 
 ## Quickstart (mock — everything on one machine)
 
