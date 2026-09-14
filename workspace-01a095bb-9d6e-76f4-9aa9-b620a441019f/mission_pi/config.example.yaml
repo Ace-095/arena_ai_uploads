@@ -2,6 +2,11 @@
 server:
   port: 8000
 
+stream:
+  fps: 12          # UI mjpeg tick (encoded once per cam, shared by all tiles)
+  width: 960       # stream pixels only — capture/detect stay full-res
+  quality: 70
+
 cameras:
   front:  { size: [1920, 1080], hfov_deg: 66.0, rotation_deg: 0, jpeg_quality: 80 }
   bottom: { size: [2028, 1520], hfov_deg: 100.0, rotation_deg: 0, jpeg_quality: 80 }

@@ -15,6 +15,11 @@
 
 server: { host: 0.0.0.0, port: 8000 }
 
+stream:
+  fps: 12          # UI mjpeg tick (encoded once per cam, shared by all tiles)
+  width: 960       # stream pixels only — capture/detect stay full-res
+  quality: 70
+
 fc:
   conn: "tcp:127.0.0.1:5762"   # SITL serial1 spare MAVLink port (same as bench)
 

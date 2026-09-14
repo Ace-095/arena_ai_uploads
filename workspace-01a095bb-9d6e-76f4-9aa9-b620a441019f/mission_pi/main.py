@@ -106,17 +106,22 @@ def main():
     if not rig.cams:
         print("WARNING: no cameras — mission will failsafe at search")
 
+    from streamm1 import StreamManager
+    streams = StreamManager(rig, cfg.get("stream", {}))
+    streams.start_all()
+
     det = get_detector(cfg.get("detector", {}))
     print("detector: %s" % det.name)
 
     mission = Mission(fc, rig, det, hub=None, cfg=cfg)  # hub attached below
-    app = create_app(rig, mission, fc)
+    app = create_app(rig, mission, fc, streams)
     mission.hub = app.state.hub
     port = int(cfg.get("server", {}).get("port", 8000))
     server = create_server(app, "0.0.0.0", port)
     srv = threading.Thread(target=server.run, name="http", daemon=True)
     srv.start()
     print("UI: http://<this-pi>:%d  (paste as Pi link)" % port)
+    print("UI streams: /api/camera/stream/cam1|2 (%s)" % streams.describe())
     try:
         mission.run()
         # The Pi link must outlive the mission: the UI needs cameras +
@@ -131,6 +136,10 @@ def main():
         try:
             server.should_exit = True
             srv.join(timeout=6.0)
+        except Exception:
+            pass
+        try:
+            streams.stop_all()
         except Exception:
             pass
         try:

@@ -1,6 +1,8 @@
 /* camera.js — UI v2 dual-camera viewer (CAM1 pi-cam3 + CAM2 imx477).
- * Each camera independently tries WebRTC (/ws/webrtc/<cam>) and falls back to
- * MJPEG-style polling (/api/camera/frame/<cam>). One shared enlarge modal.
+ * Each camera points <img> at the MJPEG stream (/api/camera/stream/<cam>,
+ * smooth ~12 fps) and falls back to snapshot polling (/api/camera/frame/<cam>)
+ * when the stream errors. WebRTC (/ws/webrtc/<cam>) is reserved for a future
+ * server. One shared enlarge modal.
  */
 (function () {
 'use strict';
@@ -36,6 +38,10 @@ function initCameras(o) {
     }
     const e = els(id);
     if (e.video) { try { e.video.pause(); e.video.srcObject = null; } catch (err) { /* noop */ } }
+    if (e.img) { e.img.onerror = null; }  // don't trip the mjpeg->polling fallback on purpose
+    if (c.mode === 'mjpeg' && e.img) {
+      try { e.img.removeAttribute('src'); } catch (err) { /* noop */ }  // kills the <img> stream
+    }
     if (!silent) { c.mode = 'off'; onMode(id, c.mode); }
   }
 
@@ -127,10 +133,32 @@ function initCameras(o) {
     };
   }
 
+  function startMjpeg(id) {
+    const c = cams[id];
+    const e = els(id);
+    stopAll(id, true);
+    c.mode = 'mjpeg'; onMode(id, c.mode);
+    onHint(id, '');
+    onStats(id, 'live');
+    onLatency(id, '');
+    const base = getPiUrl().replace(/\/$/, '');
+    e.img.style.display = 'block'; e.video.style.display = 'none';
+    e.img.onerror = () => {
+      if (c.mode !== 'mjpeg') return;
+      onLog('WARN', id + ': MJPEG stream failed → polling fallback');
+      startPolling(id);
+    };
+    e.img.src = base + '/api/camera/stream/' + id;
+  }
+
   function startCam(id) {
     if (!cams[id]) cams[id] = { mode: 'off', pollTimer: null, pc: null, ws: null, stream: null, paused: false, frames: 0 };
     cams[id].paused = false;
-    startWebrtc(id);
+    // MJPEG first (smooth, instant). startWebrtc is kept for a future
+    // server that implements /ws/webrtc — today it would only add a 6 s
+    // black tile before the fallback. startPolling stays as the fallback
+    // for servers without /api/camera/stream.
+    startMjpeg(id);
   }
 
   function togglePause(id) {
@@ -158,6 +186,10 @@ function initCameras(o) {
       videoModal.srcObject = c.stream;
       videoModal.play().catch(() => {});
       videoModal.style.display = 'block';
+    } else if (c.mode === 'mjpeg') {
+      const base = getPiUrl().replace(/\/$/, '');
+      imgModal.src = base + '/api/camera/stream/' + id;
+      imgModal.style.display = 'block';
     } else {
       const base = getPiUrl().replace(/\/$/, '');
       const tick = () => { imgModal.src = base + '/api/camera/frame/' + id + '?t=' + Date.now(); };

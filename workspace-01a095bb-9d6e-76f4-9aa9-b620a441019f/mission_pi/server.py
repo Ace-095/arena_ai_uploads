@@ -5,6 +5,11 @@ Contract (must match mission-ui js/links.js + js/camera.js):
                                 The UI polls this (its WebRTC attempt is
                                 optional and falls back here — v1 serves
                                 snapshots only, no WebRTC).
+  GET /api/camera/stream/{cam}  MJPEG multipart/x-mixed-replace (?fps=12).
+                                The UI points each tile's <img> here FIRST
+                                (smooth ~12 fps); snapshots stay as fallback.
+                                Needs the StreamManager (streamm1.py) passed
+                                to create_app, else 404 -> UI falls back.
   WS  /ws/telemetry             envelopes {channel, t, data}; Pi channels:
                                 qr / fsm / event / log / system.
   GET /health                   {ok, cams, link}
@@ -30,7 +35,7 @@ log = logging.getLogger("server")
 
 try:
     from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-    from fastapi.responses import JSONResponse, Response
+    from fastapi.responses import JSONResponse, Response, StreamingResponse
     from fastapi.middleware.cors import CORSMiddleware
     import uvicorn
     _HAVE_API = True
@@ -82,8 +87,10 @@ def _require_api():
         raise RuntimeError("fastapi/uvicorn not installed (%r)" % (_API_ERR,))
 
 
-def create_app(rig, mission, fc):
-    """rig: CameraRig, mission: Mission (or None pre-start), fc: FCLink."""
+def create_app(rig, mission, fc, streams=None):
+    """rig: CameraRig, mission: Mission (or None pre-start), fc: FCLink.
+    streams: streamm1.StreamManager (or None -> /stream/* answers 404 and
+    the UI falls back to snapshot polling)."""
     _require_api()
     app = FastAPI(title="mission_pi")
     # The UI is served from the BRIDGE origin, not the Pi — without CORS
@@ -118,6 +125,50 @@ def create_app(rig, mission, fc):
             return JSONResponse({"detail": "no frame yet from %s" % cam}, 503)
         return Response(jpg, media_type="image/jpeg",
                         headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/camera/stream/{cam}")
+    async def stream(cam: str, request: Request, fps: int = 0):
+        """MJPEG multipart stream for the UI tiles (<img> points here).
+
+        ?fps= caps the serve rate (default: the broadcaster's fps; never
+        above it — stale ticks are skipped, never duplicated). 404/503
+        answers make the tile fall back to snapshot polling.
+        """
+        c = rig.get(cam) if rig else None
+        if c is None:
+            return JSONResponse({"detail": "unknown camera (want cam1|cam2)"}, 404)
+        st = streams.get(cam) if streams else None
+        if st is None:
+            return JSONResponse({"detail": "streaming disabled on this server"}, 404)
+        if not getattr(c, "running", False):
+            return JSONResponse({"detail": "%s is not running" % cam}, 503)
+        period = 1.0 / min(max(int(fps or st.fps), 1), 30)
+
+        async def gen():
+            last = -1
+            try:
+                while True:
+                    try:
+                        if await request.is_disconnected():
+                            break
+                    except Exception:
+                        pass
+                    jpg, seq = st.latest()
+                    if jpg is not None and seq != last:
+                        last = seq
+                        yield (b"--frame\r\nContent-Type: image/jpeg\r\n"
+                               b"Content-Length: %d\r\n\r\n" % len(jpg)
+                               + jpg + b"\r\n")
+                    await asyncio.sleep(period)
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+
+        return StreamingResponse(gen(),
+                                 media_type="multipart/x-mixed-replace; boundary=frame",
+                                 headers={"Cache-Control": "no-store",
+                                          "X-Accel-Buffering": "no"})
 
     @app.api_route("/api/camera/status", methods=["GET", "POST"])
     async def camera_status(req: Request):

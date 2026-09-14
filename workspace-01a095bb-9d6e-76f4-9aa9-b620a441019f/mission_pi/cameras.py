@@ -192,7 +192,7 @@ class _BaseCamera:
         t["gain"] = t.get("gain_db")
         return t
 
-    def jpeg(self, max_width=960):
+    def jpeg(self, max_width=960, quality=None):
         """Annotated JPEG bytes for /api/camera/frame/<cam> (or None)."""
         frame, ts, _ = self.latest()
         if frame is None or not _HAVE_CV2:
@@ -215,8 +215,9 @@ class _BaseCamera:
                 if label:
                     cv2.putText(img, str(label)[:24], (p1[0], max(12, p1[1] - 6)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            q = int(quality) if quality else self.jpeg_quality
             ok, buf = cv2.imencode(".jpg", img,
-                                   [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
+                                   [cv2.IMWRITE_JPEG_QUALITY, q])
             return bytes(buf) if ok else None
         except Exception as e:
             log.debug("%s jpeg failed: %r", self.name, e)
