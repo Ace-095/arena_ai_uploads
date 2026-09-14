@@ -465,6 +465,43 @@ class FCLink:
         for msgid, hz in (specs or self.STREAM_DEFAULTS):
             self.set_message_interval(msgid, hz)
 
+    @staticmethod
+    def _param_id(m):
+        try:
+            pid = m.param_id
+            if isinstance(pid, bytes):
+                pid = pid.decode("utf-8", "ignore")
+            return str(pid).split("\x00")[0].strip().upper()
+        except Exception:
+            return ""
+
+    def get_param(self, name, timeout=4.0):
+        """PARAM_REQUEST_READ + wait for the PARAM_VALUE echo (float)."""
+        _require_pymavlink()
+        want = str(name).upper()[:16]
+        self._send(self.conn.mav.param_request_read_send,
+                   self.target_system, self.target_component,
+                   want.encode("utf-8"), -1)
+        m = self.wait_for(["PARAM_VALUE"],
+                          lambda m, w=want: self._param_id(m) == w, timeout)
+        if m is None:
+            raise FCError("get_param(%s) timeout" % want)
+        return float(m.param_value)
+
+    def set_param(self, name, value, timeout=4.0):
+        """PARAM_SET + wait for the echo; returns the FC-confirmed float."""
+        _require_pymavlink()
+        want = str(name).upper()[:16]
+        self._send(self.conn.mav.param_set_send,
+                   self.target_system, self.target_component,
+                   want.encode("utf-8"), float(value),
+                   mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
+        m = self.wait_for(["PARAM_VALUE"],
+                          lambda m, w=want: self._param_id(m) == w, timeout)
+        if m is None:
+            raise FCError("set_param(%s) not echoed" % want)
+        return float(m.param_value)
+
     def set_mode(self, mode, timeout=5.0):
         """DO_SET_MODE with canonical encoding: param1=1 (custom enabled),
         param2=mode number — the MAVLink-spec form the ADDC reference

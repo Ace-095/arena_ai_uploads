@@ -38,11 +38,13 @@ decode:
 mission:
   sweep_alt_m: 15.0
   approach_stair_m: [12.0, 9.0, 7.0]  # descend while centered on the cue
-  grid_overlap: 0.5
+  grid_overlap: 0.3      # strip spacing = footprint * (1 - overlap); scales to ANY fence size
+  resweep_alt_m: 10.0    # 2nd grid when the 1st finds nothing (0 = disabled)
+  search_speed_ms: 2.5   # WPNAV_SPEED during search, restored after (0 = FC default)
   yaw_steps: 12
   yaw_settle_s: 1.0
   trigger_timeout_s: 600
-  search_timeout_s: 600
+  search_timeout_s: 300  # ONE budget shared by yaw + grid + resweep
   approach_timeout_s: 240
   min_batt_pct: 25
   arrive_m: 2.0

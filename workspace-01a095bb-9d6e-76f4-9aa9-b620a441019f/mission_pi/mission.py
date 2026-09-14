@@ -6,7 +6,8 @@ Flow (drone is at ~15 m over home in AUTO when we take over):
   TAKEOVER      set GUIDED, verify; snapshot already holds home + fence
   SWEEP_YAW     12 stepped 30° yaws with settle pauses (sharp frames beat
                 motion blur); any fresh bbox cue jumps to TRACK
-  SWEEP_GRID    serpentine over the geofence polygon at sweep_alt; cue jumps
+  SWEEP_GRID    serpentine over the geofence polygon at sweep_alt, then a
+                best-effort re-sweep at resweep_alt_m; cue jumps to TRACK
   TRACK         bottom-cam bbox -> ground offset -> guided goto above the
                 candidate (target clamped INSIDE the fence, always)
   APPROACH      descend the altitude stair while the cue is fresh; decode
@@ -39,7 +40,9 @@ class Mission:
         m = cfg.get("mission", {})
         self.sweep_alt = float(m.get("sweep_alt_m", 15.0))
         self.approach_stair = [float(a) for a in m.get("approach_stair_m", [12.0, 9.0, 7.0])]
-        self.grid_overlap = float(m.get("grid_overlap", 0.5))
+        self.grid_overlap = float(m.get("grid_overlap", 0.3))
+        self.resweep_alt_m = float(m.get("resweep_alt_m", 10.0))
+        self.search_speed_ms = float(m.get("search_speed_ms", 2.5))
         self.yaw_steps = int(m.get("yaw_steps", 12))
         self.yaw_settle_s = float(m.get("yaw_settle_s", 1.0))
         self.trigger_timeout_s = float(m.get("trigger_timeout_s", 600))
@@ -80,6 +83,8 @@ class Mission:
         self._lock = threading.Lock()
         self._t_phase = time.time()
         self.stats = {"frames": 0, "cues": 0, "decodes": 0}
+        self._search_t0 = None     # search-budget clock (yaw+grid+resweep share it)
+        self._wpnav_orig = None    # WPNAV_SPEED to restore after the search
 
     # -- helpers --------------------------------------------------------
     def _set_phase(self, phase, detail=""):
@@ -299,6 +304,15 @@ class Mission:
                 sorted(self.trigger_cmds), fb))
         else:
             self._log("INFO", "sprayer seqs: %s" % (self.sprayer_seqs,))
+        # snapshot cruise speed so the search can fly search_speed_ms and
+        # hand the FC back exactly as found (best-effort; a dead param
+        # channel must not brick the mission).
+        try:
+            self._wpnav_orig = self.fc.get_param("WPNAV_SPEED")
+            self._log("INFO", "WPNAV_SPEED snapshot: %.0f cm/s" % self._wpnav_orig)
+        except Exception as e:
+            self._wpnav_orig = None
+            self._log("WARN", "WPNAV_SPEED read failed (%s) — search flies FC default" % e)
         # start detection workers + stream overlays
         for cam in self.rig.cams.values():
             if getattr(cam, "display_only", False):
@@ -342,11 +356,24 @@ class Mission:
         if self._abort.is_set():
             self._aborted()
             return
-        # SEARCH
+        # SEARCH (yaw + grid + resweep share one search_timeout_s budget)
+        self._search_t0 = time.time()
+        if self.search_speed_ms > 0:
+            try:
+                got = self.fc.set_param("WPNAV_SPEED", self.search_speed_ms * 100.0)
+                self._log("WARN", "search speed: WPNAV_SPEED -> %.0f cm/s (echo %.0f)" % (
+                    self.search_speed_ms * 100.0, got))
+            except Exception as e:
+                self._log("WARN", "search speed set failed (%s) — flying FC default" % e)
         if not self._sweep_yaw():
             return
         if not self._sweep_grid():
             return
+        if self.resweep_alt_m > 0 and not self.payload and not self._search_expired():
+            self._log("WARN", "grid empty @ %.0fm — re-sweeping @ %.0fm" % (
+                self.sweep_alt, self.resweep_alt_m))
+            if not self._sweep_grid(alt=self.resweep_alt_m):
+                return
         # found nothing in the pattern — one last transmit-less exit
         self._finish(found=False)
 
@@ -475,11 +502,16 @@ class Mission:
         finally:
             self.fc.unsubscribe(q)
 
+    def _search_expired(self):
+        """One search budget shared by yaw + grid + resweep (approach runs
+        on its own approach_timeout_s so a find never starves the stair)."""
+        return (self._search_t0 is not None
+                and time.time() - self._search_t0 > self.search_timeout_s)
+
     def _sweep_yaw(self):
         self._set_phase("SWEEP_YAW", "%d x %.0f deg stepped sweep" % (
             self.yaw_steps, 360.0 / self.yaw_steps))
         step = 360.0 / self.yaw_steps
-        t0 = time.time()
         for i in range(self.yaw_steps):
             if self._abort.is_set():
                 return self._aborted()
@@ -487,7 +519,7 @@ class Mission:
                 return self._aborted()
             if self.payload:
                 return self._transmit_and_finish()
-            if time.time() - t0 > self.search_timeout_s:
+            if self._search_expired():
                 break
             if self._fresh_cue():
                 return self._track_and_approach()
@@ -498,15 +530,16 @@ class Mission:
             time.sleep(step / 20.0 + self.yaw_settle_s)
         return True
 
-    def _sweep_grid(self):
+    def _sweep_grid(self, alt=None):
         if self.payload:
             return self._transmit_and_finish()
         cam = self.rig.get("cam2") or self.rig.get("cam1")
         if cam is None:
             self._set_phase("FAILSAFE", "no camera for grid sweep")
             return False
+        alt = float(alt) if alt else self.sweep_alt
         from geo import footprint_m
-        fw, fh = footprint_m(self.sweep_alt, cam.hfov_deg, cam.size[0], cam.size[1])
+        fw, fh = footprint_m(alt, cam.hfov_deg, cam.size[0], cam.size[1])
         spacing = max(2.0, min(fw, fh) * (1.0 - self.grid_overlap))
         fence = self.fence
         if len(fence) < 3:
@@ -522,8 +555,7 @@ class Mission:
         rows = geo.lawnmower_rows(fence, spacing,
                                   origin=(self.home[0], self.home[1]))
         self._set_phase("SWEEP_GRID", "%d legs, %.1fm spacing @ %.0fm" % (
-            len(rows), spacing, self.sweep_alt))
-        t0 = time.time()
+            len(rows), spacing, alt))
         for i, (lat, lon) in enumerate(rows):
             if self._abort.is_set():
                 return self._aborted()
@@ -531,8 +563,8 @@ class Mission:
                 return self._aborted()
             if self.payload:
                 return self._transmit_and_finish()
-            if time.time() - t0 > self.search_timeout_s:
-                self._log("WARN", "search timeout — finishing without payload")
+            if self._search_expired():
+                self._log("WARN", "search budget spent — finishing without payload")
                 return True
             cue = self._fresh_cue()
             if cue:
@@ -547,7 +579,7 @@ class Mission:
                 if self._fresh_cue():
                     return self._track_and_approach()
                 try:
-                    self.fc.goto_global(lat, lon, self.sweep_alt)
+                    self.fc.goto_global(lat, lon, alt)
                     pos = self.fc.get_position(timeout=1.5)
                 except Exception:
                     time.sleep(1.0)
@@ -645,7 +677,18 @@ class Mission:
         self._finish(found=True)
         return False  # stop search loops
 
+    def _restore_speed(self):
+        if self._wpnav_orig is None:
+            return
+        try:
+            self.fc.set_param("WPNAV_SPEED", float(self._wpnav_orig))
+            self._log("INFO", "WPNAV_SPEED restored to %.0f cm/s" % float(self._wpnav_orig))
+        except Exception as e:
+            log.warning("speed restore failed: %r", e)
+        self._wpnav_orig = None
+
     def _aborted(self):
+        self._restore_speed()
         self._log("ERROR", "abort — commanding RTL")
         try:
             self.fc.set_mode("RTL", timeout=6.0)
@@ -655,6 +698,7 @@ class Mission:
         return False
 
     def _finish(self, found):
+        self._restore_speed()
         if self.payload and not found:
             found = True
         self._log("WARN", "mission %s — post_action %s" % (
