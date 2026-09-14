@@ -496,7 +496,8 @@ class FCLink:
         """PARAM_SET with the FC's own type + wait for the echo.
 
         Type matters: the FC silently ignores a set whose type doesn't
-        match the parameter (WPNAV_SPEED is INT, not REAL32 — the old
+        match the parameter (names/units/types vary by firmware: WP_SPD is
+        float m/s on 4.7+, WPNAV_SPEED was INT cm/s — learning beats assuming
         always-REAL32 form could never take). We learn the type first;
         if learning fails we still try REAL32 once (harmless if the FC
         ignores it) before reporting the echo failure honestly.

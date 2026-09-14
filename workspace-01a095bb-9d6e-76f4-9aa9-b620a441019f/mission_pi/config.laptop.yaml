@@ -78,7 +78,7 @@ mission:
   approach_stair_m: [12.0, 9.0, 7.0]
   grid_overlap: 0.3      # strip spacing = footprint * (1 - overlap); scales to ANY fence size
   resweep_alt_m: 0       # bench pixels are decoupled from altitude — skip the 2nd grid
-  search_speed_ms: 2.5   # WPNAV_SPEED during search, restored after (0 = FC default)
+  search_speed_ms: 2.5   # WP_SPD (4.7+) / WPNAV_SPEED (older) during search, restored after (0 = FC default)
   yaw_steps: 12
   yaw_settle_s: 1.0
   trigger_timeout_s: 900

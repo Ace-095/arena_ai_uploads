@@ -24,7 +24,7 @@ def main():
     ap.add_argument("--device", default="tcp:127.0.0.1:5762")
     ap.add_argument("--sysid", type=int, default=51)
     ap.add_argument("--hb", default="offboard", choices=["offboard", "gcs", "none"])
-    ap.add_argument("--params", default="WPNAV_SPEED,FENCE_ENABLE")
+    ap.add_argument("--params", default="WP_SPD,WPNAV_SPEED,FENCE_ENABLE")
     ap.add_argument("--timeout", type=float, default=6.0)
     a = ap.parse_args()
 

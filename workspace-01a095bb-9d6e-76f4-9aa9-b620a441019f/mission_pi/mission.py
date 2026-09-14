@@ -87,7 +87,7 @@ class Mission:
         self._t_phase = time.time()
         self.stats = {"frames": 0, "cues": 0, "decodes": 0}
         self._search_t0 = None     # search-budget clock (yaw+grid+resweep share it)
-        self._wpnav_orig = None    # WPNAV_SPEED to restore after the search
+        self._speed_par = None     # (name, scale, orig_raw): cruise-speed snapshot to restore
         b = cfg.get("blob", {})
         self.blob_enabled = bool(b.get("enabled", True))
         self.blob_top_k = int(b.get("top_k", 3))
@@ -357,12 +357,7 @@ class Mission:
         # snapshot cruise speed so the search can fly search_speed_ms and
         # hand the FC back exactly as found (best-effort; a dead param
         # channel must not brick the mission).
-        try:
-            self._wpnav_orig = self.fc.get_param("WPNAV_SPEED")
-            self._log("INFO", "WPNAV_SPEED snapshot: %.0f cm/s" % self._wpnav_orig)
-        except Exception as e:
-            self._wpnav_orig = None
-            self._log("WARN", "WPNAV_SPEED read failed (%s) — search flies FC default" % e)
+        self._snapshot_speed()
         # start detection workers + stream overlays
         for cam in self.rig.cams.values():
             if getattr(cam, "display_only", False):
@@ -409,12 +404,16 @@ class Mission:
         # SEARCH (yaw + grid + resweep share one search_timeout_s budget)
         self._search_t0 = time.time()
         if self.search_speed_ms > 0:
-            try:
-                got = self.fc.set_param("WPNAV_SPEED", self.search_speed_ms * 100.0)
-                self._log("WARN", "search speed: WPNAV_SPEED -> %.0f cm/s (echo %.0f)" % (
-                    self.search_speed_ms * 100.0, got))
-            except Exception as e:
-                self._log("WARN", "search speed set failed (%s) — flying FC default" % e)
+            if self._speed_par is None:
+                self._log("WARN", "no speed param snapshot — flying FC default")
+            else:
+                _nm, _sc, _raw = self._speed_par
+                try:
+                    got = self.fc.set_param(_nm, self.search_speed_ms * _sc)
+                    self._log("WARN", "search speed: %s -> %s (echo %s)" % (
+                        _nm, self.search_speed_ms * _sc, got))
+                except Exception as e:
+                    self._log("WARN", "search speed set failed (%s) — flying FC default" % e)
         if not self._sweep_yaw():
             return
         if not self._sweep_grid():
@@ -966,15 +965,32 @@ class Mission:
         self._finish(found=True)
         return False  # stop search loops
 
+    def _snapshot_speed(self):
+        """Snapshot cruise speed across the 4.7 rename (WP_SPD in m/s
+        first, WPNAV_SPEED in cm/s fallback). Sets self._speed_par to
+        (name, scale, orig_raw) or None."""
+        self._speed_par = None
+        for _nm, _sc in (("WP_SPD", 1.0), ("WPNAV_SPEED", 100.0)):
+            try:
+                _raw = self.fc.get_param(_nm)
+                self._speed_par = (_nm, _sc, float(_raw))
+                self._log("INFO", "speed snapshot: %s = %s" % (_nm, _raw))
+                break
+            except Exception as e:
+                log.debug("speed snapshot %s failed: %r", _nm, e)
+        if self._speed_par is None:
+            self._log("WARN", "speed read failed (WP_SPD + WPNAV_SPEED) — search flies FC default")
+
     def _restore_speed(self):
-        if self._wpnav_orig is None:
+        if self._speed_par is None:
             return
+        _nm, _sc, _raw = self._speed_par
         try:
-            self.fc.set_param("WPNAV_SPEED", float(self._wpnav_orig))
-            self._log("INFO", "WPNAV_SPEED restored to %.0f cm/s" % float(self._wpnav_orig))
+            self.fc.set_param(_nm, float(_raw))
+            self._log("INFO", "%s restored to %s" % (_nm, _raw))
         except Exception as e:
             log.warning("speed restore failed: %r", e)
-        self._wpnav_orig = None
+        self._speed_par = None
 
     def _mode_tripped(self):
         mode = getattr(self.fc, "mode", "?")
