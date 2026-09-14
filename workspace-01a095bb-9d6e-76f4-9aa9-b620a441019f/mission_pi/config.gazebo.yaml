@@ -75,6 +75,7 @@ mission:
   sweep_alt_m: 12.0    # detection-test altitude (2x-A3 panel: code ~68 px here, ~81 px on the 10 m resweep)
   approach_stair_m: [12.0, 9.0, 7.0]
   grid_overlap: 0.3      # strip spacing = footprint * (1 - overlap); scales to ANY fence size
+  edge_margin_m: 2.0    # grid legs stop this far INSIDE the fence (breach=RTL Rsn 10; 2026-09-14)
   resweep_alt_m: 10.0    # 2nd grid when the 1st finds nothing (0 = disabled)
   search_speed_ms: 1.0   # WP_SPD (4.7+) / WPNAV_SPEED (older) during search, restored after (0 = FC default). Slow-detection sim tuning: ~11 s over each panel pass at 15 m
   yaw_steps: 12

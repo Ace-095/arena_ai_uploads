@@ -97,5 +97,35 @@ if Mission is not None:
           len(hot2) == 10 and hot2.isdisjoint(first)
           and hot2 | first == set(m._cov), repr(sorted(hot2)))
 
+# --- geo.lawnmower_rows: edge margin keeps legs off the fence line ---
+def _sq(half):
+    return [geo.enu_to_latlon(e, n, olat, olon)
+            for e, n in ((-half, -half), (-half, half),
+                         (half, half), (half, -half))]
+
+
+def _edge_gap(wps, half):
+    gap = 1e9
+    for la, lo in wps:
+        e, n = geo.latlon_to_enu(la, lo, olat, olon)
+        gap = min(gap, e + half, half - e)
+    return gap
+
+
+_sq40 = _sq(20.0)
+_w0 = geo.lawnmower_rows(_sq40, 10.0, origin=(olat, olon), edge_margin_m=0.0)
+_w2 = geo.lawnmower_rows(_sq40, 10.0, origin=(olat, olon), edge_margin_m=2.0)
+_wd = geo.lawnmower_rows(_sq40, 10.0, origin=(olat, olon))
+_gap0, _gap2, _gapd = (_edge_gap(w, 20.0) for w in (_w0, _w2, _wd))
+check("margin bites by ~2 m", abs((_gap2 - _gap0) - 2.0) < 0.01,
+      "gap0=%.2f gap2=%.2f" % (_gap0, _gap2))
+check("margin=2 legs stand off the line", _gap2 >= 1.99,
+      "gap2=%.2f" % _gap2)
+check("default margin is 2 m", abs(_gapd - _gap2) < 0.01,
+      "gapd=%.2f" % _gapd)
+_tiny = geo.lawnmower_rows(_sq(1.0), 10.0, origin=(olat, olon),
+                           edge_margin_m=2.0)
+check("tiny fence -> centroid fallback", len(_tiny) == 1, repr(_tiny))
+
 print("FAILS:", FAILS if FAILS else "none")
 sys.exit(1 if FAILS else 0)

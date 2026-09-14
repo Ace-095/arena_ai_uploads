@@ -28,9 +28,13 @@ def main():
     ap.add_argument("--timeout", type=float, default=6.0)
     a = ap.parse_args()
 
-    conn = mavutil.mavlink_connection(
-        a.device, source_system=a.sysid,
-        source_component=mavutil.mavlink.MAV_COMP_ID_ONBOARD_COMPUTER)
+    try:
+        conn = mavutil.mavlink_connection(
+            a.device, source_system=a.sysid,
+            source_component=mavutil.mavlink.MAV_COMP_ID_ONBOARD_COMPUTER)
+    except OSError as e:
+        sys.exit("SITL not listening on %s (%s) -- start Terminal B "
+                 "(sim_vehicle) first, then re-run" % (a.device, e))
     hb_type = {"offboard": mavutil.mavlink.MAV_TYPE_ONBOARD_CONTROLLER,
                "gcs": mavutil.mavlink.MAV_TYPE_GCS}.get(a.hb)
 

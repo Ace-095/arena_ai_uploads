@@ -44,6 +44,7 @@ class Mission:
         self.sweep_alt = float(m.get("sweep_alt_m", 15.0))
         self.approach_stair = [float(a) for a in m.get("approach_stair_m", [12.0, 9.0, 7.0])]
         self.grid_overlap = float(m.get("grid_overlap", 0.3))
+        self.edge_margin_m = float(m.get("edge_margin_m", 2.0))
         self.resweep_alt_m = float(m.get("resweep_alt_m", 10.0))
         self.search_speed_ms = float(m.get("search_speed_ms", 2.5))
         self.yaw_steps = int(m.get("yaw_steps", 12))
@@ -607,9 +608,10 @@ class Mission:
                      (lat0 + dlat, lon0 + dlon), (lat0 + dlat, lon0 - dlon)]
             self._log("WARN", "no fence — covering %.0f m home box" % (half * 2))
         rows = geo.lawnmower_rows(fence, spacing,
-                                  origin=(self.home[0], self.home[1]))
-        self._set_phase("SWEEP_GRID", "%d legs, %.1fm spacing @ %.0fm" % (
-            len(rows), spacing, alt))
+                                  origin=(self.home[0], self.home[1]),
+                                  edge_margin_m=self.edge_margin_m)
+        self._set_phase("SWEEP_GRID", "%d legs, %.1fm spacing @ %.0fm, %.0fm edge" % (
+            len(rows), spacing, alt, self.edge_margin_m))
         for i, (lat, lon) in enumerate(rows):
             if self._abort.is_set():
                 return self._aborted()

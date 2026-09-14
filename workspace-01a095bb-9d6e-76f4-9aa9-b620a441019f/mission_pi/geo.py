@@ -71,12 +71,14 @@ def polygon_size_m(poly):
     return (max(xs) - min(xs), max(ys) - min(ys))
 
 
-def lawnmower_rows(poly, spacing_m, origin=None):
+def lawnmower_rows(poly, spacing_m, origin=None, edge_margin_m=2.0):
     """Serpentine coverage waypoints over a polygon (the geofence).
 
-    Rows run east-west spaced `spacing_m` apart, clipped to the polygon.
-    Returns [(lat, lon), ...] in flyable order. Falls back to the polygon
-    centroid if nothing survives the clip (tiny fence).
+    Rows run east-west spaced `spacing_m` apart, clipped to the polygon,
+    then inset `edge_margin_m` along-track so legs never target the fence
+    line itself (overshoot at speed = fence-breach RTL, Rsn 10). Runs
+    shorter than 2x margin are skipped. Falls back to the polygon
+    centroid if nothing survives (tiny fence).
     """
     if len(poly) < 3 or spacing_m <= 0:
         return [polygon_centroid(poly)] if poly else []
@@ -99,7 +101,10 @@ def lawnmower_rows(poly, spacing_m, origin=None):
                 inside.append((x, y))
         if not inside:
             continue
-        pts = [inside[0], inside[-1]] if len(inside) > 1 else inside
+        x_lo, x_hi = inside[0][0] + edge_margin_m, inside[-1][0] - edge_margin_m
+        if x_hi < x_lo:
+            continue  # run shorter than 2x margin: never target the line
+        pts = [(x_lo, y)] if x_hi == x_lo else [(x_lo, y), (x_hi, y)]
         if r % 2 == 1:
             pts = pts[::-1]
         wps.extend(pts)
