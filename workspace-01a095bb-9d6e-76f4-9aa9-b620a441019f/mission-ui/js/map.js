@@ -226,17 +226,32 @@ function initMap(o) {
     html: '<svg width="26" height="26" viewBox="0 0 26 26"><g><path d="M13 2 L18 16 L13 13 L8 16 Z" fill="#ff5050" stroke="#fff" stroke-width="1.2"/></g><circle cx="13" cy="13" r="2" fill="#fff"/></svg>',
     iconSize: [26, 26], iconAnchor: [13, 13],
   });
-  let droneMarker = null;
+  let droneMarker = null, dronePos = null, droneSeen = false, following = false;
   function setDrone(lat, lon, hdg) {
+    if (lat == null || lon == null) return;
+    dronePos = [lat, lon];
     if (!droneMarker) {
-      droneMarker = L.marker([lat, lon], { icon: droneIcon, zIndexOffset: 1000 }).addTo(map);
+      droneMarker = L.marker(dronePos, { icon: droneIcon, zIndexOffset: 1000 }).addTo(map);
       droneMarker.bindTooltip('vehicle', { direction: 'top', offset: [0, -14] });
-    } else droneMarker.setLatLng([lat, lon]);
+    } else droneMarker.setLatLng(dronePos);
     if (hdg != null) {
       const el = droneMarker.getElement && droneMarker.getElement();
       const g = el && el.querySelector('g');
       if (g) g.setAttribute('transform', 'rotate(' + hdg + ' 13 13)');
     }
+    if (!droneSeen) {
+      // First fix ever: jump to the vehicle (sim boots a continent away
+      // from the session anchor — without this the marker is invisible).
+      droneSeen = true;
+      map.setView(dronePos, Math.max(map.getZoom(), 17));
+    } else if (following && !map.getBounds().pad(-0.15).contains(dronePos)) {
+      map.panTo(dronePos);
+    }
+  }
+  function setFollow(on) {
+    following = !!on;
+    if (following && dronePos) map.panTo(dronePos);
+    return following;
   }
 
   let targetMarker = null;
@@ -358,7 +373,7 @@ function initMap(o) {
 
   return {
     setDrawing, getVertices, undoVertex, clearVertices,
-    setDrone, setTarget, setFence, setOrigin, setCoverage, clearCoverage,
+    setDrone, setTarget, setFence, setOrigin, setCoverage, clearCoverage, setFollow,
     setTileSourceByName, getTileSource: () => layerName,
     reanchorGrid, zoomToGrid, map,
   };

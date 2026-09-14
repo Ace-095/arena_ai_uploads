@@ -576,6 +576,11 @@ function boot() {
   // ---- map toolbar ----
   $('selTile').addEventListener('change', (e) => { map && map.setTileSourceByName(e.target.value); });
   $('mapHint').addEventListener('click', () => { map && map.zoomToGrid(); });
+  $('btnFollow').addEventListener('click', () => {
+    if (!map) return;
+    const on = map.setFollow($('btnFollow').classList.toggle('on'));
+    if (!on) $('btnFollow').classList.remove('on');
+  });
 
   // ---- mock auto-connect (same origin serves UI + mock Pi + bridge) ----
   // No eager cam start here: probe + start + seed run on the first Pi WS

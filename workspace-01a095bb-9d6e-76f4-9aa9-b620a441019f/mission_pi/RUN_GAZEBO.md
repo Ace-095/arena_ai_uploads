@@ -69,6 +69,20 @@ Top-right dropdown → **TCP** → Connect → host = Linux WiFi IP, port
 Plan tab (before EVERY flight): TAKEOFF 15 m → WAYPOINT ~20 m out @
 15 m → DO_SPRAYER → RTL → **Write WPs**.
 
+Bridge + mirror (same Windows machine — this feeds the UI map: drone
+marker, fence, plan, console. Needs a repo copy (or just `mission-ui/`)
+on the Windows side; the bridge is pure stdlib):
+
+```powershell
+cd <repo>\mission-ui
+python bridge\mp_bridge.py            # UI at http://127.0.0.1:8100. LEAVE RUNNING.
+```
+
+MP → Ctrl+F → **Mavlink** → **UDP Client** → tick **Write access** →
+Connect → `127.0.0.1` → `14551`. Want: UI MAV lamp green + drone
+marker on the map (map auto-centers on first fix; `follow` keeps it
+in view).
+
 ## 5. Terminal D — check, then fly
 
 ```bash
@@ -82,10 +96,14 @@ python main.py --config config.gazebo.yaml
 
 ## 6. UI + flight
 
-mission-ui → Pi link `http://<linux-ip>:8000` → connect → both CAM1 +
-CAM2 tiles live. Then MP Flight Data → **Arm** → **Auto**. Watch
-Terminal D (`trigger → TAKEOVER → GUIDED → TRACK → TRANSMIT`) and MP
-Messages for `QR:MISSION-QR-001`.
+Open `http://127.0.0.1:8100` (the §4 bridge) → Pi link
+`http://<linux-ip>:8000` → connect → CAM1 + CAM2 tiles live, drone on
+the map. Meter grid spacing: the `grid` dropdown (1–100 m);
+`re-anchor` re-freezes the tape. During the search the map shades
+covered 5 m cells green + fresh cells amber (needs the Pi link up).
+Then MP Flight Data → **Arm** → **Auto**. Watch Terminal D
+(`trigger → TAKEOVER → GUIDED → TRACK → TRANSMIT`) and MP Messages
+for `QR:MISSION-QR-001`.
 
 Re-fly: MP re-arm + Auto again, restart `main.py` for a clean slate
 (SITL + Gazebo + bridge stay up).
