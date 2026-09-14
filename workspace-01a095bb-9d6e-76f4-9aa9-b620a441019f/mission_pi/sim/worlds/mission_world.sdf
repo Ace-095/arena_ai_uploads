@@ -5,11 +5,12 @@
   = upstream iris_runway.sdf, with three changes:
     1. iris_with_gimbal  ->  iris_dualcam (our fixed front+bottom cameras,
        same flight plugins verbatim, no gimbal).
-    2. qr_target          ->  qr_panel_a3 (true 297x420 mm) at (8, 0):
-       inside the 40x40 m home search box. Sim cameras render 2560x1440
-       so the A3 code shows ~38 ideal px from 15 m (same class as the
-       real Cam3's ~70 px). qr_panel_big (2x-A3, commented below) is
-       the easy-mode fallback if the laptop can't hold 1440p.
+    2. qr_target          ->  qr_panel_big (2x-A3 linear, 594x840 mm) at
+       (8, 0): DETECTION-TEST config. The classical bench detector needs
+       the code ~80+ px; 2x-A3 gives ~54 px @ 15 m / ~81 px @ 10 m, so the
+       full loop (cue->track->decode->transmit) is provable today.
+       qr_panel_a3 (true 297x420 mm, commented below) is the honest
+       target and waits for the YOLO model (~26 px @ 15 m, YOLO-only).
     3. ground plane       ->  400x400 m safety net at z=-0.01. (Upstream's
        only ground is the far-away runway strip; without this the iris
        and the panel would sit on void near the origin.)
@@ -157,15 +158,17 @@
       <pose degrees="true">0 0 0.195 0 0 90</pose>
     </include>
 
-    <!-- the QR target: true-A3 panel (sim cams are 1440p to match) ... -->
+    <!-- DETECTION-TEST target: 2x-A3 (classical needs ~80+ px in frame).
+         Honest-A3 swap (YOLO runs only): comment this include, uncomment
+         the qr_panel_a3 one below. -->
     <include>
-      <uri>model://qr_panel_a3</uri>
+      <uri>model://qr_panel_big</uri>
       <name>qr_target</name>
       <pose>8 0 0 0 0 0</pose>
     </include>
-    <!-- ... easy-mode fallback (2x-A3) if 1440p is too heavy:
+    <!-- ... honest-A3 (YOLO-only):
     <include>
-      <uri>model://qr_panel_big</uri>
+      <uri>model://qr_panel_a3</uri>
       <name>qr_target</name>
       <pose>8 0 0 0 0 0</pose>
     </include>

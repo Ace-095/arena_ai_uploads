@@ -72,7 +72,7 @@ decode:
   miss_tolerance: 1
 
 mission:
-  sweep_alt_m: 15.0
+  sweep_alt_m: 12.0    # detection-test altitude (2x-A3 panel: code ~68 px here, ~81 px on the 10 m resweep)
   approach_stair_m: [12.0, 9.0, 7.0]
   grid_overlap: 0.3      # strip spacing = footprint * (1 - overlap); scales to ANY fence size
   resweep_alt_m: 10.0    # 2nd grid when the 1st finds nothing (0 = disabled)
