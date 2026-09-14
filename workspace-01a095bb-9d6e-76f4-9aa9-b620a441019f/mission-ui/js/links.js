@@ -42,7 +42,8 @@ function initPiLink(o) {
     st.url = httpUrl;
     close(false);
     let sock;
-    try { sock = new WebSocket(wsUrl(httpUrl)); } catch (e) { schedule(); return; }
+    try { sock = new WebSocket(wsUrl(httpUrl)); }
+    catch (e) { o.onLog && o.onLog('ERROR', 'bad Pi URL ' + httpUrl + ': ' + e.message); schedule(); return; }
     st.ws = sock;
     sock.onopen = () => {
       st.retry = 0; st.opened = true; st.openedAt = Date.now(); st.lastMsgAt = 0;

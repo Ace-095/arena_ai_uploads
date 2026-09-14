@@ -510,7 +510,9 @@ function boot() {
       $('btnPiConnect').textContent = 'connect';
       return;
     }
-    S.piUrl = $('piUrl').value.trim().replace(/\/$/, '') || window.location.origin;
+    let v = $('piUrl').value.trim().replace(/\/$/, '');
+    if (v && !/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(v)) v = 'http://' + v; // bare ip:port => http
+    S.piUrl = v || window.location.origin;
     $('piUrl').value = S.piUrl;
     S.camsProbed = false; // new Pi => re-probe its rig on WS open
     S.camsAvail = { cam1: true, cam2: true };
