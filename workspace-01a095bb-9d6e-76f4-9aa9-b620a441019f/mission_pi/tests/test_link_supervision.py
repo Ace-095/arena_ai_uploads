@@ -18,6 +18,20 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import fc_link  # noqa
 
+# The watchdog logic under test is pure Python — the connection object is a
+# duck-typed stub and find_fc is monkeypatched, so no MAVLink traffic happens.
+# On a machine without pymavlink (a fresh venv, the Windows UI box) we stub the
+# import guard instead of skipping, so the reconnect state machine is still
+# covered: it is the part that used to leave the link permanently deaf.
+try:
+    import pymavlink  # noqa
+    HAVE_PYMAVLINK = True
+except Exception:                                           # noqa: BLE001
+    HAVE_PYMAVLINK = False
+    fc_link._require_pymavlink = lambda: None
+    print("INFO pymavlink not installed — stubbing the import guard "
+          "(the watchdog test needs no MAVLink traffic)")
+
 FAILS = []
 
 
