@@ -270,6 +270,23 @@ class Mission:
             return False
         return True
 
+    def _guided_ok(self):
+        """True while the vehicle is still flying OUR search (GUIDED).
+
+        Anything else 3 ticks straight (external RTL, failsafe, user mode
+        bump) trips the search — better than burning 40 s timeouts per leg
+        while the drone RTL's away (seen 2026-09-14: 13 min wasted).
+        """
+        try:
+            guided = (self.fc.mode == "GUIDED")
+        except Exception:
+            guided = False
+        if guided:
+            self._offmode_n = 0
+            return True
+        self._offmode_n = getattr(self, "_offmode_n", 0) + 1
+        return self._offmode_n < 3  # tolerate 1-2 stale reads
+
     # -- main -------------------------------------------------------------
     def run(self):
         try:
@@ -553,6 +570,8 @@ class Mission:
                 return self._aborted()
             if not self._battery_ok():
                 return self._aborted()
+            if not self._guided_ok():
+                return self._mode_tripped()
             if self.payload:
                 return self._transmit_and_finish()
             if self._search_expired():
@@ -610,6 +629,8 @@ class Mission:
             while time.time() < end:
                 if self._abort.is_set():
                     return self._aborted()
+                if not self._guided_ok():
+                    return self._mode_tripped()
                 if self.payload:
                     return self._transmit_and_finish()
                 if self._fresh_cue():
@@ -799,6 +820,8 @@ class Mission:
             while time.time() < t_end:
                 if self._abort.is_set() or not self._battery_ok():
                     return self._aborted()
+                if not self._guided_ok():
+                    return self._mode_tripped()
                 if self.payload:
                     return self._transmit_and_finish()
                 if self._fresh_cue():
@@ -952,6 +975,18 @@ class Mission:
         except Exception as e:
             log.warning("speed restore failed: %r", e)
         self._wpnav_orig = None
+
+    def _mode_tripped(self):
+        mode = getattr(self.fc, "mode", "?")
+        self._log("ERROR", "vehicle left GUIDED (now %s) — external RTL/failsafe? "
+                           "aborting search instead of burning timeouts" % mode)
+        if self.payload:
+            return self._transmit_and_finish()
+        if mode in ("RTL", "LAND"):
+            self._restore_speed()
+            self._set_phase("DONE", "external %s — search aborted" % mode)
+            return False
+        return self._finish(False)
 
     def _aborted(self):
         self._restore_speed()

@@ -475,8 +475,8 @@ class FCLink:
         except Exception:
             return ""
 
-    def get_param(self, name, timeout=4.0):
-        """PARAM_REQUEST_READ + wait for the PARAM_VALUE echo (float)."""
+    def _request_param(self, name, timeout=4.0):
+        """PARAM_REQUEST_READ -> (value, mav_param_type). Raises FCError."""
         _require_pymavlink()
         want = str(name).upper()[:16]
         self._send(self.conn.mav.param_request_read_send,
@@ -486,20 +486,35 @@ class FCLink:
                           lambda m, w=want: self._param_id(m) == w, timeout)
         if m is None:
             raise FCError("get_param(%s) timeout" % want)
-        return float(m.param_value)
+        return float(m.param_value), int(m.param_type)
+
+    def get_param(self, name, timeout=4.0):
+        """PARAM_REQUEST_READ + wait for the PARAM_VALUE echo (float)."""
+        return self._request_param(name, timeout)[0]
 
     def set_param(self, name, value, timeout=4.0):
-        """PARAM_SET + wait for the echo; returns the FC-confirmed float."""
+        """PARAM_SET with the FC's own type + wait for the echo.
+
+        Type matters: the FC silently ignores a set whose type doesn't
+        match the parameter (WPNAV_SPEED is INT, not REAL32 — the old
+        always-REAL32 form could never take). We learn the type first;
+        if learning fails we still try REAL32 once (harmless if the FC
+        ignores it) before reporting the echo failure honestly.
+        """
         _require_pymavlink()
         want = str(name).upper()[:16]
+        try:
+            _cur, ptype = self._request_param(name, timeout=2.0)
+        except FCError as e:
+            log.warning("set_param(%s): type-learn failed (%s) — trying REAL32", want, e)
+            ptype = mavutil.mavlink.MAV_PARAM_TYPE_REAL32
         self._send(self.conn.mav.param_set_send,
                    self.target_system, self.target_component,
-                   want.encode("utf-8"), float(value),
-                   mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
+                   want.encode("utf-8"), float(value), ptype)
         m = self.wait_for(["PARAM_VALUE"],
                           lambda m, w=want: self._param_id(m) == w, timeout)
         if m is None:
-            raise FCError("set_param(%s) not echoed" % want)
+            raise FCError("set_param(%s) not echoed (tried type %d)" % (want, ptype))
         return float(m.param_value)
 
     def set_mode(self, mode, timeout=5.0):
