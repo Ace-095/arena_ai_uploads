@@ -90,3 +90,6 @@ mission:
 relay:
   interval_s: 2.0
   window_s: 15.0
+  store_forward: true               # buffer when BOTH routes fail; flush on recovery
+  store_path: logs/pending_results.jsonl
+  flush_poll_s: 5.0

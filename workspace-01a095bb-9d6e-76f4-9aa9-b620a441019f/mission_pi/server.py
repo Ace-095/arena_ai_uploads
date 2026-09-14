@@ -57,16 +57,19 @@ class Hub:
         self._loop = loop
 
     def push(self, channel, data):
+        """Broadcast to WS clients. Returns clients handed to (0 = nobody
+        listening — the store&forward UI-route proxy reads this)."""
         env = json.dumps({"channel": channel, "t": time.time(), "data": data})
         with self._lock:
             clients = list(self._clients)
         if not clients or self._loop is None:
-            return
+            return 0
         for ws in clients:
             try:
                 asyncio.run_coroutine_threadsafe(ws.send_text(env), self._loop)
             except Exception:
                 pass
+        return len(clients)
 
     def add(self, ws):
         with self._lock:

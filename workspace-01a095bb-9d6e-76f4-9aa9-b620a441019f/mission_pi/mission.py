@@ -97,6 +97,13 @@ class Mission:
         self.blob_cfg = dict(b)
         self._blob_obs = []        # passive ground-projected sightings
         self._blob_last_obs = 0.0
+        rcfg = cfg.get("relay", {})
+        from store_forward import StoreForward
+        self.store_fwd = StoreForward(
+            self.fc, lambda: self.hub,
+            path=str(rcfg.get("store_path", "logs/pending_results.jsonl")),
+            poll_s=float(rcfg.get("flush_poll_s", 5.0)),
+            enabled=bool(rcfg.get("store_forward", True)))
 
     # -- helpers --------------------------------------------------------
     def _set_phase(self, phase, detail=""):
@@ -260,11 +267,16 @@ class Mission:
     # -- main -------------------------------------------------------------
     def run(self):
         try:
+            self.store_fwd.start()
             self._run()
         except Exception as e:
             log.exception("mission crashed: %r", e)
             self._set_phase("FAILSAFE", "crash: %s" % e)
         finally:
+            try:
+                self.store_fwd.stop()
+            except Exception:
+                pass
             self._stop.set()
 
     def _run(self):
@@ -870,9 +882,16 @@ class Mission:
         self._set_phase("TRANSMIT", "relaying %r" % (self.payload,))
         from qr_relay import relay_qr
         rcfg = self.cfg.get("relay", {})
+        try:
+            _p = self.fc.get_position(timeout=2.0)
+            _gps = (_p["lat"], _p["lon"], _p.get("alt_rel"))
+        except Exception:
+            _gps = None
         relay_qr(self.payload, self.fc, self.hub,
                  interval_s=float(rcfg.get("interval_s", 2.0)),
-                 window_s=float(rcfg.get("window_s", 15.0)))
+                 window_s=float(rcfg.get("window_s", 15.0)),
+                 store=self.store_fwd.store if self.store_fwd.enabled else None,
+                 gps=_gps)
         try:
             pos = self.fc.get_position(timeout=2.0)
             hold_until = time.time() + float(rcfg.get("window_s", 15.0))
