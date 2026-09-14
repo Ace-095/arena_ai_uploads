@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+config.yaml
+snaps/
+qr_dataset/
+runs/
+# generated Gazebo panel textures (regenerate via tools/make_qr_panel.py)
+sim/models/*/materials/textures/qr.png
+demo_frames/
+logs/

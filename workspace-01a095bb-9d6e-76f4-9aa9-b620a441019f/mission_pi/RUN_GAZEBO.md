@@ -1,0 +1,114 @@
+# Gazebo closed loop — paste-and-go run sheet (this laptop, verified 2026-09-14)
+
+Four terminals + MP + UI. Guts + troubleshooting live in `SIM_GUIDE.md`
+(§9/§10); this file is just the commands, in order, with the exact
+paths on this machine. Already persisted in `~/.bashrc`, so NOT repeated
+below: `GZ_CONFIG_PATH` (line ~153), the `gz` → `QT_QPA_PLATFORM=xcb gz`
+alias, `GZ_SIM_*` paths, QR textures.
+
+## 0. Fresh day? Pull + preflight (any terminal, 30 s)
+
+```bash
+cd ~/arena_ai_uploads && git pull
+# A3 panel texture (first time only; re-run harmless):
+cd ~/arena_ai_uploads/workspace-01a095bb-9d6e-76f4-9aa9-b620a441019f/mission_pi
+test -f sim/models/qr_panel_a3/materials/textures/qr.png || \
+  (source .venv/bin/activate && python tools/make_qr_panel.py \
+    --text MISSION-QR-001 --out sim/models/qr_panel_a3/materials/textures/qr.png)
+ls -la sim/models/qr_panel_a3/materials/textures/qr.png   # want: EXISTS (~100+ KB). Missing = panel renders blank WHITE = detection can NEVER fire (fix: pip install qrcode pillow in .venv, re-run make_qr_panel above)
+test -f sim/models/qr_panel_big/materials/textures/qr.png || \
+  (source .venv/bin/activate && python tools/make_qr_panel.py \
+    --text MISSION-QR-001 --out sim/models/qr_panel_big/materials/textures/qr.png)
+ls -la sim/models/qr_panel_big/materials/textures/qr.png  # want: EXISTS. Detection-test world uses the BIG panel (see world header); no texture = blank = nothing to detect
+ss -ltn | grep -E '5760|5762|8000|8099'   # want: EMPTY (nothing stale)
+hostname -I                               # note the WiFi IP for MP + UI
+```
+
+Port still held from yesterday? `pkill -f gz_cam_bridge; pkill -f arducopter; pkill gz; pkill -f sim_vehicle` then re-check.
+
+## 1. Terminal A — the world (~30 s to load)
+
+```bash
+cd ~/arena_ai_uploads/workspace-01a095bb-9d6e-76f4-9aa9-b620a441019f/mission_pi
+gz sim -v4 -r sim/worlds/mission_world.sdf
+# want: window with iris on ground + white QR panel ~8 m out on +X,
+#        both /iris/.../image topics advertised. LEAVE RUNNING.
+```
+
+## 2. Terminal B — SITL on the iris
+
+```bash
+source ~/venv-ardupilot/bin/activate
+cd ~/ardupilot
+Tools/autotest/sim_vehicle.py -v ArduCopter -f gazebo-iris --model JSON --no-mavproxy
+# want: "SERIAL0 on TCP port 5760" + "Waiting for connection". LEAVE RUNNING.
+# (First run of the day rebuilds if ardupilot/ changed; else starts in seconds.)
+```
+
+## 3. Terminal C — camera bridge (NO mission_pi venv here)
+
+```bash
+cd ~/arena_ai_uploads/workspace-01a095bb-9d6e-76f4-9aa9-b620a441019f/mission_pi
+python3 tools/gz_cam_bridge.py --port 8099
+# want: both subscribes -> OK, frame counters climbing. LEAVE RUNNING.
+```
+
+Verify pixels (any spare terminal / browser):
+
+```bash
+curl -s http://127.0.0.1:8099/health   # want: both ages < 1 s, 2560x1440
+# browser: http://127.0.0.1:8099/ — front = horizon, bottom = ground.
+```
+
+## 4. Mission Planner (Windows, same WiFi)
+
+Top-right dropdown → **TCP** → Connect → host = Linux WiFi IP, port
+**5760** → OK. Flight Data comes alive; Terminal B prints the
+`SERIAL1 on TCP port 5762` line — that is the cue for step 5.
+
+Plan tab (before EVERY flight): TAKEOFF 15 m → WAYPOINT ~20 m out @
+15 m → DO_SPRAYER → RTL → **Write WPs**.
+
+Bridge + mirror (same Windows machine — this feeds the UI map: drone
+marker, fence, plan, console. Needs a repo copy (or just `mission-ui/`)
+on the Windows side; the bridge is pure stdlib):
+
+```powershell
+cd <repo>\mission-ui
+python bridge\mp_bridge.py            # UI at http://127.0.0.1:8100. LEAVE RUNNING.
+```
+
+MP → Ctrl+F → **Mavlink** → **UDP Client** → tick **Write access** →
+Connect → `127.0.0.1` → `14551`. Want: UI MAV lamp green + drone
+marker on the map (map auto-centers on first fix; `follow` keeps it
+in view).
+
+## 5. Terminal D — check, then fly
+
+```bash
+cd ~/arena_ai_uploads/workspace-01a095bb-9d6e-76f4-9aa9-b620a441019f/mission_pi
+source .venv/bin/activate
+python main.py --check --config config.gazebo.yaml
+# want: [fc] OK ... [cam] cam1: kind=url ... [cam] cam2: kind=url ...
+python main.py --config config.gazebo.yaml
+# want: BOOTSTRAP -> SNAPSHOT -> WAIT_TRIGGER. LEAVE RUNNING.
+```
+
+## 6. UI + flight
+
+Open `http://127.0.0.1:8100` (the §4 bridge) → Pi link
+`http://<linux-ip>:8000` → connect → CAM1 + CAM2 tiles live, drone on
+the map. Meter grid spacing: the `grid` dropdown (1–100 m);
+`re-anchor` re-freezes the tape. During the search the map shades
+covered 5 m cells green + fresh cells amber (needs the Pi link up).
+Then MP Flight Data → **Arm** → **Auto**. Watch Terminal D
+(`trigger → TAKEOVER → GUIDED → TRACK → TRANSMIT`) and MP Messages
+for `QR:MISSION-QR-001`.
+
+Re-fly: MP re-arm + Auto again, restart `main.py` for a clean slate
+(SITL + Gazebo + bridge stay up).
+
+## 7. Shutdown
+
+Ctrl-C in D, C, B, A (in that order). Stuck ports: see the `pkill` line
+in §0.

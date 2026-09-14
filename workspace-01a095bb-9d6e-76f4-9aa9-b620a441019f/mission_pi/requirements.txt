@@ -1,0 +1,28 @@
+# mission_pi dependencies.
+#
+# CORE (Pi 5, flight): install with pip (break-system-packages on Pi OS).
+pymavlink>=2.4.40
+pyserial>=3.5
+numpy>=1.24
+pyyaml>=6.0
+fastapi>=0.100
+uvicorn[standard]>=0.23
+# The [standard] extra above is what pulls in a websocket implementation.
+# Without one, uvicorn answers /ws/telemetry with a bare 404: HTTP and the
+# camera tiles keep working while the UI's PI lamp stays red forever. Listed
+# explicitly so a plain `pip install uvicorn` cannot silently break the link.
+websockets>=10.4
+#
+# VISION (Pi 5, flight): prefer apt on Pi OS, pip elsewhere.
+#   sudo apt install -y python3-opencv python3-picamera2 zbar-tools
+#   pip install pyzbar
+# Extra for qr_bench on x86: opencv-python
+#
+# HAILO (Pi 5, flight): NOT pip — install the Hailo stack via apt:
+#   sudo apt install -y hailo-all
+# then verify with: hailortcli scan   (expects the AI HAT+ 26 TOPS)
+#
+# TRAINING (x86 +GPU, never on the Pi): used by training/*.py only.
+#   pip install ultralytics qrcode pillow opencv-python
+# HEF compile additionally needs the Hailo Dataflow Compiler (x86, licensed
+# download from hailo.ai/developer-zone) — see training/compile_hef.md.

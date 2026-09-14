@@ -1,0 +1,5 @@
+# runtime residue — never commit flight/bench artefacts
+logs/
+__pycache__/
+*.pyc
+.venv/

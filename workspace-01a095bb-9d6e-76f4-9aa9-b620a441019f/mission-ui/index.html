@@ -1,220 +1,255 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Mission Companion</title>
-<link rel="stylesheet" href="vendor/leaflet/leaflet.css" />
-<link rel="stylesheet" href="css/app.css" />
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mission Companion — UI v2</title>
+<link rel="stylesheet" href="vendor/leaflet/leaflet.css">
+<link rel="stylesheet" href="css/app.css">
 </head>
 <body>
-
 <header id="topbar">
-  <div class="brand">MISSION <strong>COMPANION</strong> <span class="dim">· mp-first</span></div>
-  <div class="lamps">
-    <span class="lamp off" id="lampPi" title="Pi backend link (router/LTE)">PI</span>
-    <span class="lamp off" id="lampBridge" title="MP log bridge (local)">BRIDGE</span>
-    <span class="badge amber" id="mockBadge" hidden>MOCK DATA</span>
+  <div class="brand">MISSION COMPANION <span class="sub">ui v2 · bridge + Pi · MP-forwarded MAVLink</span></div>
+  <div class="top-right">
+    <span id="mockBadge" class="badge hidden">MOCK</span>
+    <span class="lamp"><i id="lampPi" class="dot off"></i>PI</span>
+    <span class="lamp"><i id="lampBridge" class="dot off"></i>BRIDGE</span>
+    <span class="lamp"><i id="lampMav" class="dot off"></i>MAV</span>
+    <span id="clock" class="clock">--:--:--</span>
   </div>
-  <div class="spacer"></div>
-  <div id="clock" class="mono dim">--:--:--</div>
 </header>
 
-<main id="app">
-  <!-- ================= LEFT PANEL ================= -->
-  <aside id="panel">
+<main id="layout">
+  <section id="panels">
 
-    <div class="card">
-      <h2>Pi Link</h2>
-      <input type="text" id="piUrl" placeholder="http://&lt;pi-ip&gt;:8000" spellcheck="false" />
-      <button id="btnPiConnect" class="primary">Connect</button>
-      <div class="stat-row"><span class="k">websocket</span><span class="v" id="piWs">—</span></div>
-      <div class="stat-row"><span class="k">mode</span><span class="v" id="piMode">—</span></div>
+    <div class="card" id="cardMav">
+      <h2>MP LINK <span class="hint-inline">(MAVLink via Mission Planner)</span></h2>
+      <div class="row"><span class="badge" id="mavBadge">DISCONNECTED</span></div>
+      <div class="kv"><span>vehicle</span><b id="mavVeh">—</b></div>
+      <div class="kv"><span>mode / armed</span><b id="mavMode">—</b></div>
+      <div class="kv"><span>rx rate</span><b id="mavRx">—</b></div>
+      <div class="kv"><span>MP forwarder</span><b id="mavSender">—</b></div>
+      <div class="kv"><span>plan (from FC)</span><b id="mavPlan">—</b></div>
+      <div class="row wrap">
+        <label class="inline">UDP listen <input id="mavPort" type="number" value="14551" min="1" max="65535"></label>
+        <button id="btnMavPort" class="btn small">set</button>
+      </div>
+      <div class="row wrap">
+        <input id="paramName" class="grow" placeholder="param e.g. FENCE_ENABLE" value="FENCE_ENABLE">
+        <button id="btnParam" class="btn small">read</button>
+      </div>
+      <div class="kv"><span>param value</span><b id="paramVal">—</b></div>
+      <p class="hint">MP: right-click vehicle → MAVLink Forwarding → 127.0.0.1:14551 + Write access. Fence / RTL go out this way; flight control stays in MP.</p>
     </div>
 
-    <div class="card">
-      <h2>Mission State <span class="badge idle" id="fsmBadge">—</span></h2>
-      <div class="fsm-main">
-        <div class="fsm-state" id="fsmState">—</div>
-        <div class="fsm-reason" id="fsmReason">waiting for Pi…</div>
+    <div class="card" id="cardPi">
+      <h2>PI LINK <span class="hint-inline">(receive-only)</span></h2>
+      <div class="kv"><span>ws status</span><b id="piWs">—</b></div>
+      <div class="kv"><span>http probe</span><b id="piHealth">—</b></div>
+      <div class="kv"><span>mode</span><b id="piMode">—</b></div>
+      <div class="row wrap">
+        <input id="piUrl" class="grow" placeholder="http://<pi-ip>:8000">
+        <button id="btnPiConnect" class="btn small">connect</button>
+        <button id="btnPiProbe" class="btn small" title="HTTP check of /health — says why the socket will not open">probe</button>
       </div>
-      <div class="fsm-chips" id="fsmChips"></div>
-      <div class="stat-row"><span class="k">plan</span><span class="v" id="planInfo">—</span></div>
-      <div class="stat-row"><span class="k">armable</span><span class="v" id="armableInfo">—</span></div>
+      <p class="hint" id="piHint">Paste the URL mission_pi prints on startup (http://&lt;pi-ip&gt;:8000). UI only reads Pi mission/fsm/system events; fence + flight go via the MP link, camera tuning is the only write.</p>
     </div>
 
-    <div class="card">
-      <h2>Geofence / Search Area <span class="badge idle" id="fenceBadge">none</span></h2>
-      <div class="row2">
-        <button id="btnDraw">Start drawing</button>
-        <button id="btnUndoV">Undo pt</button>
-      </div>
-      <div class="row2">
-        <button id="btnClearV">Clear pts</button>
-        <label class="chk"><input type="checkbox" id="chkSnap" /> snap to grid</label>
-      </div>
-      <div class="stat-row">
-        <span class="k">meter grid</span>
-        <select id="selGrid" class="sel">
-          <option value="1" selected>1 m</option><option value="2">2 m</option>
-          <option value="5">5 m</option><option value="10">10 m</option>
-          <option value="20">20 m</option><option value="50">50 m</option>
-        </select>
-      </div>
-      <div class="stat-row"><span class="k">state</span><span class="v" id="fenceState">no fence loaded</span></div>
-      <div class="stat-row"><span class="k">readback</span><span class="v" id="fenceReadback">—</span></div>
-      <div class="stat-row"><span class="k">vertices</span><span class="v" id="fenceVerts">—</span></div>
-      <div class="stat-row"><span class="k">area</span><span class="v" id="fenceArea">—</span></div>
-      <div class="stat-row"><span class="k">max radius</span><span class="v" id="fenceRadius">—</span></div>
-      <div class="stat-row"><span class="k">EKF origin</span><span class="v" id="fenceOrigin">—</span></div>
-      <div class="stat-row"><span class="k">drawing now</span><span class="v" id="drawCount">0 pts</span></div>
-      <button id="btnApplyFence" class="primary">Apply fence → Pi → FC</button>
-      <div class="row2">
-        <button id="btnClearFence">Clear on FC</button>
-        <button id="btnExportLap">Export .lap</button>
-      </div>
-      <div class="hint">Draw: click map to add points (3–255). This becomes the Pi's search area.
-      <span class="dim">.lap export = manual MP fallback (bench-test in MP).</span></div>
+    <div class="card" id="cardFsm">
+      <h2>MISSION STATE <span class="hint-inline">(from Pi + MP)</span></h2>
+      <div class="row"><span class="badge" id="fsmBadge">—</span></div>
+      <div class="kv"><span>state</span><b id="fsmState">—</b></div>
+      <div class="kv"><span>acknowledged</span><b id="fsmReason">—</b></div>
+      <div class="kv"><span>plan (from FC)</span><b id="planInfo">—</b></div>
+      <div class="kv"><span>armable</span><b id="armableInfo">—</b></div>
     </div>
 
-    <div class="card">
-      <h2>Telemetry</h2>
-      <div class="stat-row"><span class="k">lat</span><span class="v" id="tLat">—</span></div>
-      <div class="stat-row"><span class="k">lon</span><span class="v" id="tLon">—</span></div>
-      <div class="stat-row"><span class="k">alt rel / MSL</span><span class="v" id="tAlt">—</span></div>
-      <div class="stat-row"><span class="k">mode / armed</span><span class="v" id="tMode">—</span></div>
-      <div class="stat-row"><span class="k">vx, vy, vz</span><span class="v" id="tVel">—</span></div>
-      <div class="stat-row"><span class="k">roll, pitch, yaw</span><span class="v" id="tAtt">—</span></div>
-      <div class="stat-row"><span class="k">GPS</span><span class="v" id="tGps">—</span></div>
-      <div class="stat-row"><span class="k">battery</span><span class="v" id="tBat">—</span></div>
+    <div class="card" id="cardFence">
+      <h2>GEOFENCE <span class="hint-inline">(→ MP → FC)</span></h2>
+      <div class="row wrap">
+        <button id="btnDraw" class="btn small toggle">draw</button>
+        <button id="btnUndo" class="btn small">undo</button>
+        <button id="btnClearDraw" class="btn small">clear</button>
+      </div>
+      <div class="row wrap">
+        <label class="inline">snap <input id="snapInput" type="number" value="1" min="1" max="100"> m</label>
+        <label class="inline">grid <select id="gridSelect">
+          <option value="1">1 m</option><option value="2">2 m</option><option value="5">5 m</option>
+          <option value="10" selected>10 m</option><option value="20">20 m</option>
+          <option value="50">50 m</option><option value="100">100 m</option>
+        </select></label>
+        <button id="btnReanchor" class="btn small" title="Re-freeze the grid anchor at the current map centre">re-anchor</button>
+      </div>
+      <div class="kv"><span>state</span><b id="fState">—</b></div>
+      <div class="kv"><span>readback</span><b id="fReadback">—</b></div>
+      <div class="kv"><span>vertices</span><b id="fVerts">—</b></div>
+      <div class="kv"><span>area</span><b id="fArea">—</b></div>
+      <div class="kv"><span>max radius</span><b id="fRadius">—</b></div>
+      <div class="kv"><span>origin</span><b id="fOrigin">—</b></div>
+      <div class="kv"><span>drawing</span><b id="fDrawing">0 pts</b></div>
+      <div class="kv"><span>draw area</span><b id="drawArea">—</b></div>
+      <div class="row wrap">
+        <button id="btnFenceApply" class="btn primary">APPLY FENCE → MP</button>
+        <button id="btnFenceClear" class="btn small danger">clear on FC</button>
+        <button id="btnFenceRefresh" class="btn small">refresh from FC</button>
+      </div>
+      <button id="btnExportLap" class="btn small">export .lap</button>
+      <p class="hint">Fence uploads via the MP link (FENCE mission type) with FC readback verify, then FENCE_ENABLE + FENCE_ACTION + FENCE_TYPE params. Confirm the polygon in MP before flight.</p>
     </div>
 
-    <div class="card">
-      <h2>System (Pi) <span class="badge idle" id="sysBadge">—</span></h2>
-      <div class="stat-row"><span class="k">CPU / temp</span><span class="v" id="sCpu">—</span></div>
-      <div class="stat-row"><span class="k">RAM</span><span class="v" id="sRam">—</span></div>
-      <div class="stat-row"><span class="k">disk / freq</span><span class="v" id="sDisk">—</span></div>
-      <div class="stat-row"><span class="k">uptime</span><span class="v" id="sUp">—</span></div>
-      <div class="stat-row"><span class="k">router / lte</span><span class="v" id="sNet">—</span></div>
+    <div class="card" id="cardTelem">
+      <h2>TELEMETRY <span class="hint-inline">(from MAVLink)</span></h2>
+      <div class="kv"><span>lat / lon</span><b id="tLatLon">—</b></div>
+      <div class="kv"><span>alt rel / msl</span><b id="tAlt">—</b></div>
+      <div class="kv"><span>mode</span><b id="tMode">—</b></div>
+      <div class="kv"><span>vel m/s</span><b id="tVel">—</b></div>
+      <div class="kv"><span>att r/p/y</span><b id="tAtt">—</b></div>
+      <div class="kv"><span>gps fix / sats</span><b id="tGps">—</b></div>
+      <div class="kv"><span>battery</span><b id="tBatt">—</b></div>
+      <div class="kv"><span>mission seq</span><b id="tMis">—</b></div>
     </div>
 
-    <div class="card">
-      <h2>Camera 1 · Search (Pi Cam 3)</h2>
-      <div class="stat-row"><span class="k">stream</span><span class="v" id="cMode">—</span></div>
-      <div class="stat-row"><span class="k">latency</span><span class="v" id="cLat">—</span></div>
-      <div class="cam-ctl">
-        <div class="stat-row"><span class="k">exposure (µs)</span><span class="v" id="cExpV">8000</span></div>
-        <input type="range" id="cExp" min="1000" max="30000" step="500" value="8000" />
-        <div class="stat-row"><span class="k">gain / ISO</span><span class="v" id="cGainV">1.5</span></div>
-        <input type="range" id="cGain" min="0.5" max="16" step="0.5" value="1.5" />
-        <div class="row2">
-          <label class="chk grow">AF
-            <select id="cAf" class="sel">
-              <option value="auto">auto</option>
-              <option value="continuous" selected>continuous</option>
-              <option value="manual">manual</option>
-              <option value="off">off</option>
-            </select>
-          </label>
-          <label class="chk"><input type="checkbox" id="cAdaptive" checked /> adaptive shutter</label>
+    <div class="card" id="cardSys">
+      <h2>SYSTEM <span class="hint-inline">(from Pi)</span></h2>
+      <div class="kv"><span>temp</span><b id="sTemp">—</b></div>
+      <div class="kv"><span>cpu / mem</span><b id="sCpu">—</b></div>
+      <div class="kv"><span>disk</span><b id="sDisk">—</b></div>
+      <div class="kv"><span>uptime</span><b id="sUp">—</b></div>
+    </div>
+
+    <div class="card" id="cardCam">
+      <h2>CAMERAS <span class="hint-inline">(Pi, live)</span></h2>
+      <div class="row">
+        <button id="tabCam1" class="btn small toggle on">CAM1 · pi-cam3</button>
+        <button id="tabCam2" class="btn small toggle">CAM2 · imx477</button>
+      </div>
+      <div id="camCtls1" class="camctls">
+        <div class="kv"><span>CAM1 stream</span><b id="c1Mode">—</b></div>
+        <div class="kv"><span>CAM1 latency</span><b id="c1Lat">—</b></div>
+        <div class="ctl"><label>exposure µs <output id="c1ExpV">8333</output></label><input id="c1Exp" type="range" min="100" max="66000" step="100" value="8333"></div>
+        <div class="ctl"><label>gain dB <output id="c1GainV">6</output></label><input id="c1Gain" type="range" min="0" max="32" step="0.5" value="6"></div>
+        <div class="row wrap">
+          <label class="inline">AF <select id="c1Af"><option value="auto">auto</option><option value="continuous">continuous</option><option value="manual">manual</option></select></label>
+          <label class="inline"><input id="c1Adapt" type="checkbox" checked> adaptive</label>
         </div>
-        <div class="stat-row"><span class="k">brightness</span><span class="v" id="cBriV">0.10</span></div>
-        <input type="range" id="cBri" min="-1" max="1" step="0.05" value="0.1" />
-        <div class="stat-row"><span class="k">contrast</span><span class="v" id="cConV">1.20</span></div>
-        <input type="range" id="cCon" min="-1" max="2" step="0.05" value="1.2" />
-        <div class="stat-row"><span class="k">saturation</span><span class="v" id="cSatV">1.00</span></div>
-        <input type="range" id="cSat" min="-1" max="2" step="0.05" value="1" />
-        <div class="stat-row"><span class="k">sharpness</span><span class="v" id="cShaV">1.20</span></div>
-        <input type="range" id="cSha" min="-1" max="2" step="0.05" value="1.2" />
-        <button id="btnCamApply">Apply camera settings</button>
-        <div class="hint" id="camCtlHint">sent via POST /api/camera/controls → libcamera controls (bench-verify on Pi)</div>
+        <div class="ctl"><label>brightness <output id="c1BriV">0</output></label><input id="c1Bri" type="range" min="-100" max="100" value="0"></div>
+        <div class="ctl"><label>contrast <output id="c1ConV">1.0</output></label><input id="c1Con" type="range" min="0" max="2" step="0.1" value="1"></div>
+        <div class="ctl"><label>saturation <output id="c1SatV">1.0</output></label><input id="c1Sat" type="range" min="0" max="2" step="0.1" value="1"></div>
+        <div class="ctl"><label>sharpness <output id="c1ShaV">1.0</output></label><input id="c1Sha" type="range" min="0" max="2" step="0.1" value="1"></div>
+        <div class="kv"><span>CAM1 live-apply</span><b id="c1Live">idle</b></div>
+      </div>
+      <div id="camCtls2" class="camctls hidden">
+        <div class="kv"><span>CAM2 stream</span><b id="c2Mode">—</b></div>
+        <div class="kv"><span>CAM2 latency</span><b id="c2Lat">—</b></div>
+        <div class="ctl"><label>exposure µs <output id="c2ExpV">8333</output></label><input id="c2Exp" type="range" min="100" max="66000" step="100" value="8333"></div>
+        <div class="ctl"><label>gain dB <output id="c2GainV">6</output></label><input id="c2Gain" type="range" min="0" max="32" step="0.5" value="6"></div>
+        <div class="row wrap">
+          <label class="inline">AF <select id="c2Af"><option value="auto">auto</option><option value="continuous">continuous</option><option value="manual">manual</option></select></label>
+          <label class="inline"><input id="c2Adapt" type="checkbox" checked> adaptive</label>
+        </div>
+        <div class="ctl"><label>brightness <output id="c2BriV">0</output></label><input id="c2Bri" type="range" min="-100" max="100" value="0"></div>
+        <div class="ctl"><label>contrast <output id="c2ConV">1.0</output></label><input id="c2Con" type="range" min="0" max="2" step="0.1" value="1"></div>
+        <div class="ctl"><label>saturation <output id="c2SatV">1.0</output></label><input id="c2Sat" type="range" min="0" max="2" step="0.1" value="1"></div>
+        <div class="ctl"><label>sharpness <output id="c2ShaV">1.0</output></label><input id="c2Sha" type="range" min="0" max="2" step="0.1" value="1"></div>
+        <div class="kv"><span>CAM2 live-apply</span><b id="c2Live">idle</b></div>
+      </div>
+      <p class="hint">Sliders apply live to the selected camera (debounced); no Apply button. Watch the feed update in real time.</p>
+    </div>
+
+    <div class="card" id="cardQr">
+      <h2>QR / RESULT</h2>
+      <div class="kv"><span>streak</span><b id="qrStreak">—</b></div>
+      <div class="kv"><span>payload</span><b id="qrPayload">—</b></div>
+      <div class="kv"><span>via pi-ws</span><b id="qrSrcPi">—</b></div>
+      <div class="kv"><span>via mavlink</span><b id="qrSrcMav">—</b></div>
+      <div class="kv"><span>via mp-log</span><b id="qrSrcMp">—</b></div>
+      <div class="kv"><span>via manual</span><b id="qrSrcMan">—</b></div>
+      <div class="row wrap">
+        <input id="qrManual" class="grow" placeholder="manual payload">
+        <button id="btnQrManual" class="btn small">send</button>
       </div>
     </div>
 
-    <div class="card">
-      <h2>QR / Result <span class="badge idle" id="qrBadge">awaiting</span></h2>
-      <div class="streak" id="qrStreak"><span></span><span></span><span></span></div>
-      <div class="qr-payload" id="qrPayload">—</div>
-      <div class="stat-row"><span class="k">via PI (WS)</span><span class="v" id="qrSrcPi">—</span></div>
-      <div class="stat-row"><span class="k">via MP log (local)</span><span class="v" id="qrSrcMp">—</span></div>
-      <div class="stat-row"><span class="k">manual entry</span><span class="v" id="qrSrcMan">—</span></div>
-      <div class="row2">
-        <input type="text" id="manualQr" maxlength="6" placeholder="2-digit" />
-        <button id="btnManualQr">Enter</button>
-      </div>
-      <div class="hint">1st priority route: STATUSTEXT → MP console. MP-log route needs no
-      router/LTE. Manual entry = guaranteed fallback.</div>
+    <div class="card" id="cardMpConsole">
+      <h2>MP CONSOLE <span class="hint-inline">(FC STATUSTEXT via MAVLink)</span></h2>
+      <div id="mpConsole" class="logbox short"></div>
     </div>
 
-    <div class="card">
-      <h2>MP Log Bridge (local)</h2>
-      <div class="stat-row"><span class="k">watching</span><span class="v" id="mpWatch">—</span></div>
-      <div class="stat-row"><span class="k">.bin parser</span><span class="v" id="mpDfr">—</span></div>
-      <div class="stat-row"><span class="k">last line</span><span class="v" id="mpLast">—</span></div>
-      <div class="row2">
-        <input type="text" id="watchPath" placeholder="C:\path\to\MP log file/folder" />
-        <button id="btnWatch">Watch</button>
+    <div class="card" id="cardMpLog">
+      <h2>MP LOG BRIDGE <span class="hint-inline">(file tail)</span></h2>
+      <div class="row wrap">
+        <input id="watchPath" class="grow" placeholder="path to MP log file (optional)">
+        <button id="btnWatch" class="btn small">watch</button>
       </div>
-      <div class="hint">Bridge tails MP log files for <span class="mono">QR:&lt;payload&gt;</span> and
-      pushes it here — works even when router + LTE are both down.</div>
+      <div class="kv"><span>watching</span><b id="watchInfo">—</b></div>
+      <p class="hint">Optional: tail a Mission Planner tlog/telemetry log. QR + mission-result lines are forwarded even if MAVLink is down.</p>
     </div>
 
-    <div class="card">
-      <h2>Logs</h2>
-      <input type="text" id="logFilter" placeholder="filter…" />
+    <div class="card" id="cardLogs">
+      <h2>LOGS</h2>
+      <div class="row wrap">
+        <select id="logFilter"><option value="">all</option><option>INFO</option><option>WARN</option><option>ERROR</option></select>
+        <button id="btnLogDownload" class="btn small">download</button>
+        <button id="btnLogClear" class="btn small">clear</button>
+      </div>
       <div id="logBox" class="logbox"></div>
-      <div class="row2">
-        <button id="btnLogDl">Download .txt</button>
-        <button id="btnLogClr">Clear</button>
+    </div>
+
+    <div class="card danger-card" id="cardCtl">
+      <h2>ACTIONS <span class="hint-inline">(via MP link)</span></h2>
+      <button id="btnAbort" class="btn danger big">ABORT → RTL</button>
+      <div class="row wrap">
+        <button id="btnLand" class="btn small">LAND</button>
+        <button id="btnMockRestart" class="btn small">restart mock</button>
       </div>
+      <p class="hint">RTL sends DO_SET_MODE(RTL) through MP to the FC. Arming / takeoff / mission control stay in Mission Planner.</p>
     </div>
 
-    <div class="card">
-      <h2>Controls</h2>
-      <button id="btnAbort" class="danger big">⚠ ABORT MISSION (Pi → failsafe → RTL)</button>
-      <button id="btnRestartMock" class="dim-btn" hidden>↻ restart mock mission (debug)</button>
-      <div class="hint">MP stays the mission head: arming, plan, home point all in Mission
-      Planner. UI never arms the drone.</div>
-    </div>
+  </section>
 
-  </aside>
-
-  <!-- ================= MAP ================= -->
-  <section id="mapwrap">
-    <div id="map"></div>
-    <div id="mapHint" class="map-hint">zoom in for the 1 m grid</div>
-    <div id="tileSelWrap" title="Map tile source (auto-switches if a source is blocked)">
-      <select id="selTile" class="sel">
-        <option value="osm">OSM standard</option>
-        <option value="cartoDark">Carto dark (UI match)</option>
-        <option value="voyager">Carto voyager (light)</option>
-        <option value="esriSat">Esri satellite</option>
-        <option value="esriTopo">Esri topo</option>
-      </select>
+  <section id="mapPane">
+    <div id="mapWrap">
+      <div id="map"></div>
+      <div id="mapBar">
+        <select id="selTile" title="tile source"></select>
+        <span id="mapHint" class="maphint" title="click to zoom to a level where the grid renders"></span>
+        <span id="covLegend"></span>
+        <button id="btnFollow" class="btn small toggle" title="keep the drone marker in view">follow</button>
+      </div>
     </div>
     <div id="camgrid">
-      <div class="cam-view" id="camView1">
-        <video id="videoCam1" autoplay playsinline muted></video>
-        <img id="imgCam1" alt="camera feed" hidden />
-        <div class="cam-label">CAM 1 · SEARCH</div>
-        <div class="cam-stats" id="camStats1">no feed</div>
-        <div class="cam-hint">⤢ click to enlarge</div>
+      <div class="camview">
+        <video id="videoCam1" muted playsinline></video>
+        <img id="imgCam1" alt="cam1 frame">
+        <div class="camhead"><b>CAM1 · pi-cam3</b><span id="camStats1">—</span></div>
+        <div id="camHint1" class="camhint">connecting…</div>
+        <button id="btnModalCam1" class="btn small">enlarge</button>
+        <button id="btnPauseCam1" class="btn small">pause</button>
+      </div>
+      <div class="camview" id="camView2">
+        <video id="videoCam2" muted playsinline></video>
+        <img id="imgCam2" alt="cam2 frame">
+        <div class="camhead"><b>CAM2 · imx477</b><span id="camStats2">—</span></div>
+        <div id="camHint2" class="camhint">connecting…</div>
+        <button id="btnModalCam2" class="btn small">enlarge</button>
+        <button id="btnPauseCam2" class="btn small">pause</button>
       </div>
     </div>
   </section>
 </main>
 
-<!-- ================= ENLARGE MODAL ================= -->
-<div id="modal" hidden>
-  <div class="modal-bg" id="modalBg"></div>
-  <div class="modal-body">
-    <video id="videoModal" autoplay playsinline muted></video>
-    <img id="imgModal" alt="camera feed enlarged" hidden />
-    <button id="modalClose">✕ close (Esc)</button>
+<div id="modal" class="hidden">
+  <div class="modal-inner">
+    <div class="camhead"><b id="modalCamLabel">CAM</b><button id="btnModalClose" class="btn small">close</button></div>
+    <video id="videoModal" muted playsinline></video>
+    <img id="imgModal" alt="modal frame">
   </div>
 </div>
 
 <script src="vendor/leaflet/leaflet.js"></script>
-<script type="module" src="js/app.js"></script>
+<script src="js/links.js"></script>
+<script src="js/camera.js"></script>
+<script src="js/map.js"></script>
+<script src="js/app.js"></script>
 </body>
 </html>
