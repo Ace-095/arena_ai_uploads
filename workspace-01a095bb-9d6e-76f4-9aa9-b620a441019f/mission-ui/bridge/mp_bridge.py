@@ -60,6 +60,13 @@ STATUS_TEXT = {200: "OK", 204: "No Content", 400: "Bad Request", 404: "Not Found
                405: "Method Not Allowed", 500: "Internal Server Error", 503: "Service Unavailable"}
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
+WS_PATHS = ("/ws/telemetry", "/ws/webrtc/cam1", "/ws/webrtc/cam2")
+
+
+def ws_servable(path, mock):
+    """Only the mock bridge implements Pi-side WS routes."""
+    return bool(mock) and path in WS_PATHS
+
 # channels the PI owns over its WS (v2: telemetry/fence are bridge-owned now)
 PI_CHANNELS = ("system", "event", "qr", "fsm", "log")
 
@@ -883,6 +890,17 @@ class Server:
                 pass
 
     async def handle_ws(self, reader, writer, path, headers):
+        if not ws_servable(path, self.mock):
+            # Real mode serves no Pi WS: refuse BEFORE 101, else the UI
+            # "opens" a dead socket (fake-green lamp, zero data).
+            writer.write(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n"
+                         b"Connection: close\r\n\r\n")
+            await writer.drain()
+            try:
+                writer.close()
+            except Exception:
+                pass
+            return
         key = headers.get("sec-websocket-key", "")
         accept = base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
         writer.write(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"

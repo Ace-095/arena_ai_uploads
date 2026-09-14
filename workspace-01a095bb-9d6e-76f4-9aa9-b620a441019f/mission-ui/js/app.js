@@ -81,6 +81,7 @@ function renderMav(d) {
   $('mavMode').textContent = (d.mode || '—') + (d.armed ? ' · ARMED' : '') +
     (d.hb_age_s != null ? ' · hb ' + d.hb_age_s + 's ago' : '');
   $('mavRx').textContent = d.rx_rate + ' msg/s · ' + fmtInt(d.rx_msgs) + ' total · :' + d.port;
+  if (d.port != null && document.activeElement !== $('mavPort')) $('mavPort').value = d.port;
   $('mavSender').textContent = (d.sender || 'no forwarder yet') + (d.tx_msgs != null ? ' · tx ' + fmtInt(d.tx_msgs) : '') + (d.sender_changes ? ' · mpswitch ' + d.sender_changes : '') + (d.link_flaps ? ' · flaps ' + d.link_flaps : '');
   renderPlan(S.plan || d.plan);
   renderArmable();
@@ -502,7 +503,10 @@ function boot() {
     onLog: log,
   });
   $('btnPiConnect').addEventListener('click', () => {
-    if (S.pi.connected) {
+    let v = $('piUrl').value.trim().replace(/\/$/, '');
+    if (v && !/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(v)) v = 'http://' + v; // bare ip:port => http
+    v = v || window.location.origin;
+    if (S.pi.connected && v === S.piUrl) {
       pi.close(true);
       S.pi.connected = false;
       $('piWs').textContent = 'closed by user';
@@ -510,9 +514,9 @@ function boot() {
       $('btnPiConnect').textContent = 'connect';
       return;
     }
-    let v = $('piUrl').value.trim().replace(/\/$/, '');
-    if (v && !/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(v)) v = 'http://' + v; // bare ip:port => http
-    S.piUrl = v || window.location.origin;
+    // New target (or not connected): (re)connect. Pasting a URL and
+    // clicking must SWITCH to it — never silently disconnect instead.
+    S.piUrl = v;
     $('piUrl').value = S.piUrl;
     S.camsProbed = false; // new Pi => re-probe its rig on WS open
     S.camsAvail = { cam1: true, cam2: true };
@@ -587,8 +591,14 @@ function boot() {
   // open (onStatus), so tiles always poll the connected Pi, not boot origin.
   S.piUrl = window.location.origin;
   $('piUrl').value = S.piUrl;
-  pi.connect(S.piUrl);
-  log('INFO', 'mission-ui v2 boot: Pi WS + bridge SSE starting on ' + S.piUrl);
+  // Only the MOCK bridge serves a Pi WS: in real mode there is no
+  // /ws/telemetry on the bridge, so wait for the real Pi URL instead.
+  fetch('/api/mp/state').then((r) => r.json()).then((st) => {
+    if (st && st.mock) pi.connect(S.piUrl);
+    else $('piWs').textContent = 'not connected — paste Pi URL';
+    log('INFO', 'mission-ui v2 boot: bridge SSE on ' + S.piUrl +
+        (st && st.mock ? ' (+ mock Pi WS)' : ' (real mode: Pi link manual)'));
+  }).catch(() => { pi.connect(S.piUrl); }); // state unreadable: old behavior
 }
 
 document.addEventListener('DOMContentLoaded', boot);
