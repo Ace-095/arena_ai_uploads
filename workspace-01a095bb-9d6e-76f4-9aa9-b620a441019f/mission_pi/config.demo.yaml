@@ -1,0 +1,80 @@
+# DEMO config — the whole stack on ONE machine with zero hardware.
+#
+#   Terminal 1:  python3 tools/fake_sitl.py            (tiny MAVLink vehicle)
+#   Terminal 2:  python3 tools/make_demo_frames.py --out demo_frames --jpg
+#                python3 main.py --config config.demo.yaml
+#   Terminal 3:  cd ../mission-ui && python3 bridge/mp_bridge.py --mock
+#                -> open http://127.0.0.1:8100, paste http://127.0.0.1:8000
+#                   as the Pi link, press connect.
+#   In Terminal 1 press:  m  (AUTO)   then  s  (fire DO_SPRAYER)
+#
+# What it proves: FC link + boot snapshot (home/fence/plan/sprayer scan),
+# the DO_SPRAYER trigger, GUIDED takeover, detect -> decode -> consensus,
+# TRANSMIT (STATUSTEXT "QR:<payload>" to the FC, `qr` event to the UI), and
+# the Pi HTTP/WS link the UI rides on. What it does NOT prove: real optics,
+# real flight dynamics, Hailo timing — see SIM_GUIDE.md for that ladder.
+
+server: { host: 0.0.0.0, port: 8000 }
+
+stream: { fps: 10, width: 960, quality: 72 }
+
+fc:
+  conn: "tcp:127.0.0.1:5762"   # tools/fake_sitl.py (or SITL's serial1)
+  retry_s: 3                   # fake/SITL may not be up yet — keep trying
+  connect_timeout_s: 0         # 0 = never give up (the UI stays served)
+
+cameras:
+  # Playback of tools/make_demo_frames.py: one "bottom" camera, no hardware.
+  bottom: { kind: file, path: demo_frames, fps: 4, size: [1280, 720],
+            hfov_deg: 68.0, rotation_deg: 0, jpeg_quality: 82 }
+
+detector:
+  kind: classical              # cv2 + pyzbar; no Hailo on a laptop
+  conf_thr: 0.35
+  iou_thr: 0.5
+  tile_bottom: true
+  tile_grid: [3, 3]
+  full_decode_every_n: 3
+  cue_frames: 2
+
+decode:
+  required_streak: 3
+  miss_tolerance: 1
+
+mission:
+  sweep_alt_m: 12.0
+  approach_stair_m: [12.0, 9.0, 7.0]
+  grid_overlap: 0.3
+  edge_margin_m: 2.0
+  resweep_alt_m: 0             # the demo frames decode on the first pass
+  search_speed_ms: 0           # leave the fake vehicle's speed alone
+  yaw_steps: 4
+  yaw_settle_s: 0.5
+  link_timeout_s: 600          # wait for the FC link instead of failing fast
+  trigger_timeout_s: 600
+  search_timeout_s: 120
+  approach_timeout_s: 90
+  min_batt_pct: 0
+  arrive_m: 2.0
+  post_action: RTL
+  trigger_seq: null
+  trigger_cmds: [216, 222, 223, 42600]
+  trigger_require_auto: true
+  trigger_peek_ahead: false
+  nofence_half_m: 20.0
+
+blob: { enabled: false }       # demo decodes directly; no hypotheses needed
+
+coverage:
+  cell_m: 5.0
+  push_every_s: 5.0
+  center_tol_m: 3.0
+  settle_s: 1.0
+  max_misses: 2
+
+relay:
+  interval_s: 2.0
+  window_s: 10.0
+  store_forward: true
+  store_path: logs/pending_results.jsonl
+  flush_poll_s: 5.0

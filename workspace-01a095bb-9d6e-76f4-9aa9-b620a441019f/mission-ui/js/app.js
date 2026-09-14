@@ -191,9 +191,9 @@ function renderSystem(d) {
   if (d.uptime_s != null) $('sUp').textContent = Math.floor(d.uptime_s / 60) + 'm ' + Math.floor(d.uptime_s % 60) + 's';
 }
 
-function renderFsm(d) {
+function renderFsm(d, via) {
   S.fsm = d;
-  const state = d.state || d.to || '?';
+  const state = (d.state || d.to || d.phase || '?') + (via === 'poll' ? ' (polled)' : '');
   const reason = d.reason || (d.acknowledged && (d.acknowledged.reason || d.acknowledged.by)) || '—';
   $('fsmBadge').textContent = state;
   $('fsmState').textContent = state;
@@ -243,7 +243,7 @@ function onEnvelope(env) {
     case 'system': renderSystem(d); break;
     case 'event': renderEvent(d); break;
     case 'qr': renderQrUpdate(d); log('WARN', 'QR via pi-ws: ' + (d.payload || '?')); break;
-    case 'fsm': renderFsm(d); if (map && (d.phase || d.state || d.to) === 'WAIT_LINK') map.clearCoverage(); break;
+    case 'fsm': renderFsm(d, env.via); if (map && (d.phase || d.state || d.to) === 'WAIT_LINK') map.clearCoverage(); break;
     case 'coverage': if (map) map.setCoverage(d); break;
     case 'log': log(d.level || 'INFO', d.msg || JSON.stringify(d).slice(0, 200)); break;
     default: break; // bridge-owned channels also arrive on WS in mock — ignore, SSE handles them
@@ -484,23 +484,82 @@ function boot() {
   });
 
   // ---- links ----
+  // A successful HTTP probe means the Pi is really there even when the
+  // websocket is not (missing `websockets` extra on the Pi => uvicorn 404s
+  // /ws/telemetry; a proxy that blocks Upgrade; an old server). In that case
+  // the camera tiles and the mission panels must still come up — links.js
+  // polls /api/fsm/status, and we start the tiles from here.
+  let probeCamsAt = 0;
+  function renderPiProbe(res) {
+    const el = $('piHealth');
+    const hint = $('piHint');
+    if (!res) { el.textContent = '—'; return; }
+    if (res.ok) {
+      const h = res.health || {};
+      const bu = h.bringup || {};
+      const bad = Object.keys(bu.state || {}).filter((k) => bu.state[k] === 'failed');
+      el.textContent = 'up ' + res.ms + ' ms · link ' + (h.link ? 'OK' : 'down')
+        + ' · cams ' + (Object.keys(h.cams || {}).join(',') || 'none')
+        + (bu.stage ? (' · ' + bu.stage) : '')
+        + (S.pi.connected ? '' : ' · WS REFUSED');
+      el.style.color = S.pi.connected ? '#5fd97a' : '#ffb020';
+      const last = (bu.errors || []).slice(-1)[0];
+      hint.textContent = bad.length
+        ? ('Pi up but bring-up failed: ' + bad.join(', ') + (last ? ' — ' + last.error : ''))
+        : (S.pi.connected ? 'Pi link healthy.' :
+          ('Pi answers HTTP but the websocket is refused — on the Pi run: '
+           + 'pip install "uvicorn[standard]" and restart mission_pi. '
+           + 'Polling /api/fsm/status meanwhile.'));
+      if (!S.pi.connected && Date.now() - probeCamsAt > 5000) {
+        probeCamsAt = Date.now();
+        probeCameras().then(() => { startAvailableCams(); seedCamControls(); });
+      }
+    } else {
+      el.textContent = 'unreachable (' + res.error + ')';
+      el.style.color = '#ff6b6b';
+      hint.textContent = 'Cannot reach ' + S.piUrl + ' — is mission_pi running '
+        + 'there (python3 main.py --config config.laptop.yaml)? Right IP '
+        + '(hostname -I on the Pi box)? Firewall open (sudo ufw allow 8000/tcp)? '
+        + 'Diagnose: tools/link_doctor.py on the Pi box, or '
+        + 'tools/link_doctor.py --target ' + S.piUrl + ' from here.';
+    }
+  }
+
   pi = window.MissionLinks.initPiLink({
     onStatus: (s) => {
       const was = S.pi.connected;
       S.pi.connected = s.connected;
       $('piWs').textContent = s.connected
-        ? ('open · ' + s.url) : ('down · retry ' + s.retry);
+        ? ('open · ' + s.url)
+        : ('down · retry ' + s.retry + (s.polling ? ' · polling HTTP' : ''));
       setLamp('lampPi', s.connected);
       $('btnPiConnect').textContent = s.connected ? 'disconnect' : 'connect';
       // Fresh Pi (WS open <=> HTTP up, same server): probe the rig, show
       // only real tiles, and (re)start polling against THIS Pi URL — polls
       // bound at boot would otherwise stare at the old base forever.
       if (s.connected && !was) {
+        probeCamsAt = Date.now();
         probeCameras().then(() => { startAvailableCams(); seedCamControls(); });
+        $('piHint').textContent = 'Pi link healthy.';
+        $('piHealth').style.color = '#5fd97a';
       }
     },
+    onProbe: renderPiProbe,
     onEnvelope,
     onLog: log,
+  });
+  $('btnPiProbe').addEventListener('click', () => {
+    let v = $('piUrl').value.trim().replace(/\/$/, '');
+    if (v && !/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(v)) v = 'http://' + v;
+    if (v && v !== S.piUrl) { S.piUrl = v; $('piUrl').value = v; }
+    $('piHealth').textContent = 'probing…';
+    if (!S.piUrl) { log('ERROR', 'no Pi URL to probe'); return; }
+    pi.probe().then((res) => {
+      log(res && res.ok ? 'INFO' : 'ERROR',
+        'pi probe ' + S.piUrl + ': ' + (res && res.ok
+          ? ('HTTP up in ' + res.ms + ' ms' + (res.isPi ? '' : ' (NOT mission_pi!)'))
+          : ('unreachable — ' + (res && res.error))));
+    });
   });
   $('btnPiConnect').addEventListener('click', () => {
     let v = $('piUrl').value.trim().replace(/\/$/, '');

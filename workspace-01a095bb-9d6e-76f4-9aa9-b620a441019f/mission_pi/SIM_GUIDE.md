@@ -24,6 +24,47 @@ NOT proved on the bench:
 * Hailo timing (laptop runs the classical detector — which is the
   right tool here anyway: stock YOLO knows no QR class).
 
+## 0.5 Zero-hardware demo (5 min, no SITL / no camera / no Mission Planner)
+
+Start here when something is broken and you need to know **which side** is
+broken. A fake vehicle stands in for SITL, a folder of PNGs stands in for the
+camera, and the normal bridge/UI run against them — so the whole chain
+(FC link → detect → decode → consensus → `STATUSTEXT` → bridge → UI) is
+exercised with nothing but Python.
+
+```bash
+cd mission_pi
+python3 tools/make_demo_frames.py      # writes demo_frames/*.png (gitignored)
+
+# terminal 1 — fake vehicle: tcp 5760 + 5762 (like SITL) and a udp mirror to
+#              127.0.0.1:14551 (like MP's MAVLink Forwarding)
+python3 tools/fake_sitl.py --udp 127.0.0.1:14551 --auto --loop --no-keys
+
+# terminal 2 — the Pi link, demo config (file camera + tcp:127.0.0.1:5762)
+python3 main.py --config config.demo.yaml
+
+# terminal 3 — UI + bridge (Windows: py -3 bridge\mp_bridge.py --port 8100)
+cd ../mission-ui && python3 bridge/mp_bridge.py --port 8100
+```
+
+Open `http://localhost:8100`. `--auto --loop` flies the mission, "finds" the
+panel, transmits `QR:MISSION-QR-001` and restarts, so the UI should show the
+payload within a minute without anyone touching anything.
+
+Useful while it runs:
+
+```bash
+curl -s localhost:8000/health | python3 -m json.tool   # link/bring-up/fc detail
+curl -s localhost:8000/api/bringup                     # just the bring-up ledger
+curl -s localhost:8100/api/mp/state                    # bridge side + latched QR
+python3 tools/link_doctor.py --target http://localhost:8000
+```
+
+The fake vehicle is also how the FC-link watchdog is tested: kill terminal 1,
+watch `/health` go `"link": false, "fc": {"down": true, "watchdog": true}` with
+`link_lost` in the UI log, restart it and watch `link_restored` +
+`"reconnects": 1`. No EOF flood, no restart of `main.py` needed.
+
 ## 1. Topology
 
 ```
@@ -265,7 +306,14 @@ Kill everything with Ctrl-C (Terminal 1 SITL, Terminal 2 mission).
 | `waf`/prereqs fail | Re-run `install-prereqs-ubuntu.sh -y`, fresh terminal, retry; needs ~5 GB disk |
 | MP "connection failed" on 5760 | SITL listens on all interfaces (verified in source) — it's network/typing: Linux `ss -ltn \| grep 5760` must show LISTEN; `hostname -I` for the WiFi IP (not 127.0.0.1); Windows `ping <ip>` then PowerShell `Test-NetConnection <ip> -Port 5760`; `sudo ufw allow 5760/tcp` if ufw is active; in MP put IP and port in SEPARATE fields |
 | SITL console lacks "SERIAL1 on TCP port 5762" | It appears only AFTER the first 5760 client connects — connect MP first. Fallback: `-A "--serial1=udpclient:127.0.0.1:14555"` + `fc.conn: "udpin:0.0.0.0:14555"` |
-| `[fc] FAIL: no heartbeat` on 5762 | SITL up? (Terminal 1). Port shared/IPC clash: nothing else may hold 5762 |
+| UI says "Pi link: down" but `/health` works in a browser | **`websockets` is not installed.** uvicorn then serves HTTP normally but *silently 404s every WebSocket route* — telemetry socket dead, REST alive. `pip install websockets` (or `uvicorn[standard]`); `main.py` prints a startup warning if it is missing. The UI also falls back to polling `/api/fsm/status` + `/api/qr/status` every 2 s (Pi lamp reads `polling`), so a missing ws lib degrades rather than dies |
+| Nothing at all listens on `:8000` | Old code raised out of `fc.connect()` **before** uvicorn bound, so a missing FC meant a dead port and zero diagnostics. Fixed: the server comes up first, then bring-up runs on its own thread. `GET /health` / `GET /api/bringup` now answer while the FC is still being retried, and say which subsystem failed and why |
+| UI on Windows can't reach `http://<linux-ip>:8000` at all | Same-LAN check first: `hostname -I` on Linux (use that IP, not 127.0.0.1), `ping` + `Test-NetConnection <ip> -Port 8000` from Windows, `sudo ufw allow 8000/tcp`. Then run `python3 tools/link_doctor.py --target http://<linux-ip>:8000` **from the Windows box** (needs Python only) — it reports TCP connect, `/health`, `/api/cameras`, a real WS handshake (101) and how many envelopes arrive. Chrome must be allowed Local Network Access |
+| Fresh clone has no `mission_pi/` | You are on `main`, which predates this work. `git checkout arena/01a0a01d-arena-ai-uploads` — see the repository README |
+| FC link dies when SITL restarts / USB replugs / laptop sleeps | Supervised now: a watchdog notices a stale vehicle heartbeat (>10 s), tears the socket down, re-acquires the device and restarts its threads. Look for `link_lost` / `link_retry` / `link_restored` in the UI log and `"fc": {"down":…, "reconnects":…, "watchdog":true}` in `/health`. Tunables: `fc.dead_s`, `fc.retry_s`, `fc.connect_timeout_s` (0 = retry forever, the UI stays served either way) |
+| Bridge shows MAVLink `connected` but no telemetry / no QR | Check `GET /api/mp/mavlink`: `bad_frames` > 0 means the bytes on that port are not usable MAVLink (wrong port, another service, signed frames); `unknown_ids` > 0 is **normal** (SITL streams VFR_HUD etc. that this bridge does not model). `rx_v1` > 0 means the mirror is MAVLink1 — parsed fine since the codec accepts both, but ArduPilot normally mirrors v2 (`SERIAL_PROTOCOL=2`) |
+| QR payload never reaches the UI even though MP shows `QR:...` | The bridge only latches a payload matching `QR:<payload>` (colon required) — prose like "the QR code was missed" must NOT latch. First payload wins and stays in `GET /api/mp/state` → `qr` even for a UI opened after the fly-past. Verify the route without flying: send a STATUSTEXT to the bridge's udp port and watch `/api/mp/stream` |
+
 | `[cam] none assigned` | `ls /dev/video*`; close apps holding the cam; `device: 1`; video-group perms (§2); `--verbose` |
 | `cv2` import error (libGL) | `sudo apt install libgl1` |
 | `pyzbar` import error | `sudo apt install libzbar0` (decode still works via OpenCV alone, slower) |

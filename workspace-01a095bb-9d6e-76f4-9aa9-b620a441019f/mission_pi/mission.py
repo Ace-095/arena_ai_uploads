@@ -52,6 +52,10 @@ class Mission:
         self.trigger_timeout_s = float(m.get("trigger_timeout_s", 600))
         self.search_timeout_s = float(m.get("search_timeout_s", 600))
         self.approach_timeout_s = float(m.get("approach_timeout_s", 240))
+        # WAIT_LINK budget. main.py brings the FC link up on its own thread
+        # (retrying) while the UI is already served, so this only has to
+        # outlast a slow SITL start / a late MP connection, not a hard fail.
+        self.link_timeout_s = float(m.get("link_timeout_s", 600.0))
         self.min_batt_pct = float(m.get("min_batt_pct", 25))
         self.post_action = str(m.get("post_action", "RTL")).upper()
         self.arrive_m = float(m.get("arrive_m", 2.0))
@@ -89,6 +93,11 @@ class Mission:
         self.stats = {"frames": 0, "cues": 0, "decodes": 0}
         self._search_t0 = None     # search-budget clock (yaw+grid+resweep share it)
         self._speed_par = None     # (name, scale, orig_raw): cruise-speed snapshot to restore
+        # initialised here (not only in reset()) so a fresh Mission and a
+        # reset Mission have identical shape — code can read them unguarded.
+        self._target_last = None   # (ts, lat, lon) of the last guided target
+        self._offmode_n = 0        # consecutive off-mode heartbeat reads
+        self._blob_last_push = 0.0
         b = cfg.get("blob", {})
         self.blob_enabled = bool(b.get("enabled", True))
         self.blob_top_k = int(b.get("top_k", 3))
@@ -228,6 +237,76 @@ class Mission:
                 self.payload = payload
         self._log("WARN", "QR CONFIRMED via %s: %r" % (cam_name, payload))
 
+    def _push_target(self, lat, lon, conf=None, cam=None, box=None,
+                     inside=True):
+        """`target_detected` on the UI contract — the map draws the marker.
+
+        Throttled to one push per 2 s unless the candidate actually moved
+        (>1 m): TRACK ticks at 2 Hz and the UI only needs to see the target
+        travel, not every control cycle.
+        """
+        if lat is None or lon is None:
+            return
+        now = time.time()
+        with self._lock:
+            last = getattr(self, "_target_last", None)
+            if last and (now - last[0]) < 2.0:
+                try:
+                    if geo.haversine_m(last[1], last[2], lat, lon) < 1.0:
+                        return
+                except Exception:
+                    return
+            self._target_last = (now, lat, lon)
+        try:
+            self.hub.push("event", {"type": "target_detected", "lat": lat,
+                                    "lon": lon, "confidence": conf, "cam": cam,
+                                    "bbox": box, "inside_fence": bool(inside),
+                                    "phase": self.phase})
+        except Exception:
+            pass
+
+    def stop(self):
+        """Ask every loop to wind down (called on shutdown)."""
+        self._abort.set()
+        self._stop.set()
+
+    def reset(self):
+        """Clear per-run state so `run()` can be called again in the same
+        process (bench re-runs, and the auto-restart after a no-link
+        FAILSAFE). Threads/objects owned elsewhere (fc, rig, detector, hub,
+        store) are deliberately kept."""
+        with self._lock:
+            self.phase, self.detail = "BOOT", "reset"
+            self.home = None
+            self.fence = []
+            self.plan = []
+            self.sprayer_seqs = []
+            self.payload = None
+            self._cue = None
+            self._cue_hits = 0
+            self._advancing = False
+            self._target_last = None
+            self._workers = []
+            self._search_t0 = None
+            self._speed_par = None
+            self._offmode_n = 0
+            self.stats = {"frames": 0, "cues": 0, "decodes": 0}
+            self._cov = set()
+            self._cov_hot = set()
+            self._cov_last_push = 0.0
+            self._blob_obs = []
+            self._blob_last_push = 0.0
+            self._blob_last_obs = 0.0
+            self._t_phase = time.time()
+        try:
+            self._consensus.reset()
+        except Exception:
+            pass
+        self._stop.clear()
+        self._takeover.clear()
+        self._abort.clear()
+        log.info("mission state reset — ready for another run")
+
     def _fresh_cue(self, max_age=2.0, facing=None):
         with self._lock:
             if not self._cue or time.time() - self._cue[5] > max_age:
@@ -309,11 +388,17 @@ class Mission:
         self._cov_last_push = 0.0
         # WAIT_LINK
         self._set_phase("WAIT_LINK", "waiting for FC heartbeat")
-        t0 = time.time()
+        t0, next_note = time.time(), 15.0
         while not self.fc.link_ok():
-            if time.time() - t0 > 60 or self._abort.is_set():
+            waited = time.time() - t0
+            if waited > self.link_timeout_s or self._abort.is_set():
                 self._set_phase("FAILSAFE", "no FC link")
                 return
+            if waited > next_note:
+                next_note += 15.0
+                self._log("WARN", "still no FC heartbeat after %.0fs — the UI "
+                                  "link stays up; SITL/Gazebo + MP must be "
+                                  "connected first (see SIM_GUIDE.md §6)" % waited)
             time.sleep(0.5)
         # SNAPSHOT (while still in AUTO — home + fence + plan + sprayer)
         self._set_phase("SNAPSHOT", "reading home / fence / plan")
@@ -355,6 +440,16 @@ class Mission:
                 sorted(self.trigger_cmds), fb))
         else:
             self._log("INFO", "sprayer seqs: %s" % (self.sprayer_seqs,))
+        # contract event: the UI logs the plan the Pi actually sees
+        try:
+            self.hub.push("event", {
+                "type": "plan_synced", "items": len(self.plan or []),
+                "trigger_seq": (self.sprayer_seqs[0] if self.sprayer_seqs
+                                else None),
+                "fence_verts": len(self.fence or []),
+                "home": list(self.home) if self.home else None})
+        except Exception:
+            pass
         # snapshot cruise speed so the search can fly search_speed_ms and
         # hand the FC back exactly as found (best-effort; a dead param
         # channel must not brick the mission).
@@ -904,6 +999,8 @@ class Mission:
                 ex0, ny0 = geo.latlon_to_enu(pos["lat"], pos["lon"], olat, olon)
                 tlat, tlon = geo.enu_to_latlon(ex0 + ex, ny0 + ny, olat, olon)
                 tlat, tlon, inside = self._clamp_to_fence(tlat, tlon, pos["lat"], pos["lon"])
+                self._push_target(tlat, tlon, cam=cam_name,
+                                  box=[x, y, w, h], inside=inside)
                 if not inside:
                     self._log("WARN", "cue projects outside fence — holding")
                     time.sleep(1.0)

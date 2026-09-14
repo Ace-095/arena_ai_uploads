@@ -32,8 +32,56 @@ python3 bridge/mp_bridge.py --mock --origin 15.3647,75.1240
 2. **Bridge**: `python3 bridge/mp_bridge.py [--port 8100] [--mav-port 14551]
    [--watch "C:\path\to\MP log"] [--mbtiles venue.mbtiles]`.
 3. **UI**: open `http://127.0.0.1:8100`, paste the Pi URL (`http://<pi-ip>:8000`)
-   → connect. Draw fence → *APPLY FENCE → MP* → confirm the polygon in MP's
-   Fence tab before flight.
+   → connect (or press **Probe** — see below). Draw fence → *APPLY FENCE → MP* →
+   confirm the polygon in MP's Fence tab before flight.
+
+### Pi link: probe, then fall back instead of failing
+
+The Pi link has three layers, and the UI reports which one it is on rather than
+showing a bare red lamp:
+
+1. **Probe** (`btnPiProbe` in the Pi-link box) — does an HTTP `GET /health`
+   against the URL you typed and prints what actually happened: DNS/TCP failure,
+   HTTP status, `link`, `ready`, the bring-up `stage` and any `errors[]`, plus
+   the LAN URLs the Pi itself suggests. This is the difference between "the Pi
+   is down" and "the Pi is up but has no flight controller".
+2. **WebSocket** `ws://<pi-ip>:8000/ws/telemetry` — the normal path (envelopes
+   `{channel, t, data}`: `system`, `fsm`, `mission`, `qr`, `coverage`, `log`,
+   `event`, `telemetry`). On connect the Pi replays the latest envelope per
+   channel, so a UI opened mid-flight is immediately correct.
+3. **Polling fallback** — if the socket never opens (uvicorn installed without
+   `websockets`/`wsproto` *silently 404s WebSocket routes* while HTTP works
+   fine; or a proxy strips `Upgrade`), `links.js` polls `/api/fsm/status` + `/api/qr/status` every 2 s and the
+   Pi lamp reads `polling` instead of `down`. Slower, but the mission is still
+   visible.
+
+The `system` channel carries the Pi's own health (host, temps, cpu/mem/disk,
+bring-up state) so a failing Pi is diagnosable from the Windows side without
+SSH.
+
+### QR payload: first one wins, and it is remembered
+
+Four independent routes can deliver the payload (Pi WS `qr`, MAVLink
+`STATUSTEXT`, MP log tail, manual entry). Two rules the UI relies on:
+
+* The bridge matches **`QR:<payload>`** — the colon is required, up to 32 chars
+  of `[A-Za-z0-9._+-]`. Prose such as "the QR code was missed" or the Pi's own
+  "QR CONFIRMED via bottom: 'X'" log line must **not** produce a payload; with
+  latching, one false positive would poison the whole hunt.
+* The **first** payload is latched and stays in `GET /api/mp/state` → `qr`, so a
+  UI opened *after* the fly-past still shows the result. Later payloads still
+  stream as `mp-qr` events to whoever is watching.
+
+### MAVLink 1 and 2
+
+The bridge's frozen codec (`bridge/_mavlink_v2.py`) **parses both** wire
+versions on input and sends v2. MP mirrors whatever the vehicle speaks, so a
+link on `SERIAL_PROTOCOL=1` (or older firmware) still delivers telemetry and
+the QR `STATUSTEXT`. `GET /api/mp/mavlink` reports `rx_v1` / `rx_v2` /
+`rx_bad_crc` / `bad_frames` (unusable bytes) separately from `unknown_ids`
+(well-formed frames for message ids this bridge does not model — normal: SITL
+streams VFR_HUD and friends all day).
+
 
 ## Offline map pack (laptop is offline in the field)
 
@@ -52,9 +100,16 @@ coverage; the UI defaults to the offline pack and falls back to OSM/Carto.
 ```bash
 python3 -m py_compile bridge/*.py tools/*.py
 /path/to/venv/bin/python tests/test_mavcodec.py   # 23/23 byte-identical
+python3 tests/test_mavv1.py       # MAVLink1 + MAVLink2 parsing, drop reasons
+python3 tests/test_qrlatch.py     # QR regex (payloads in, prose out) + latch
 python3 bridge/mp_bridge.py --selftest            # SELFTEST PASS
 node --check js/app.js js/map.js js/links.js js/camera.js
+for t in tests/*.py; do python3 "$t" || echo "FAILED $t"; done
 ```
+
+All of them are stdlib-only and need no hardware; the pymavlink cross-checks
+inside `test_mavcodec.py` / `test_mavv1.py` skip themselves where pymavlink is
+not installed (the field laptop).
 
 ## Repo map
 

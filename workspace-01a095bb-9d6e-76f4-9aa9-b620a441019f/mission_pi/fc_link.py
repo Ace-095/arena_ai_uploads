@@ -114,6 +114,13 @@ def find_fc(bauds=(115200, 57600, 921600), hb_timeout=3.0, device=None):
                           source_component=mavutil.mavlink.MAV_COMP_ID_ONBOARD_COMPUTER)
                 if baud is not None:
                     kw["baud"] = baud
+                if _is_network_device(dev):
+                    # SITL/Gazebo restarts and laptop sleep/wake drop the TCP
+                    # socket; pymavlink's own autoreconnect puts it back
+                    # without us rebuilding the whole connection (our watchdog
+                    # below is the second line of defence, and the only one
+                    # that works for a USB replug).
+                    kw["autoreconnect"] = True
                 conn = mavutil.mavlink_connection(dev, **kw)
             except Exception as e:
                 errors.append("%s@%s: %s" % (dev, baud, e))
@@ -156,29 +163,165 @@ class FCLink:
         self._subs = {}
         self._subs_lock = threading.Lock()
         self._send_lock = threading.Lock()
+        self._conn_lock = threading.RLock()
         self._stop = threading.Event()
         self._reader = None
         self._hb_thread = None
         self._stream_thread = None
+        # link supervision (a dead USB/TCP link must not leave us deaf forever)
+        self.link_down = False
+        self.reconnects = 0
+        self._watchdog = None
+        self._wd_stop = threading.Event()
+        self._wd_dead_s = 10.0
+        self._wd_retry_s = 5.0
+        self._on_event = None
+        self._bauds = (115200, 57600, 921600)
 
     # -- lifecycle ------------------------------------------------------
-    def connect(self, device=None, bauds=(115200, 57600, 921600)):
+    def connect(self, device=None, bauds=(115200, 57600, 921600),
+                supervise=True, on_event=None, dead_s=10.0, retry_s=5.0):
+        """Acquire the FC and (by default) supervise it forever after.
+
+        supervise: a watchdog thread notices a missing vehicle heartbeat and
+        rebuilds the connection, so a USB replug, an SITL restart or a radio
+        drop recovers on its own instead of leaving mission_pi permanently
+        deaf (which used to look like "the mission just stopped working").
+        on_event(kind, detail) is called for link_lost / link_retry /
+        link_restored — main.py forwards those to the UI log.
+        """
         _require_pymavlink()
-        conn, dev = find_fc(bauds=bauds, device=device)
-        self.conn = conn
-        self.device = dev
-        self.target_system = conn.target_system or 1
-        self.target_component = conn.target_component or 1
-        self._stop.clear()
-        self._reader = threading.Thread(target=self._read_loop, name="fc-reader", daemon=True)
-        self._reader.start()
-        self._hb_thread = threading.Thread(target=self._hb_loop, name="fc-hb", daemon=True)
-        self._hb_thread.start()
-        self._stream_thread = threading.Thread(target=self._stream_loop, name="fc-streams", daemon=True)
-        self._stream_thread.start()
+        self._bauds = tuple(bauds or (115200, 57600, 921600))
+        if device:
+            # publish the intended device immediately: while find_fc is
+            # failing, /health must say WHAT we are trying to reach instead
+            # of showing device=None (which reads as "not configured").
+            self.device = device
+        conn, dev = find_fc(bauds=self._bauds, device=device)
+        self._adopt(conn, dev)
+        if supervise:
+            self.start_watchdog(dead_s=dead_s, retry_s=retry_s,
+                                on_event=on_event)
         return dev
 
+    def _adopt(self, conn, dev):
+        """Install a fresh connection and (re)start the three link threads."""
+        with self._conn_lock:
+            self.conn = conn
+            self.device = dev
+            self.target_system = conn.target_system or 1
+            self.target_component = conn.target_component or 1
+            self.last_hb = time.time()      # find_fc just saw a heartbeat
+            self.link_down = False
+            self._stop.clear()
+            self._reader = threading.Thread(target=self._read_loop,
+                                            name="fc-reader", daemon=True)
+            self._reader.start()
+            self._hb_thread = threading.Thread(target=self._hb_loop,
+                                               name="fc-hb", daemon=True)
+            self._hb_thread.start()
+            self._stream_thread = threading.Thread(target=self._stream_loop,
+                                                   name="fc-streams", daemon=True)
+            self._stream_thread.start()
+
+    def _teardown(self):
+        """Stop the link threads and drop the socket (used by reconnect)."""
+        self._stop.set()
+        for t in (self._reader, self._hb_thread, self._stream_thread):
+            if t and t.is_alive() and t is not threading.current_thread():
+                t.join(timeout=1.5)
+        self._reader = self._hb_thread = self._stream_thread = None
+        with self._conn_lock:
+            conn, self.conn = self.conn, None
+        try:
+            conn and conn.close()
+        except Exception:
+            pass
+
+    def reconnect(self):
+        """Drop and re-acquire the FC on the same device. Raises on failure."""
+        _require_pymavlink()
+        self._teardown()
+        conn, dev = find_fc(bauds=self._bauds, device=self.device)
+        self._adopt(conn, dev)
+        self.reconnects += 1
+        log.warning("FC link re-established on %s (reconnect #%d)", dev,
+                    self.reconnects)
+        return dev
+
+    # -- link supervision ------------------------------------------------
+    def start_watchdog(self, dead_s=10.0, retry_s=5.0, on_event=None):
+        if on_event is not None:
+            self._on_event = on_event
+        self._wd_dead_s = max(3.0, float(dead_s))
+        self._wd_retry_s = max(1.0, float(retry_s))
+        if self._watchdog is not None and self._watchdog.is_alive():
+            return
+        self._wd_stop.clear()
+        self._watchdog = threading.Thread(target=self._watch_loop,
+                                          name="fc-watchdog", daemon=True)
+        self._watchdog.start()
+        log.info("FC watchdog up (dead after %.0fs, retry every %.0fs)",
+                 self._wd_dead_s, self._wd_retry_s)
+
+    def stop_watchdog(self):
+        self._wd_stop.set()
+        t = self._watchdog
+        if t is not None and t.is_alive() and t is not threading.current_thread():
+            t.join(timeout=2.0)
+        self._watchdog = None
+
+    def _event(self, kind, detail):
+        log.warning("fc link %s: %s", kind, detail)
+        cb = self._on_event
+        if cb is None:
+            return
+        try:
+            cb(kind, detail)
+        except Exception:
+            pass
+
+    def _watch_loop(self):
+        down_since = None
+        while not self._wd_stop.wait(self._wd_retry_s):
+            hb_age = (time.time() - self.last_hb) if self.last_hb else float("inf")
+            alive = (self.conn is not None) and hb_age < self._wd_dead_s
+            if alive:
+                if down_since is not None:
+                    self.link_down = False
+                    self._event("link_restored", "vehicle heartbeat is back "
+                                                 "(%.1fs old)" % hb_age)
+                    down_since = None
+                continue
+            if down_since is None:
+                down_since = time.time()
+                self.link_down = True
+                self._event("link_lost", "no vehicle heartbeat for %.0fs on %s "
+                                         "— reconnecting" % (hb_age, self.device))
+                continue
+            try:
+                dev = self.reconnect()
+                down_since = None
+                self._event("link_restored", "reconnected to %s (#%d)"
+                            % (dev, self.reconnects))
+            except Exception as e:
+                self._event("link_retry", "reconnect failed: %s" % e)
+
+    def link_state(self):
+        """JSON-safe link summary for /health and the UI."""
+        return {"device": self.device,
+                "connected": self.conn is not None,
+                "down": bool(self.link_down),
+                "reconnects": int(self.reconnects),
+                "hb_age_s": (round(time.time() - self.last_hb, 1)
+                             if self.last_hb else None),
+                "mode": self.mode, "armed": bool(self.armed),
+                "veh_sysid": self.veh_sysid,
+                "watchdog": bool(self._watchdog is not None
+                                 and self._watchdog.is_alive())}
+
     def close(self):
+        self.stop_watchdog()
         self._stop.set()
         for t in (self._reader, self._hb_thread, self._stream_thread):
             if t:
@@ -231,14 +374,27 @@ class FCLink:
             fn(*a, **k)
 
     def _read_loop(self):
+        quiet = 0
         while not self._stop.is_set():
+            conn = self.conn
+            if conn is None:                 # swapped out by a reconnect
+                time.sleep(0.2)
+                continue
             try:
-                m = self.conn.recv_match(blocking=True, timeout=0.3)
+                m = conn.recv_match(blocking=True, timeout=0.3)
             except Exception:
-                time.sleep(0.1)
+                quiet += 1
+                # A dead TCP socket makes pymavlink raise/EOF in a tight loop
+                # (it prints "EOF on TCP socket" per read). Back off so the
+                # watchdog can work in peace and the log stays readable.
+                time.sleep(min(2.0, 0.2 * quiet))
                 continue
             if m is None:
+                quiet += 1
+                if quiet > 20:
+                    time.sleep(min(2.0, 0.1 * (quiet // 20)))
                 continue
+            quiet = 0
             t = m.get_type()
             if t == "HEARTBEAT" and m.get_srcSystem() != 51:
                 try:

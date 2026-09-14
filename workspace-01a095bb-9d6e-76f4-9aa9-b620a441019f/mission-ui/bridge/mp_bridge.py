@@ -43,7 +43,19 @@ import sys
 import threading
 import time
 
-QR_RE = re.compile(r"QR[:\s]+([0-9A-Za-z]{1,6})\b")
+# QR catcher. Widened 2026-09-14: the old [0-9A-Za-z]{1,6} silently dropped
+# any real payload with a dash or more than 6 chars ("QR:MISSION-QR-001" —
+# the payload every doc/sim texture in this repo uses), so the MAVLink and
+# MP-log routes never latched while the Pi WS route did. Keep it anchored on
+# the literal "QR:" and a conservative charset (alnum + . _ + -) so a random
+# STATUSTEXT still cannot fake a result.
+# Canonical wire format is `QR:<payload>` (see mission_pi/qr_relay.py, which
+# truncates to the 50-char STATUSTEXT limit). The colon is REQUIRED: a bare
+# `QR[\s:]` also matched ordinary prose — "the QR code was missed" latched
+# payload "code", and the Pi's own "QR CONFIRMED via bottom: 'X'" log line
+# latched "CONFIRMED". With first-payload-wins latching, one false positive
+# poisons the whole hunt, so the pattern stays strict.
+QR_RE = re.compile(r"QR\s*:\s*([0-9A-Za-z][0-9A-Za-z._+-]{0,31})")
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # mission-ui/
 STATIC_TYPES = {
@@ -68,7 +80,11 @@ def ws_servable(path, mock):
     return bool(mock) and path in WS_PATHS
 
 # channels the PI owns over its WS (v2: telemetry/fence are bridge-owned now)
-PI_CHANNELS = ("system", "event", "qr", "fsm", "log")
+# Pi WS channels the bridge caches for replay: a UI opened mid-flight gets the
+# latest envelope per channel immediately instead of waiting for the next push
+# (coverage only re-pushes every few seconds, and the grid is the thing the
+# operator is looking at when they open the page).
+PI_CHANNELS = ("system", "event", "qr", "fsm", "log", "coverage")
 
 MOCK_ORIGIN = (15.3697, 75.1235)   # Hubballi — demo origin only, NOT a venue
 MOCK_PAYLOAD = "42"                 # 2-digit payload (confirmed spec)
@@ -125,6 +141,7 @@ class Hub:
         self.clients = {}          # id -> {"kind": "sse"|"ws", "writer": w}
         self.lock = asyncio.Lock()
         self.latest = {}           # latest envelope per Pi channel (WS replay)
+        self.qr = None             # first QR latched from ANY route
 
     async def add(self, kind, writer):
         cid = id(writer)
@@ -148,6 +165,17 @@ class Hub:
             pass
 
     async def _emit_now(self, event, data):
+        if event == "mp-qr" and isinstance(data, dict) and data.get("payload"):
+            # Latch the FIRST payload from any of the 4 routes (pi-ws, mavlink
+            # STATUSTEXT, MP-log tail, manual). Without this the QR only ever
+            # existed as a live SSE event: a UI opened AFTER the fly-past saw
+            # `qr: null` in bridge-state and reported nothing, even though the
+            # bridge had already caught it. First payload wins, per the UI
+            # invariant; later ones still stream to whoever is watching.
+            if self.qr is None:
+                self.qr = {"payload": data["payload"], "source": data.get("source"),
+                           "ts": data.get("ts", time.time()),
+                           "line": data.get("line", "")}
         sse_frame = _sse_chunk(event, data)
         env = {"channel": event, "t": time.time(), "data": data}
         if event in PI_CHANNELS:
@@ -806,7 +834,7 @@ class Server:
     def bridge_state(self):
         st = {
             "watching": list(self.tailer.watch),
-            "qr": self.bridge["qr"],
+            "qr": self.bridge["qr"] or self.hub.qr,
             "bin_parser_available": HAVE_DFR,
             "mock": bool(self.args.mock),
             "mavlink": {"connected": bool(self.mav and self.mav.connected),

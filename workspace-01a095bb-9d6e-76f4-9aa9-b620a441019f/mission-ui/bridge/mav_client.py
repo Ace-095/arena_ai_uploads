@@ -34,7 +34,19 @@ import time
 
 import _mavlink_v2 as M
 
-QR_RE = re.compile(r"QR[:\s]+([0-9A-Za-z]{1,6})\b")
+# QR catcher. Widened 2026-09-14: the old [0-9A-Za-z]{1,6} silently dropped
+# any real payload with a dash or more than 6 chars ("QR:MISSION-QR-001" —
+# the payload every doc/sim texture in this repo uses), so the MAVLink and
+# MP-log routes never latched while the Pi WS route did. Keep it anchored on
+# the literal "QR:" and a conservative charset (alnum + . _ + -) so a random
+# STATUSTEXT still cannot fake a result.
+# Canonical wire format is `QR:<payload>` (see mission_pi/qr_relay.py, which
+# truncates to the 50-char STATUSTEXT limit). The colon is REQUIRED: a bare
+# `QR[\s:]` also matched ordinary prose — "the QR code was missed" latched
+# payload "code", and the Pi's own "QR CONFIRMED via bottom: 'X'" log line
+# latched "CONFIRMED". With first-payload-wins latching, one false positive
+# poisons the whole hunt, so the pattern stays strict.
+QR_RE = re.compile(r"QR\s*:\s*([0-9A-Za-z][0-9A-Za-z._+-]{0,31})")
 
 EARTH_RADIUS_M = 6371000.0
 
@@ -137,6 +149,11 @@ class MavClient:
 
         self.rx_msgs = 0
         self.tx_msgs = 0
+        self.bad_frames = 0           # datagrams that are not usable MAVLink
+        self.unknown_ids = 0          # well-formed frames whose message id this
+                                      # bridge does not model (VFR_HUD, etc.)
+        self._parse_warned = False    # one-shot "nothing parses" warning
+        self._v1_noted = False        # one-shot MAVLink1 notice
         self.rx_rate = 0.0
         self._last_ack_src = {}
         self.sender_changes = 0
@@ -308,7 +325,34 @@ class MavClient:
                 continue
             parsed = M.parse_datagram(data)
             if parsed is None:
+                if M.LAST_DROP == "unknown_id":
+                    # Expected, not a fault: SITL/ArduPilot streams messages
+                    # this bridge does not model (VFR_HUD, SCALED_IMU2, ...).
+                    # Counting those as "bad" made a healthy link look ~25%
+                    # broken and hid the failures that actually matter.
+                    self.unknown_ids += 1
+                    continue
+                # bytes are arriving but no frame parses: wrong port, a
+                # non-MAVLink service, signed frames or a dialect we lack.
+                # Counted and reported once — silence here is how a hunt ends
+                # with "connected" lamps and no data.
+                self.bad_frames += 1
+                if not self._parse_warned and self.bad_frames >= 25 \
+                        and self.rx_msgs == 0:
+                    self._parse_warned = True
+                    self.hub.emit_threadsafe("log", {"level": "ERROR", "msg": (
+                        "%d datagrams on port %d carried no parseable MAVLink "
+                        "frame and nothing valid has arrived — is MP forwarding "
+                        "to this port? parser stats: %s"
+                        % (self.bad_frames, self.port, M.PARSE_STATS))})
                 continue
+            if not self._v1_noted and M.PARSE_STATS["v1"]:
+                self._v1_noted = True
+                self.hub.emit_threadsafe("log", {"level": "INFO", "msg": (
+                    "receiving MAVLink1 frames on port %d (parsed fine). "
+                    "ArduPilot normally mirrors MAVLink2 — check "
+                    "SERIAL_PROTOCOL if telemetry looks partial."
+                    % self.port)})
             msgid, src_sys, _src_comp, _seq, fields = parsed
             self.rx_msgs += 1
             self._rx_window += 1
@@ -504,6 +548,12 @@ class MavClient:
             "hb_age_s": round(time.time() - self.last_hb, 2) if self.last_hb else None,
             "rx_msgs": self.rx_msgs,
             "rx_rate": round(self.rx_rate, 1),
+            "rx_v2": M.PARSE_STATS["v2"],
+            "rx_v1": M.PARSE_STATS["v1"],
+            "rx_bad_crc": M.PARSE_STATS["bad_crc"],
+            "rx_signed_dropped": M.PARSE_STATS["signed_dropped"],
+            "bad_frames": self.bad_frames,
+            "unknown_ids": self.unknown_ids,
             "fence": self.fence_status,
             "plan": self.plan,
         }

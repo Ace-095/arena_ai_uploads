@@ -7,6 +7,11 @@ numpy>=1.24
 pyyaml>=6.0
 fastapi>=0.100
 uvicorn[standard]>=0.23
+# The [standard] extra above is what pulls in a websocket implementation.
+# Without one, uvicorn answers /ws/telemetry with a bare 404: HTTP and the
+# camera tiles keep working while the UI's PI lamp stays red forever. Listed
+# explicitly so a plain `pip install uvicorn` cannot silently break the link.
+websockets>=10.4
 #
 # VISION (Pi 5, flight): prefer apt on Pi OS, pip elsewhere.
 #   sudo apt install -y python3-opencv python3-picamera2 zbar-tools

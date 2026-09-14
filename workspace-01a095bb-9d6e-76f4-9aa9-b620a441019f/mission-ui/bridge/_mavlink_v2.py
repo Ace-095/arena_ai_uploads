@@ -12,8 +12,15 @@ Design notes
 ------------
 * UDP transport here is one frame per datagram (the MAVLink-over-UDP
   convention used by Mission Planner forwarding). parse_datagram() scans
-  for the first 0xFD and verifies the CRC; bad datagrams are dropped,
+  for a frame start and verifies the CRC; bad datagrams are dropped,
   never fatal.
+* BOTH wire versions are accepted on input: MAVLink 2 (magic 0xFD) and
+  MAVLink 1 (magic 0xFE). We only ever SEND v2, but MP mirrors whatever the
+  vehicle speaks, and a link on SERIAL_PROTOCOL=1 (or older firmware) sends
+  v1. A v2-only parser dropped every such frame silently — telemetry looked
+  half-alive and the STATUSTEXT carrying the QR payload never arrived, which
+  on the bench reads as "the bridge is connected but the hunt found nothing".
+  PARSE_STATS below makes any drop visible instead of silent.
 * Message values are plain dicts keyed by field name (wire order handled
   internally). char[N] fields are bytes; uint16_t[N] etc. are tuples.
 * We never sign messages and never accept signing (incompat-flag check) —
@@ -27,9 +34,30 @@ from _mavtable_gen import TABLE, ID_TO_NAME
 _ARRAY_RE = re.compile(r"^(\d+)([a-zA-Z])$")
 
 STX_V2 = 0xFD
+STX_V1 = 0xFE
 HEADER_FMT = "<BBBBBBBHB"   # magic, len, iflag, cflag, seq, sysid, compid, msgid(3)
 HEADER_LEN = 10
+HEADER_V1_FMT = "<BBBBBB"   # magic, len, seq, sysid, compid, msgid(1)
+HEADER_V1_LEN = 6
 MAX_PAYLOAD = 255
+
+# Parse diagnostics — surfaced by mav_client.state_dict() at /api/mp/mavlink so
+# a link that delivers bytes but no usable frames is explainable from the UI.
+PARSE_STATS = {"v2": 0, "v1": 0, "bad_crc": 0, "unknown_id": 0,
+               "signed_dropped": 0, "truncated": 0, "no_magic": 0,
+               "short_header": 0, "bad_length": 0, "no_frame": 0}
+
+# Why the most recent parse_datagram() returned None. Callers must be able to
+# tell "a message id this bridge does not model" (expected, forward-compatible
+# — SITL streams VFR_HUD etc. all day) from "the bytes are not MAVLink" (a real
+# problem: wrong port, another service, corrupt mirror). Lumping them together
+# made a healthy link look 25% broken.
+LAST_DROP = None
+
+
+def _drop(reason):
+    PARSE_STATS[reason] = PARSE_STATS.get(reason, 0) + 1
+    return reason
 
 
 def crc16(data: bytes) -> int:
@@ -91,35 +119,79 @@ def build_frame(msgid: int, sysid: int, compid: int, seq: int, values: dict) -> 
 
 
 def parse_datagram(data: bytes):
-    """Parse (up to) one frame from a UDP datagram.
-    Returns (msgid, sysid, compid, seq, fields) or None if no valid frame."""
-    i = data.find(bytes([STX_V2]))
-    if i < 0 or i + HEADER_LEN > len(data):
+    """Parse (up to) one frame from a UDP datagram, MAVLink v2 or v1.
+    Returns (msgid, sysid, compid, seq, fields) or None if no valid frame.
+
+    Fields are returned in the v2 layout: v1 frames carry no extension
+    fields, so those come back as zeros (e.g. STATUSTEXT.id/chunk_seq).
+    """
+    global LAST_DROP
+    i2 = data.find(bytes([STX_V2]))
+    i1 = data.find(bytes([STX_V1]))
+    if i2 < 0 and i1 < 0:
+        LAST_DROP = _drop("no_magic")
         return None
-    (magic, ln, iflag, _cflag, seq, sysid, compid,
-     m16, mhi) = struct.unpack_from(HEADER_FMT, data, i)
-    if iflag & 0x01:          # signing — not supported, drop
+    # try each candidate start in order of appearance: a datagram may be
+    # prefixed with garbage, and a 0xFD inside a payload must not win over a
+    # real frame that starts earlier.
+    reason = None
+    for i in sorted(x for x in (i2, i1) if x >= 0):
+        got = _parse_at(data, i)
+        if isinstance(got, tuple):
+            LAST_DROP = None
+            return got
+        if reason is None:
+            # report the FIRST candidate's verdict: the earliest magic byte is
+            # the intended frame start, so its reason is the honest one. (A
+            # corrupted v1 frame also contains a 0xFD msgid byte, and reporting
+            # that bogus candidate's verdict read as "signed frames dropped".)
+            reason = got
+    LAST_DROP = reason or "no_frame"
+    return None
+
+
+def _parse_at(data: bytes, i: int):
+    """Parse one frame starting at data[i]; None if it is not a valid frame."""
+    magic = data[i]
+    if magic == STX_V2:
+        hlen = HEADER_LEN
+        if i + hlen > len(data):
+            return _drop("short_header")
+        (_mg, ln, iflag, _cflag, seq, sysid, compid,
+         m16, mhi) = struct.unpack_from(HEADER_FMT, data, i)
+        if iflag & 0x01:      # signing — not supported, drop
+            return _drop("signed_dropped")
+        msgid = m16 | (mhi << 16)
+    elif magic == STX_V1:
+        hlen = HEADER_V1_LEN
+        if i + hlen > len(data):
+            return _drop("short_header")
+        _mg, ln, seq, sysid, compid, m8 = struct.unpack_from(HEADER_V1_FMT,
+                                                             data, i)
+        msgid = m8            # v1 message ids are one byte (< 256)
+    else:
         return None
     if ln > MAX_PAYLOAD:
-        return None
-    msgid = m16 | (mhi << 16)
+        return _drop("bad_length")
     entry = TABLE.get(msgid)
     if entry is None:
-        return None           # unknown message id — ignore (forward compat)
-    total = HEADER_LEN + ln + 2
+        return _drop("unknown_id")   # not modelled here — ignore (fwd compat)
+    total = hlen + ln + 2
     if i + total > len(data):
-        return None
+        return _drop("truncated")
     frame = data[i:i + total]
-    crc_in = struct.unpack_from("<H", frame, HEADER_LEN + ln)[0]
-    if crc16(frame[1:HEADER_LEN + ln] + bytes([entry[1]])) != crc_in:
-        return None           # CRC mismatch — corrupt / wrong dialect
-    # The payload may be trailing-zero-stripped (valid MAVLink v2); re-pad to
-    # the full field layout before unpacking. Reject frames claiming more
-    # payload bytes than the message definition allows.
+    crc_in = struct.unpack_from("<H", frame, hlen + ln)[0]
+    # the CRC covers everything after the magic byte, plus the message's
+    # CRC_EXTRA signature — identical rule in v1 and v2.
+    if crc16(frame[1:hlen + ln] + bytes([entry[1]])) != crc_in:
+        return _drop("bad_crc")      # corrupt, or a dialect we do not have
+    # A v2 payload may be trailing-zero-stripped, and a v1 payload is short by
+    # the v2 extension fields; re-pad to the full field layout before
+    # unpacking. Reject frames claiming more payload than the definition allows.
     full_len = sum(struct.calcsize("<" + fc) for _f, fc in entry[2])
     if ln > full_len:
-        return None
-    payload = frame[HEADER_LEN:HEADER_LEN + ln] + b"\x00" * (full_len - ln)
+        return _drop("bad_length")
+    payload = frame[hlen:hlen + ln] + b"\x00" * (full_len - ln)
     fields = {}
     off = 0
     for field, fchar in entry[2]:
@@ -130,7 +202,8 @@ def parse_datagram(data: bytes):
             val = struct.unpack_from("<" + fchar, payload, off)[0]
         fields[field] = val
         off += struct.calcsize("<" + fchar)
-    return msgid, sysid, compid, seq, fields
+    PARSE_STATS["v2" if magic == STX_V2 else "v1"] += 1
+    return (msgid, sysid, compid, seq, fields)
 
 
 # ---------------------------------------------------------------------------

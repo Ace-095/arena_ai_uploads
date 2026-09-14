@@ -121,6 +121,27 @@ class StreamManager:
         self.streams = {name: CamStream(cam, fps, width, quality)
                         for name, cam in cams.items()}
 
+    def sync(self, rig):
+        """Adopt cameras discovered after construction.
+
+        main.py builds the StreamManager BEFORE the cameras are detected (the
+        HTTP server has to come up first), so `self.streams` starts empty.
+        Idempotent: existing streams are kept, new cams get one, cams that
+        vanished are stopped and dropped. Returns the current stream count.
+        """
+        cams = getattr(rig, "cams", None) or {}
+        for name in [n for n in self.streams if n not in cams]:
+            try:
+                self.streams[name].stop()
+            except Exception:
+                pass
+            self.streams.pop(name, None)
+        for name, cam in cams.items():
+            if name not in self.streams:
+                self.streams[name] = CamStream(cam, self.fps, self.width,
+                                               self.quality)
+        return len(self.streams)
+
     def describe(self):
         return "%dfps %dw q%d x%d" % (self.fps, self.width, self.quality,
                                       len(self.streams))

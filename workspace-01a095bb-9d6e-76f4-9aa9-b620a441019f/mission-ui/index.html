@@ -45,12 +45,14 @@
     <div class="card" id="cardPi">
       <h2>PI LINK <span class="hint-inline">(receive-only)</span></h2>
       <div class="kv"><span>ws status</span><b id="piWs">—</b></div>
+      <div class="kv"><span>http probe</span><b id="piHealth">—</b></div>
       <div class="kv"><span>mode</span><b id="piMode">—</b></div>
       <div class="row wrap">
         <input id="piUrl" class="grow" placeholder="http://<pi-ip>:8000">
         <button id="btnPiConnect" class="btn small">connect</button>
+        <button id="btnPiProbe" class="btn small" title="HTTP check of /health — says why the socket will not open">probe</button>
       </div>
-      <p class="hint">UI only reads Pi mission/fsm/system events. Fence + flight go via the MP link; only camera tuning is pushed to the Pi (no MAVLink path exists for it).</p>
+      <p class="hint" id="piHint">Paste the URL mission_pi prints on startup (http://&lt;pi-ip&gt;:8000). UI only reads Pi mission/fsm/system events; fence + flight go via the MP link, camera tuning is the only write.</p>
     </div>
 
     <div class="card" id="cardFsm">
