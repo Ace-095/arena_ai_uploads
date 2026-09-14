@@ -159,3 +159,27 @@ def front_pixel_bearing_deg(px, img_w, hfov_deg, yaw_deg):
     fx = (img_w / 2.0) / math.tan(math.radians(hfov_deg) / 2.0)
     off = math.degrees(math.atan((px - img_w / 2.0) / fx))
     return (yaw_deg + off + 360.0) % 360.0
+
+
+def cover_cells(lat, lon, origin, cell_m, radius_m):
+    """Cells (ix, iy) whose centre falls within `radius_m` of (lat, lon).
+
+    Grid: ENU metres about `origin` (lat, lon); cell (ix, iy) spans
+    [ix*cell, (ix+1)*cell) x [iy*cell, (iy+1)*cell). The live coverage
+    heatmap marks these (mission) and draws them (UI). Set of tuples.
+    """
+    import math as _m
+    cell_m = max(0.5, float(cell_m))
+    radius_m = max(0.0, float(radius_m))
+    e, n = latlon_to_enu(lat, lon, origin[0], origin[1])
+    ix0 = int(_m.floor((e - radius_m) / cell_m))
+    ix1 = int(_m.floor((e + radius_m) / cell_m))
+    iy0 = int(_m.floor((n - radius_m) / cell_m))
+    iy1 = int(_m.floor((n + radius_m) / cell_m))
+    out = set()
+    for ix in range(ix0, ix1 + 1):
+        for iy in range(iy0, iy1 + 1):
+            cx, cy = (ix + 0.5) * cell_m, (iy + 0.5) * cell_m
+            if (cx - e) ** 2 + (cy - n) ** 2 <= radius_m ** 2 + 1e-9:
+                out.add((ix, iy))
+    return out

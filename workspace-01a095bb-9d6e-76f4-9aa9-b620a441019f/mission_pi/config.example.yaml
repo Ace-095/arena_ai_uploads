@@ -18,6 +18,10 @@ blob:
   commit_score: 0.7
   trend_gain: 0.03   # trajectory must beat entry by this…
   trend_slack: 0.05  # …while staying near the best so far (dips recover)
+
+coverage:
+  cell_m: 5.0               # heatmap resolution (m)
+  push_every_s: 5.0         # full-set snapshot cadence (self-healing)
   center_tol_m: 3.0
   settle_s: 2.0
   max_misses: 2

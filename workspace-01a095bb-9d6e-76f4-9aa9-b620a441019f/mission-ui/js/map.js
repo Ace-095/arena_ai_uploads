@@ -254,6 +254,46 @@ function initMap(o) {
     } else targetMarker.setLatLng(p);
   }
 
+  // ---- search coverage heatmap (Pi "coverage" channel; full set, self-healing) ----
+  const covGroup = L.layerGroup().addTo(map);
+  const covCells = new Set();   // "ix,iy" already drawn
+  let covOrigin = null, covCellM = 5;
+  function updateCovLegend(n) {
+    const el = document.getElementById('covLegend');
+    if (!el) return;
+    el.style.cssText = 'margin-left:8px;font-size:11px;color:#9fb3c8;white-space:nowrap;';
+    el.innerHTML = '<span style="display:inline-block;width:10px;height:10px;background:#2f8f6f;opacity:.8;margin-right:3px;"></span>searched '
+      + n + ' cells <span style="display:inline-block;width:10px;height:10px;background:#ffd23f;opacity:.9;margin:0 3px 0 8px;"></span>scanning';
+  }
+  function setCoverage(msg) {
+    if (!msg || !msg.origin) return;
+    const o = { lat: msg.origin.lat, lon: msg.origin.lon };
+    const cm = msg.cell_m || 5;
+    if (!covOrigin || o.lat !== covOrigin.lat || o.lon !== covOrigin.lon || cm !== covCellM) {
+      covOrigin = o; covCellM = cm;
+      covCells.clear(); covGroup.clearLayers();
+    }
+    const hot = {};
+    (msg.hot || []).forEach((c) => { hot[c[0] + ',' + c[1]] = 1; });
+    (msg.cells || []).forEach((c) => {
+      const k = c[0] + ',' + c[1];
+      if (covCells.has(k) || covCells.size > 4000) return;
+      covCells.add(k);
+      const sw = enuToLatlon(c[0] * covCellM, c[1] * covCellM, o.lat, o.lon);
+      const ne = enuToLatlon((c[0] + 1) * covCellM, (c[1] + 1) * covCellM, o.lat, o.lon);
+      covGroup.addLayer(L.rectangle([[sw[0], sw[1]], [ne[0], ne[1]]], {
+        stroke: false,
+        fillColor: hot[k] ? '#ffd23f' : '#2f8f6f',
+        fillOpacity: hot[k] ? 0.55 : 0.35,
+        interactive: false, renderer: canvas,
+      }));
+    });
+    updateCovLegend(msg.total != null ? msg.total : covCells.size);
+  }
+  function clearCoverage() {
+    covCells.clear(); covGroup.clearLayers(); updateCovLegend(0);
+  }
+
   // ---- fence overlay (authoritative copy from FC) ----
   let fencePoly = null;
   function setFence(verts) {
@@ -318,7 +358,7 @@ function initMap(o) {
 
   return {
     setDrawing, getVertices, undoVertex, clearVertices,
-    setDrone, setTarget, setFence, setOrigin,
+    setDrone, setTarget, setFence, setOrigin, setCoverage, clearCoverage,
     setTileSourceByName, getTileSource: () => layerName,
     reanchorGrid, zoomToGrid, map,
   };

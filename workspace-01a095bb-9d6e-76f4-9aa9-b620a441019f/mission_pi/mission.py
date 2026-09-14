@@ -97,6 +97,12 @@ class Mission:
         self.blob_cfg = dict(b)
         self._blob_obs = []        # passive ground-projected sightings
         self._blob_last_obs = 0.0
+        cvcfg = cfg.get("coverage", {})
+        self.cov_cell_m = float(cvcfg.get("cell_m", 5.0))
+        self.cov_every_s = float(cvcfg.get("push_every_s", 5.0))
+        self._cov = set()            # (ix, iy) searched cells
+        self._cov_hot = set()        # genuinely-new cells since last push
+        self._cov_last_push = 0.0
         rcfg = cfg.get("relay", {})
         from store_forward import StoreForward
         self.store_fwd = StoreForward(
@@ -280,6 +286,9 @@ class Mission:
             self._stop.set()
 
     def _run(self):
+        self._cov = set()
+        self._cov_hot = set()
+        self._cov_last_push = 0.0
         # WAIT_LINK
         self._set_phase("WAIT_LINK", "waiting for FC heartbeat")
         t0 = time.time()
@@ -612,6 +621,7 @@ class Mission:
                     time.sleep(1.0)
                     continue
                 self._blob_observe(cam, pos, alt)
+                self._cover_tick(cam, pos, alt)
                 if geo.haversine_m(pos["lat"], pos["lon"], lat, lon) <= self.arrive_m:
                     break
                 time.sleep(1.0)
@@ -695,6 +705,33 @@ class Mission:
         if best is None or best_d > rad:
             return 0.0, None
         return best
+
+    def _cover_tick(self, cam, pos, alt_cmd):
+        """Mark searched cells + push throttled full-set snapshots."""
+        if not pos or self.home is None:
+            return
+        try:
+            from geo import cover_cells, footprint_m
+            fw, fh = footprint_m(float(alt_cmd), cam.hfov_deg,
+                                 cam.size[0], cam.size[1])
+            new = cover_cells(pos["lat"], pos["lon"],
+                              (self.home[0], self.home[1]),
+                              self.cov_cell_m, min(fw, fh) / 2.0)
+            fresh = new - self._cov
+            self._cov |= new
+            self._cov_hot |= fresh
+            now = time.time()
+            if fresh and now - self._cov_last_push >= self.cov_every_s:
+                self._cov_last_push = now
+                hot = sorted(self._cov_hot)
+                self._cov_hot = set()
+                self.hub.push("coverage", {
+                    "origin": {"lat": self.home[0], "lon": self.home[1]},
+                    "cell_m": self.cov_cell_m,
+                    "cells": sorted(self._cov),
+                    "hot": hot, "total": len(self._cov)})
+        except Exception as e:
+            log.debug("coverage tick: %r", e)
 
     def _blob_fallback(self):
         """Last resort: visit top-3 blob hypotheses with descent verification.

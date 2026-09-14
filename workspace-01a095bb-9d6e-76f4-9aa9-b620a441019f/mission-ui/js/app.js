@@ -242,7 +242,8 @@ function onEnvelope(env) {
     case 'system': renderSystem(d); break;
     case 'event': renderEvent(d); break;
     case 'qr': renderQrUpdate(d); log('WARN', 'QR via pi-ws: ' + (d.payload || '?')); break;
-    case 'fsm': renderFsm(d); break;
+    case 'fsm': renderFsm(d); if (map && (d.phase || d.state || d.to) === 'WAIT_LINK') map.clearCoverage(); break;
+    case 'coverage': if (map) map.setCoverage(d); break;
     case 'log': log(d.level || 'INFO', d.msg || JSON.stringify(d).slice(0, 200)); break;
     default: break; // bridge-owned channels also arrive on WS in mock — ignore, SSE handles them
   }
