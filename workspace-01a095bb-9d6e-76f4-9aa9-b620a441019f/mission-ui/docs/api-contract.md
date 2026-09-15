@@ -150,7 +150,7 @@ if known) + the latest envelope per Pi channel.
 - IN: `HEARTBEAT` (mode/armed, liveness 2.5 s), `GLOBAL_POSITION_INT`,
   `ATTITUDE`, `GPS_RAW_INT`, `BATTERY_STATUS`/`SYS_STATUS`, `MISSION_CURRENT`,
   `MISSION_ITEM_REACHED`, `FENCE_STATUS` (breach → ERROR log), `PARAM_VALUE`,
-  `STATUSTEXT` → `mp-console` (+ `QR[:\s]+([A-Za-z0-9]{1,6})` → `mp-qr`).
+  `STATUSTEXT` → `mp-console` (+ `QR\s*:\s*([0-9A-Za-z][0-9A-Za-z._+-]{0,31})` → `mp-qr`).
 - OUT: fence upload (`MISSION_COUNT`/`MISSION_ITEM_INT`, mission_type 1,
   `MAV_CMD_NAV_FENCE_POLYGON_VERTEX_INCLUSION` = 5001, frame GLOBAL,
   **param1 = vertex_count on every item**), readback verify (1e-7° ≈ 1 cm),

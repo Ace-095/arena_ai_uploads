@@ -191,9 +191,10 @@ arrive, printing a fix hint for each failure.
   or any phase timeout → best-effort RTL + loud logging.
 
 Payload note: mission-ui's MAVLink QR catcher latches
-`[0-9A-Za-z]{1,6}` — keep competition payloads short if you want the
-MP-message path to auto-capture there. The ws event always carries the
-full text.
+`QR\s*:\s*([0-9A-Za-z][0-9A-Za-z._+-]{0,31})` — colon required, first char
+alphanumeric, up to 32 chars total, so `MISSION-QR-001` is captured. (The old
+`[0-9A-Za-z]{1,6}` limit is gone; prose such as "the QR code was missed" still
+must not latch.) The ws event always carries the full text.
 
 ## Fine-tune loop (x86)
 

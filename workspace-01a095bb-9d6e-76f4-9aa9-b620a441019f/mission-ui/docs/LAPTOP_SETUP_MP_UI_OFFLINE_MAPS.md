@@ -159,8 +159,9 @@ is auto-watched), `--verbose`.
    only flight commands. Arming, takeoff and mission control stay in MP.
 4. **QR arrives on 4 independent routes** (first payload wins the display,
    all receipts timestamped): Pi websocket, MAVLink STATUSTEXT
-   (`QR:<payload>` in the MP Messages tab — keep competition payloads ≤6
-   alphanumerics or the MP-message regex won't auto-latch it), tailed MP
+   (`QR:<payload>` in the MP Messages tab — the bridge latches
+   `QR\s*:\s*([0-9A-Za-z][0-9A-Za-z._+-]{0,31})`, so `MISSION-QR-001`-style
+   ids are fine; the colon is required), tailed MP
    log file, and manual typing. If the venue kills every link at once, the
    Pi's store-and-forward buffer holds the result and flushes on recovery.
 5. **MP log tail:** the bridge auto-watches
@@ -303,7 +304,7 @@ whole install — one file, no import step, no service.
 | Grey grid at some zooms (UI) | Pack lacks that zoom/bbox → rebuild bigger (§7.1); bounds in tiles-info tell you what you have. |
 | Grey grid in MP | That provider/zoom wasn't prefetched (§6) → switch provider; prefetch can't run offline. |
 | UI can't reach Pi | Different LAN (Pi hotspot vs venue router)? `http://<pi-ip>:8000/health` in a tab is the raw test; mock mode covers UI-only practice. |
-| QR in MP Messages but not UI | Payload >6 chars or lowercase/symbols — the MP-message regex latches `[A-Za-z0-9]{1,6}` only; Pi-WS route carries the full text regardless. |
+| QR in MP Messages but not UI | The bridge latches only `QR\s*:\s*([0-9A-Za-z][0-9A-Za-z._+-]{0,31})` — the colon is required (prose must not latch) and the first char must be alphanumeric; the Pi-WS route carries the full text regardless. |
 | Bridge dies on start | Port 8100 busy (old bridge still running) or Python <3.8; `--port` overrides. |
 | Mirror settings won't stick | Known MP quirk — set mirror, **restart MP**, re-Connect vehicle + mirror. |
 
