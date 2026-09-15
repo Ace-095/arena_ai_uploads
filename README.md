@@ -24,35 +24,31 @@ vehicle.
 
 ---
 
-## ⚠️ Which branch has the code? (read this first)
+## Where the code lives (read this first)
 
-`main` on this repository is **stale**: it contains only `hehe/` (an older
-reference implementation) and an early `mission-ui/` snapshot. **`main` has no
-`mission_pi/` at all**, so a fresh clone of `main` gives you nothing that
-listens on `http://<ip>:8000` — which is exactly why the UI on Windows showed
-"Pi link: down".
-
-All current work lives on:
-
-```
-arena/01a0a01d-arena-ai-uploads
-```
+**`main`.** The historical branch `arena/01a0a01d-arena-ai-uploads` was merged
+into `main` by PR #2 (2026-09-14), so a fresh clone of `main` has the whole
+stack — `mission_pi/` (59 files), `mission-ui/` (29 files), the configs, the
+tools and these docs. The older warning that lived here ("main has no
+`mission_pi/`") was true before that merge and is no longer.
 
 ```bash
 git clone https://github.com/Ace-095/arena_ai_uploads.git
 cd arena_ai_uploads
-git checkout arena/01a0a01d-arena-ai-uploads        # ← the branch with the code
-ls workspace-*/mission_pi/main.py                   # must exist
+ls workspace-*/mission_pi/main.py        # must exist
+git rev-parse --abbrev-ref HEAD          # -> main
 ```
 
-A pull request merging this branch into `main` is the intended fix; until it is
-merged, **check the branch out on both machines** (the Linux laptop and the
-Windows box). To confirm you are on the right one:
+## Start here: the three setup docs
 
-```bash
-git rev-parse --abbrev-ref HEAD     # -> arena/01a0a01d-arena-ai-uploads
-git log --oneline -1
-```
+| # | Doc | One line |
+|---|---|---|
+| 01 | [`docs/01_TWO_LAPTOP_SITL_GAZEBO_SETUP.md`](docs/01_TWO_LAPTOP_SITL_GAZEBO_SETUP.md) | `git clone` → working hunt on two laptops (Linux: SITL + Gazebo + `mission_pi`; Windows: Mission Planner + bridge + UI) |
+| 02 | [`docs/02_PI5_AI_HAT_CAMERAS_BENCH.md`](docs/02_PI5_AI_HAT_CAMERAS_BENCH.md) | Pi 5 + Hailo AI HAT + CSI cameras, brought up against the **simulated** vehicle |
+| 03 | [`docs/03_REAL_FLIGHT_INTEGRATION.md`](docs/03_REAL_FLIGHT_INTEGRATION.md) | Everything physically connected: Pixhawk, telemetry radio, Pi onboard, failsafes, flight day |
+
+Index + "which doc do I want": [`docs/README.md`](docs/README.md).
+
 
 ---
 
@@ -66,9 +62,12 @@ Everything lives under `workspace-01a095bb-9d6e-76f4-9aa9-b620a441019f/`:
 | `mission-ui/` | Browser ground UI + `bridge/mp_bridge.py` (serves the UI on `:8100`, bridges Mission Planner's MAVLink mirror) | Windows 11 |
 | `hehe/` | Older reference implementation — ideas only, not part of the run | — |
 | `our-mission.md`, `ui-spec.md`, `hehe-analysis.md` | Requirements and design notes | — |
+| `docs/` (repo root) | The three bring-up guides: two-laptop SITL/Gazebo, Pi 5 + AI HAT bench, real-flight integration | — |
 
 Key docs:
 
+* `docs/` — **the bring-up ladder** (01 bench → 02 hardware → 03 air), with an
+  acceptance checklist at the end of each.
 * `mission_pi/SIM_GUIDE.md` — the full bench guide (SITL, webcam, Gazebo,
   troubleshooting ladder, demo mode).
 * `mission_pi/RUN_GAZEBO.md` — Gazebo Harmonic + ArduPilot plugin specifics.
