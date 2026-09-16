@@ -1,0 +1,67 @@
+# mission-ui config.yaml — UI + bridge config for arena/test1
+# Configurable max height and camera FOV (matches mission_pi/config.yaml + cam.txt)
+
+# --- Flight altitude (configurable max height) ---
+flight:
+  max_alt_m: 15.0          # <-- CHANGE THIS: 5 / 10 / 15 m (drone ceiling)
+  default_sweep_alt_m: 15.0
+  min_alt_m: 2.0
+  # UI will clamp search altitude to max_alt_m and show warning if exceeded
+
+# --- Camera FOV from cam.txt (for coverage planning) ---
+cameras:
+  # Pi Camera Module 3 Standard — cam.txt
+  front:
+    model: "Pi Camera Module 3 Standard"
+    sensor: "IMX708"
+    hfov_deg: 66.0          # ~66° HFOV from cam.txt
+    vfov_deg: 41.0          # ~41° VFOV
+    diagonal_fov_deg: 75.0  # 75° diagonal
+    resolution: [4608, 2592]
+    focal_mm: 4.74
+
+  # Waveshare IMX477 IR-CUT B, 113° — cam.txt
+  bottom:
+    model: "Waveshare IMX477 IR-CUT B"
+    sensor: "IMX477"
+    hfov_deg: 100.0         # ~100° HFOV derived from 113° diagonal on 4:3
+    vfov_deg: 75.0          # ~75° VFOV
+    diagonal_fov_deg: 113.0 # 113° diagonal from cam.txt
+    resolution: [4056, 3040]
+    focal_mm: 2.7
+
+# --- Polygon / Fence ---
+polygon:
+  # Polygon is the primary drawing that shows on Mission Planner
+  # Button converts polygon -> fence inclusion (MAV_CMD 5001)
+  default_mode: "polygon"   # polygon | fence
+  show_on_mp: true          # polygon shows on MP via fence upload
+  auto_convert: false       # if true, drawing polygon auto-uploads as fence
+
+fence:
+  type: "inclusion"         # inclusion (5001) | exclusion (5002)
+  action: 1                 # 1=RTL, 2=LAND, etc
+  enable_after_upload: true
+  readback_verify: true
+
+# --- Coverage planning (FOV-based) ---
+coverage:
+  mode: "fov_optimal"       # fov_optimal = max coverage using cam FOV
+  overlap: 0.3              # 30% overlap ensures no gaps
+  min_overlap: 0.2
+  cell_m: 5.0
+  # At 15m with IMX477 100° HFOV: footprint ~36m wide, spacing ~25m with 0.3 overlap
+  # At 10m: ~24m wide, spacing ~17m
+  # At 5m: ~12m wide, spacing ~8m — more legs, better resolution
+
+# --- Bridge / MAVLink ---
+bridge:
+  mav_port: 14551
+  host: "0.0.0.0"
+  port: 8100
+  sysid: 254
+
+# --- Tiles ---
+tiles:
+  default_source: "offline-mbtiles"  # offline-mbtiles | osm | carto-dark
+  auto_switch: true

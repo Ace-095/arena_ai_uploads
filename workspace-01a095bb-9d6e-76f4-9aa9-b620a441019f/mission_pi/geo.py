@@ -3,10 +3,39 @@
 Same convention as mission-ui js/geo.js: x = east, y = north, angles in
 degrees, yaw clockwise from north. Stdlib only (no numpy/cv2) so the
 mission math stays testable anywhere.
+
+Enhanced for arena/test1:
+ - configurable max height via config.yaml (flight.max_alt_m / mission.max_alt_m)
+ - camera FOV based coverage (cam.txt specs: Pi Cam3 66° HFOV, IMX477 100° HFOV)
+ - polygon -> fence inclusion conversion helpers
+ - optimal grid spacing ensuring max area coverage with no gaps
 """
 import math
 
 R_EARTH_M = 6371000.0
+
+# --- Camera specs from cam.txt (arena/test1) ---
+# Pi Camera Module 3 Standard
+CAM3_STANDARD = {
+    "model": "Pi Camera Module 3 Standard",
+    "sensor": "IMX708",
+    "hfov_deg": 66.0,
+    "vfov_deg": 41.0,
+    "diagonal_fov_deg": 75.0,
+    "focal_mm": 4.74,
+    "resolution": (4608, 2592),
+}
+
+# Waveshare IMX477 IR-CUT B, 113° diagonal
+IMX477_B = {
+    "model": "Waveshare IMX477 IR-CUT B",
+    "sensor": "IMX477",
+    "hfov_deg": 100.0,  # derived from 113° diagonal on 4:3
+    "vfov_deg": 75.0,
+    "diagonal_fov_deg": 113.0,
+    "focal_mm": 2.7,
+    "resolution": (4056, 3040),
+}
 
 
 def latlon_to_enu(lat, lon, olat, olon):
@@ -58,9 +87,45 @@ def point_in_polygon(lat, lon, poly):
     return inside
 
 
+def point_in_polygon_enu(x, y, enu_poly):
+    """ENU version of point_in_polygon for faster checks."""
+    inside = False
+    n = len(enu_poly)
+    if n < 3:
+        return False
+    j = n - 1
+    for i in range(n):
+        yi, xi = enu_poly[i][1], enu_poly[i][0]  # y=lat-like, x=lon-like
+        yj, xj = enu_poly[j][1], enu_poly[j][0]
+        if ((yi > y) != (yj > y)) and \
+                (x < (xj - xi) * (y - yi) / (yj - yi + 1e-12) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
 def polygon_centroid(poly):
     return (sum(p[0] for p in poly) / len(poly),
             sum(p[1] for p in poly) / len(poly))
+
+
+def polygon_area_m2_enu(enu):
+    """Shoelace area in m² for ENU polygon."""
+    a = 0.0
+    for i in range(len(enu)):
+        x0, y0 = enu[i]
+        x1, y1 = enu[(i + 1) % len(enu)]
+        a += x0 * y1 - x1 * y0
+    return abs(a) / 2.0
+
+
+def polygon_area_m2(poly, origin=None):
+    """Area in m² for latlon polygon."""
+    if len(poly) < 3:
+        return 0.0
+    olat, olon = origin or polygon_centroid(poly)
+    enu = [latlon_to_enu(p[0], p[1], olat, olon) for p in poly]
+    return polygon_area_m2_enu(enu)
 
 
 def polygon_size_m(poly):
@@ -69,6 +134,80 @@ def polygon_size_m(poly):
     xs = [latlon_to_enu(p[0], p[1], olat, olon)[0] for p in poly]
     ys = [latlon_to_enu(p[0], p[1], olat, olon)[1] for p in poly]
     return (max(xs) - min(xs), max(ys) - min(ys))
+
+
+def vfov_from_hfov(hfov_deg, img_w, img_h):
+    return math.degrees(2.0 * math.atan(
+        math.tan(math.radians(hfov_deg) / 2.0) * img_h / img_w))
+
+
+def vfov_from_diagonal(diagonal_deg, img_w, img_h):
+    """Derive VFOV from diagonal FOV and aspect ratio."""
+    diag_rad = math.radians(diagonal_deg)
+    # diagonal pixels
+    diag_px = math.hypot(img_w, img_h)
+    # focal in px from diagonal
+    f = (diag_px / 2.0) / math.tan(diag_rad / 2.0)
+    vfov = 2.0 * math.atan((img_h / 2.0) / f)
+    return math.degrees(vfov)
+
+
+def hfov_from_diagonal(diagonal_deg, img_w, img_h):
+    """Derive HFOV from diagonal FOV and aspect ratio."""
+    diag_rad = math.radians(diagonal_deg)
+    diag_px = math.hypot(img_w, img_h)
+    f = (diag_px / 2.0) / math.tan(diag_rad / 2.0)
+    hfov = 2.0 * math.atan((img_w / 2.0) / f)
+    return math.degrees(hfov)
+
+
+def footprint_m(alt_m, hfov_deg, img_w, img_h, vfov_deg=None):
+    """Ground footprint (width, height) meters for a nadir camera.
+    
+    If vfov_deg is given (from cam.txt), use it directly; otherwise derive
+    from hfov + aspect ratio.
+    """
+    if vfov_deg is None:
+        vfov_deg = vfov_from_hfov(hfov_deg, img_w, img_h)
+    w = 2.0 * alt_m * math.tan(math.radians(hfov_deg) / 2.0)
+    h = 2.0 * alt_m * math.tan(math.radians(vfov_deg) / 2.0)
+    return (w, h)
+
+
+def footprint_at_max_alt(max_alt_m, camera="bottom"):
+    """Footprint at max allowed altitude for given camera.
+    
+    camera: 'front' = Pi Cam3 Standard (66° HFOV), 'bottom' = IMX477 B (100° HFOV)
+    Returns (width_m, height_m)
+    """
+    if camera == "front":
+        spec = CAM3_STANDARD
+        # Use actual res for footprint calc, but FOV dominates
+        img_w, img_h = spec["resolution"]
+        return footprint_m(max_alt_m, spec["hfov_deg"], img_w, img_h, spec["vfov_deg"])
+    else:
+        spec = IMX477_B
+        img_w, img_h = spec["resolution"]
+        return footprint_m(max_alt_m, spec["hfov_deg"], img_w, img_h, spec["vfov_deg"])
+
+
+def optimal_spacing_m(alt_m, hfov_deg, img_w, img_h, overlap=0.3, vfov_deg=None):
+    """Optimal lawnmower spacing ensuring max coverage with no gaps.
+    
+    Uses the smaller footprint dimension (height, since rows run E-W) 
+    to guarantee overlap in both axes.
+    """
+    fw, fh = footprint_m(alt_m, hfov_deg, img_w, img_h, vfov_deg)
+    # Use the smaller dimension for spacing to ensure full coverage
+    # Overlap 0.3 means 70% of footprint is new area per row
+    min_dim = min(fw, fh)
+    spacing = max(1.0, min_dim * (1.0 - overlap))
+    return spacing, (fw, fh)
+
+
+def clamp_altitude(alt_m, max_alt_m, min_alt_m=1.0):
+    """Clamp altitude to [min_alt_m, max_alt_m] from config.yaml."""
+    return max(float(min_alt_m), min(float(max_alt_m), float(alt_m)))
 
 
 def lawnmower_rows(poly, spacing_m, origin=None, edge_margin_m=2.0):
@@ -113,16 +252,149 @@ def lawnmower_rows(poly, spacing_m, origin=None, edge_margin_m=2.0):
     return [enu_to_latlon(x, y, olat, olon) for x, y in wps]
 
 
-def vfov_from_hfov(hfov_deg, img_w, img_h):
-    return math.degrees(2.0 * math.atan(
-        math.tan(math.radians(hfov_deg) / 2.0) * img_h / img_w))
+def lawnmower_rows_fov_optimal(poly, alt_m, hfov_deg, img_w, img_h,
+                               origin=None, edge_margin_m=2.0,
+                               overlap=0.3, vfov_deg=None,
+                               max_alt_m=None):
+    """FOV-optimal lawnmower: max coverage using camera footprint at alt.
+    
+    This is the main function for arena/test1 — divides polygon area
+    according to cam FOV so drone covers as much as possible.
+    
+    - alt_m is clamped to max_alt_m if given (from config.yaml)
+    - spacing derived from footprint * (1 - overlap)
+    - ensures no gaps, maximizes covered area
+    """
+    if max_alt_m is not None:
+        alt_m = clamp_altitude(alt_m, max_alt_m)
+    spacing, (fw, fh) = optimal_spacing_m(alt_m, hfov_deg, img_w, img_h,
+                                          overlap=overlap, vfov_deg=vfov_deg)
+    wps = lawnmower_rows(poly, spacing, origin=origin, edge_margin_m=edge_margin_m)
+    return {
+        "waypoints": wps,
+        "spacing_m": spacing,
+        "footprint_w_m": fw,
+        "footprint_h_m": fh,
+        "alt_m": alt_m,
+        "overlap": overlap,
+        "coverage_m2": fw * fh,
+        "total_area_m2": polygon_area_m2(poly, origin),
+    }
 
 
-def footprint_m(alt_m, hfov_deg, img_w, img_h):
-    """Ground footprint (width, height) meters for a nadir camera."""
-    w = 2.0 * alt_m * math.tan(math.radians(hfov_deg) / 2.0)
-    h = 2.0 * alt_m * math.tan(math.radians(vfov_from_hfov(hfov_deg, img_w, img_h)) / 2.0)
-    return (w, h)
+def divide_polygon_by_fov(poly, alt_m, camera_specs, overlap=0.3,
+                          origin=None, max_alt_m=None):
+    """Divide polygon into coverage cells based on camera FOV.
+    
+    For each camera (front 66° + bottom 100°), compute footprint at alt_m,
+    then return grid that maximizes coverage. This is used to ensure
+    drone covers as much as possible area according to cam FOV.
+    
+    camera_specs: dict like {"front": {"hfov_deg": 66, "size": [4608,2592]}, ...}
+    Returns dict with per-camera plans + combined optimal.
+    """
+    if max_alt_m is not None:
+        alt_m = clamp_altitude(alt_m, max_alt_m)
+    if origin is None:
+        origin = polygon_centroid(poly) if poly else (0, 0)
+    
+    results = {}
+    best_spacing = None
+    best_cam = None
+    
+    for cam_name, spec in (camera_specs or {}).items():
+        hfov = float(spec.get("hfov_deg", 66.0))
+        size = spec.get("size", [1920, 1080])
+        img_w, img_h = int(size[0]), int(size[1])
+        vfov = spec.get("vfov_deg")
+        if vfov is not None:
+            vfov = float(vfov)
+        spacing, (fw, fh) = optimal_spacing_m(alt_m, hfov, img_w, img_h,
+                                              overlap=overlap, vfov_deg=vfov)
+        wps = lawnmower_rows(poly, spacing, origin=origin, edge_margin_m=2.0)
+        area = polygon_area_m2(poly, origin)
+        footprint_area = fw * fh
+        # coverage efficiency: how many footprints needed to cover area
+        needed = area / (footprint_area * (1.0 - overlap)) if footprint_area > 0 else 0
+        
+        results[cam_name] = {
+            "hfov_deg": hfov,
+            "vfov_deg": vfov if vfov is not None else vfov_from_hfov(hfov, img_w, img_h),
+            "footprint_w_m": fw,
+            "footprint_h_m": fh,
+            "footprint_area_m2": footprint_area,
+            "spacing_m": spacing,
+            "waypoints": wps,
+            "waypoint_count": len(wps),
+            "total_area_m2": area,
+            "estimated_footprints_needed": needed,
+            "alt_m": alt_m,
+        }
+        # Choose smallest spacing (most conservative, ensures coverage) as best
+        if best_spacing is None or spacing < best_spacing:
+            best_spacing = spacing
+            best_cam = cam_name
+    
+    # Combined optimal uses the most restrictive (smallest) footprint to guarantee no gaps
+    if best_cam and best_cam in results:
+        results["optimal"] = results[best_cam]
+        results["optimal"]["chosen_camera"] = best_cam
+    elif results:
+        # fallback to first
+        first = next(iter(results))
+        results["optimal"] = results[first]
+        results["optimal"]["chosen_camera"] = first
+    
+    return results
+
+
+def polygon_to_fence_inclusion(polygon_latlon, max_alt_m=None):
+    """Convert a drawn polygon to fence inclusion vertices.
+    
+    In arena/test1, UI draws polygon (shows on Mission Planner as polygon),
+    then button converts it to fence inclusion (MAV_CMD 5001) for FC.
+    
+    Returns list of (lat, lon) tuples, validated, clamped.
+    """
+    if not polygon_latlon or len(polygon_latlon) < 3:
+        return []
+    # Validate and normalize to (lat, lon) tuples
+    verts = []
+    for p in polygon_latlon:
+        if isinstance(p, dict):
+            lat = p.get("lat")
+            lon = p.get("lon")
+        elif isinstance(p, (list, tuple)) and len(p) >= 2:
+            lat, lon = p[0], p[1]
+        else:
+            continue
+        try:
+            lat = float(lat)
+            lon = float(lon)
+            if -90 <= lat <= 90 and -180 <= lon <= 180:
+                verts.append((lat, lon))
+        except Exception:
+            continue
+    # Ensure at least 3
+    if len(verts) < 3:
+        return []
+    # Clamp to max 255 (MAVLink limit)
+    if len(verts) > 255:
+        verts = verts[:255]
+    return verts
+
+
+def validate_max_alt(max_alt_m, default=15.0, min_alt=1.0, max_allowed=50.0):
+    """Validate max altitude from config.yaml (5, 10, 15 m etc)."""
+    try:
+        v = float(max_alt_m)
+        if v < min_alt:
+            return float(min_alt)
+        if v > max_allowed:
+            return float(max_allowed)
+        return v
+    except Exception:
+        return float(default)
 
 
 def _rot_px(px, py, img_w, img_h, rot_deg):
