@@ -178,11 +178,16 @@ function dividePolygonByFov(polygonLatLon, alt_m, cameraSpecs, overlap, max_alt_
     };
   }
 
-  // optimal = smallest spacing (most conservative)
-  let best = null, bestSpacing = Infinity;
+  // optimal = largest footprint area (max coverage per cam.txt: bottom 100° HFOV)
+  // This ensures drone covers as much as possible area according to cam FOV
+  // Bottom cam at 15m: ~35m wide vs front 66° ~19m -> bottom wins for max area
+  let best = null, bestArea = -1;
   for (const k in results) {
-    if (results[k].spacing_m < bestSpacing) {
-      bestSpacing = results[k].spacing_m;
+    const area = results[k].footprint_area_m2;
+    let isBetter = area > bestArea;
+    if (k === 'bottom') isBetter = isBetter || area >= bestArea * 0.99;
+    if (best === null || isBetter) {
+      bestArea = area;
       best = k;
     }
   }

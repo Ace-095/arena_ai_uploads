@@ -299,9 +299,12 @@ def divide_polygon_by_fov(poly, alt_m, camera_specs, overlap=0.3,
         origin = polygon_centroid(poly) if poly else (0, 0)
     
     results = {}
-    best_spacing = None
+    best_area = -1
     best_cam = None
-    
+    # For max area coverage we prefer largest footprint (bottom cam 100° HFOV)
+    # but we keep per-camera plans so UI can switch. The optimal is the one
+    # with largest footprint_area (max coverage per image) — ensures drone
+    # covers as much as possible area according to cam FOV at max_alt.
     for cam_name, spec in (camera_specs or {}).items():
         hfov = float(spec.get("hfov_deg", 66.0))
         size = spec.get("size", [1920, 1080])
@@ -314,9 +317,8 @@ def divide_polygon_by_fov(poly, alt_m, camera_specs, overlap=0.3,
         wps = lawnmower_rows(poly, spacing, origin=origin, edge_margin_m=2.0)
         area = polygon_area_m2(poly, origin)
         footprint_area = fw * fh
-        # coverage efficiency: how many footprints needed to cover area
         needed = area / (footprint_area * (1.0 - overlap)) if footprint_area > 0 else 0
-        
+
         results[cam_name] = {
             "hfov_deg": hfov,
             "vfov_deg": vfov if vfov is not None else vfov_from_hfov(hfov, img_w, img_h),
@@ -330,17 +332,19 @@ def divide_polygon_by_fov(poly, alt_m, camera_specs, overlap=0.3,
             "estimated_footprints_needed": needed,
             "alt_m": alt_m,
         }
-        # Choose smallest spacing (most conservative, ensures coverage) as best
-        if best_spacing is None or spacing < best_spacing:
-            best_spacing = spacing
+        # Max coverage = largest footprint area (bottom 100° HFOV wins over front 66°)
+        # If tie, prefer bottom camera explicitly
+        is_better = footprint_area > best_area
+        if cam_name == "bottom":
+            is_better = is_better or footprint_area >= best_area * 0.99
+        if best_cam is None or is_better:
+            best_area = footprint_area
             best_cam = cam_name
-    
-    # Combined optimal uses the most restrictive (smallest) footprint to guarantee no gaps
+
     if best_cam and best_cam in results:
         results["optimal"] = results[best_cam]
         results["optimal"]["chosen_camera"] = best_cam
     elif results:
-        # fallback to first
         first = next(iter(results))
         results["optimal"] = results[first]
         results["optimal"]["chosen_camera"] = first
