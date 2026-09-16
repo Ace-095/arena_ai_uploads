@@ -227,6 +227,43 @@ def bring_up_thread(cfg, args, fc, rig, det_box, streams, mission, hub, bu):
                 say("cameras", "ok", ", ".join(
                     "%s=%s/%s" % (n, c.model, c.facing)
                     for n, c in sorted(rig.cams.items())))
+
+                # --- QR boost: make QR pop more than ground (Kabaddi setting) ---
+                try:
+                    cam_cfg = cfg.get("cameras", {}) or {}
+                    qr_boost_cfg = cfg.get("qr_boost", {}) or {}
+                    global_enabled = qr_boost_cfg.get("enabled", True)
+                    for cam_name, cam in rig.cams.items():
+                        role = cam.facing
+                        role_cfg = cam_cfg.get(role, {}) or {}
+                        per_cam_qr = role_cfg.get("qr_boost", {}) or {}
+                        enabled = per_cam_qr.get("enabled", global_enabled)
+                        if not enabled:
+                            continue
+                        profile = per_cam_qr.get("profile") or qr_boost_cfg.get("profile")
+                        if not profile:
+                            if role == "bottom":
+                                profile = "bottom_qr_boost"
+                            elif role == "front":
+                                profile = "front_qr_boost"
+                            else:
+                                profile = qr_boost_cfg.get("mode", "qr_boost_day")
+                        try:
+                            cam.apply_qr_profile(profile)
+                            say("cameras", "ok", "%s QR boost: %s" % (cam_name, profile))
+                            hub.push("log", {"level": "INFO",
+                                             "msg": "%s QR boost %s — contrast high, sat low, sharp high, QR pops vs ground" % (cam_name, profile)})
+                        except Exception as e:
+                            log.warning("%s QR boost %r failed: %r", cam_name, profile, e)
+                        sw_mode = per_cam_qr.get("software_mode") or qr_boost_cfg.get("software_mode", "qr_boost")
+                        if sw_mode:
+                            cam.qr_boost["qr_software_enhance"] = True
+                            cam.qr_boost["qr_enhance_mode"] = sw_mode
+                            log.info("%s software QR enhance %s enabled (CLAHE+unsharp+green suppress)", cam_name, sw_mode)
+                except Exception as e:
+                    log.warning("QR boost setup failed: %r", e)
+                    hub.push("log", {"level": "WARN", "msg": "QR boost setup failed: %s" % e})
+
             else:
                 bu.mark("cameras", "failed", "no camera assigned")
                 hub.push("log", {"level": "ERROR",

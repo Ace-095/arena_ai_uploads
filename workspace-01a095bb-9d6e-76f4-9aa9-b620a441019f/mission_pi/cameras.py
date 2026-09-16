@@ -74,6 +74,10 @@ class _BaseCamera:
                        "adaptive": True, "brightness": 0.0, "contrast": 1.0,
                        "saturation": 1.0, "sharpness": 1.0}
 
+    #: QR boost defaults — makes QR pop more than ground
+    QR_BOOST_DEFAULTS = {"qr_boost_enabled": False, "qr_boost_mode": "qr_boost_day",
+                         "qr_software_enhance": True, "qr_enhance_mode": "qr_boost"}
+
     def __init__(self, name, index, size, hfov_deg, facing,
                  rotation_deg=0, jpeg_quality=80):
         self.name = name            # cam1 | cam2
@@ -86,8 +90,10 @@ class _BaseCamera:
         self.model = "?"
         self.display_only = False  # True for mirrors: UI tile only, no detector worker
         self.tuning = dict(self.TUNING_DEFAULTS)
+        self.qr_boost = dict(self.QR_BOOST_DEFAULTS)
         self._lock = threading.Lock()
         self._frame = None
+        self._frame_raw = None      # raw frame before software enhance
         self._frame_ts = 0.0
         self._frames = 0
         self._overlay = []          # [(x,y,w,h,label), ...] drawn on stream
@@ -143,6 +149,14 @@ class _BaseCamera:
         return img
 
     def _loop(self):
+        # Optional QR boost software enhance — imported lazily so bench without cv2 still works
+        try:
+            from qr_camera_boost import enhance_qr_frame
+            _has_qr_boost = True
+        except Exception:
+            enhance_qr_frame = None
+            _has_qr_boost = False
+
         while not self._stop.is_set():
             try:
                 arr = self._grab()
@@ -158,16 +172,33 @@ class _BaseCamera:
                     arr = cv2.resize(arr, tuple(self.size))
             except Exception:
                 pass
+
+            # Keep raw for debug, then optionally enhance for detection so QR pops vs ground
+            raw = arr
+            enhanced = arr
+            try:
+                if _has_qr_boost and self.qr_boost.get("qr_software_enhance"):
+                    mode = self.qr_boost.get("qr_enhance_mode", "qr_boost")
+                    if mode and mode != "none":
+                        enhanced = enhance_qr_frame(arr, mode=mode)
+            except Exception as e:
+                log.debug("%s qr enhance failed: %r", self.name, e)
+                enhanced = arr
+
             with self._lock:
-                self._frame = arr
+                self._frame_raw = raw
+                self._frame = enhanced
                 self._frame_ts = time.time()
                 self._frames += 1
 
     # -- consumers ------------------------------------------------------
-    def latest(self):
+    def latest(self, raw=False):
         """(frame_bgr_or_None, ts, count). Frame is a shared reference —
-        consumers must not modify it in place."""
+        consumers must not modify it in place.
+        If raw=True, returns un-enhanced frame (for stream debug)."""
         with self._lock:
+            if raw:
+                return self._frame_raw, self._frame_ts, self._frames
             return self._frame, self._frame_ts, self._frames
 
     def set_overlay(self, boxes):
@@ -184,21 +215,48 @@ class _BaseCamera:
                 self.tuning[k] = tuning[k]
         if tuning is not None and "gain" in tuning and "gain_db" not in tuning:
             self.tuning["gain_db"] = tuning["gain"]
+        # QR boost tuning
+        for k in self.QR_BOOST_DEFAULTS:
+            if tuning is not None and k in tuning:
+                self.qr_boost[k] = tuning[k]
         return self.get_tuning()
 
     def get_tuning(self):
-        """Contract-shaped tuning incl. the mock's `gain` alias."""
+        """Contract-shaped tuning incl. the mock's `gain` alias + QR boost."""
         t = dict(self.tuning)
         t["gain"] = t.get("gain_db")
+        # include QR boost for UI
+        for k, v in self.qr_boost.items():
+            t[k] = v
         return t
 
-    def jpeg(self, max_width=960, quality=None):
-        """Annotated JPEG bytes for /api/camera/frame/<cam> (or None)."""
-        frame, ts, _ = self.latest()
+    def apply_qr_profile(self, profile_name):
+        """Apply a QR boost ISP profile (see qr_camera_boost.QR_BOOST_PROFILES)."""
+        try:
+            from qr_camera_boost import get_profile
+            prof = get_profile(profile_name)
+            if not prof:
+                log.warning("%s unknown QR profile %r", self.name, profile_name)
+                return self.get_tuning()
+            # Map profile to contract tuning
+            tuning = {k: v for k, v in prof.items() if k in self.TUNING_DEFAULTS}
+            # QR boost meta
+            self.qr_boost["qr_boost_enabled"] = True
+            self.qr_boost["qr_boost_mode"] = profile_name
+            # Apply ISP tuning via backend
+            return self.apply_tuning(tuning)
+        except Exception as e:
+            log.warning("%s apply_qr_profile %r failed: %r", self.name, profile_name, e)
+            return self.get_tuning()
+
+    def jpeg(self, max_width=960, quality=None, raw=False):
+        """Annotated JPEG bytes for /api/camera/frame/<cam> (or None).
+        raw=False = enhanced frame (QR pops), raw=True = raw frame."""
+        frame, ts, _ = self.latest(raw=raw)
         if frame is None or not _HAVE_CV2:
             return None
         try:
-            img = frame
+            img = frame.copy()  # don't modify shared frame
             h, w = img.shape[:2]
             if w > max_width:
                 s = max_width / w
@@ -229,7 +287,9 @@ class _BaseCamera:
                 "model": self.model, "size": list(self.size),
                 "facing": self.facing, "hfov_deg": self.hfov_deg,
                 "running": self.running, "frames": n,
-                "age_s": round(time.time() - ts, 2) if ts else None}
+                "age_s": round(time.time() - ts, 2) if ts else None,
+                "qr_boost": dict(self.qr_boost),
+                "tuning": dict(self.tuning)}
 
 
 class Camera(_BaseCamera):

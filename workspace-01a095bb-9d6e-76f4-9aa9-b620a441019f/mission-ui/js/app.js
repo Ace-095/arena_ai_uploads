@@ -618,6 +618,68 @@ function boot() {
       log('INFO', 'exported FOV coverage ' + out.waypoints.length + ' wps to fov_coverage.json');
     });
 
+    // ---- QR BOOST (Kabaddi setting — make QR pop vs ground) ----
+    const qrBoostProfile = $('qrBoostProfile');
+    const qrSwMode = $('qrSwMode');
+    const qrBoostInfo = $('qrBoostInfo');
+
+    function applyQrBoostProfile(profileName) {
+      const cam = S.camActive === 'cam1' ? 'cam1' : 'cam2';
+      // Map profile to ISP tuning (same as qr_camera_boost.py)
+      const profiles = {
+        normal: { adaptive: true, exposure_us: 8333, gain_db: 6, brightness: 0, contrast: 1.0, saturation: 1.0, sharpness: 1.0 },
+        qr_boost_day: { adaptive: false, exposure_us: 5000, gain_db: 2, brightness: -10, contrast: 1.8, saturation: 0.7, sharpness: 2.0 },
+        qr_boost_aggressive: { adaptive: false, exposure_us: 4000, gain_db: 1, brightness: -15, contrast: 2.0, saturation: 0.5, sharpness: 2.2 },
+        qr_boost_lowlight: { adaptive: false, exposure_us: 8000, gain_db: 6, brightness: 5, contrast: 1.6, saturation: 0.8, sharpness: 1.8 },
+        bottom_qr_boost: { adaptive: false, exposure_us: 5000, gain_db: 2, brightness: -12, contrast: 1.9, saturation: 0.6, sharpness: 2.0, af_mode: 'manual' },
+        front_qr_boost: { adaptive: false, exposure_us: 6000, gain_db: 3, brightness: -5, contrast: 1.6, saturation: 0.8, sharpness: 1.8, af_mode: 'continuous' },
+      };
+      const tuning = profiles[profileName] || profiles.qr_boost_day;
+      tuning.cam = cam;
+      // POST to Pi /api/camera/controls
+      postJson('/api/camera/controls', tuning).then(() => {
+        log('WARN', cam + ' QR boost ISP ' + profileName + ' applied — contrast ' + tuning.contrast + ' sat ' + tuning.saturation + ' sharp ' + tuning.sharpness + ' (QR pops vs ground)');
+        if (qrBoostInfo) qrBoostInfo.textContent = profileName + ': contrast ' + tuning.contrast + ' sat ' + tuning.saturation + ' sharp ' + tuning.sharpness + ' bright ' + tuning.brightness + ' exp ' + tuning.exposure_us + 'us — ' + (profileName.includes('aggressive') ? 'ground almost gray, QR B/W stays' : 'QR B/W pops vs green/brown ground');
+        // Also update sliders to reflect new values
+        const pfx = cam === 'cam1' ? 'c1' : 'c2';
+        if ($(pfx+'Con')) { $(pfx+'Con').value = tuning.contrast; if ($(pfx+'ConV')) $(pfx+'ConV').textContent = tuning.contrast; }
+        if ($(pfx+'Sat')) { $(pfx+'Sat').value = tuning.saturation; if ($(pfx+'SatV')) $(pfx+'SatV').textContent = tuning.saturation; }
+        if ($(pfx+'Sha')) { $(pfx+'Sha').value = tuning.sharpness; if ($(pfx+'ShaV')) $(pfx+'ShaV').textContent = tuning.sharpness; }
+        if ($(pfx+'Bri')) { $(pfx+'Bri').value = tuning.brightness; if ($(pfx+'BriV')) $(pfx+'BriV').textContent = tuning.brightness; }
+      }).catch((e) => log('ERROR', 'QR boost ISP failed: ' + e.message));
+    }
+
+    const btnQrBoostApply = $('btnQrBoostApply');
+    if (btnQrBoostApply) btnQrBoostApply.addEventListener('click', () => {
+      const prof = qrBoostProfile ? qrBoostProfile.value : 'qr_boost_day';
+      applyQrBoostProfile(prof);
+    });
+
+    const btnQrBoostOff = $('btnQrBoostOff');
+    if (btnQrBoostOff) btnQrBoostOff.addEventListener('click', () => {
+      applyQrBoostProfile('normal');
+      if (qrBoostInfo) qrBoostInfo.textContent = 'reset to normal — auto exposure, contrast 1.0 sat 1.0 sharp 1.0';
+    });
+
+    const btnQrSwApply = $('btnQrSwApply');
+    if (btnQrSwApply) btnQrSwApply.addEventListener('click', () => {
+      const cam = S.camActive === 'cam1' ? 'cam1' : 'cam2';
+      const mode = qrSwMode ? qrSwMode.value : 'qr_boost';
+      postJson('/api/camera/controls', { cam, qr_software_enhance: mode !== 'none', qr_enhance_mode: mode }).then(() => {
+        log('INFO', cam + ' software QR enhance ' + mode + ' — CLAHE+unsharp+green suppress, QR pops vs ground');
+      }).catch((e) => log('ERROR', 'software enhance failed: ' + e.message));
+    });
+
+    // Quick preset buttons
+    const btnQrBoostDay = $('btnQrBoostDay');
+    if (btnQrBoostDay) btnQrBoostDay.addEventListener('click', () => { if (qrBoostProfile) qrBoostProfile.value = 'qr_boost_day'; applyQrBoostProfile('qr_boost_day'); });
+    const btnQrBoostAgg = $('btnQrBoostAgg');
+    if (btnQrBoostAgg) btnQrBoostAgg.addEventListener('click', () => { if (qrBoostProfile) qrBoostProfile.value = 'qr_boost_aggressive'; applyQrBoostProfile('qr_boost_aggressive'); });
+    const btnQrBoostBottom = $('btnQrBoostBottom');
+    if (btnQrBoostBottom) btnQrBoostBottom.addEventListener('click', () => { if (qrBoostProfile) qrBoostProfile.value = 'bottom_qr_boost'; applyQrBoostProfile('bottom_qr_boost'); });
+    const btnQrBoostFront = $('btnQrBoostFront');
+    if (btnQrBoostFront) btnQrBoostFront.addEventListener('click', () => { if (qrBoostProfile) qrBoostProfile.value = 'front_qr_boost'; applyQrBoostProfile('front_qr_boost'); });
+
     // ---- legacy fence tools (still supported) ----
     const btnDraw = $('btnDraw');
     if (btnDraw) btnDraw.addEventListener('click', () => {

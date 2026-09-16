@@ -395,8 +395,9 @@ def create_app(rig, mission, fc, streams=None, bringup=None, pulse_s=2.0,
     @app.post("/api/camera/controls")
     async def camera_controls(req: Request):
         """Contract: {cam, exposure_us, gain_db, af_mode, adaptive,
-        brightness, contrast, saturation, sharpness} -> {ok, cam, controls}.
-        The UI sliders POST here (debounced)."""
+        brightness, contrast, saturation, sharpness, qr_boost_mode, qr_enhance_mode} -> {ok, cam, controls}.
+        The UI sliders POST here (debounced). QR boost profiles also via this endpoint.
+        Supports: qr_boost_profile / qr_boost_mode / profile for ISP, qr_enhance_mode / qr_software_enhance for SW."""
         try:
             body = await req.json()
         except Exception:
@@ -407,8 +408,36 @@ def create_app(rig, mission, fc, streams=None, bringup=None, pulse_s=2.0,
         c = rig.get(cam) if rig else None
         if c is None:
             return JSONResponse({"detail": "unknown camera (want cam1|cam2)"}, 404)
+        # QR boost profile — if profile specified, apply ISP profile first (Kabaddi setting)
+        profile = body.get("qr_boost_profile") or body.get("qr_boost_mode") or body.get("profile") or body.get("qr_profile")
+        if profile:
+            try:
+                # apply_qr_profile handles ISP tuning for QR pop vs ground
+                c.apply_qr_profile(profile)
+            except Exception as e:
+                log.warning("qr boost profile %r failed: %r", profile, e)
+        # Software enhance mode
+        if "qr_enhance_mode" in body or "qr_software_enhance" in body:
+            try:
+                sw = body.get("qr_enhance_mode")
+                if sw is None:
+                    # bool flag
+                    en = body.get("qr_software_enhance")
+                    if isinstance(en, bool):
+                        c.qr_boost["qr_software_enhance"] = en
+                    elif isinstance(en, str):
+                        c.qr_boost["qr_software_enhance"] = True
+                        c.qr_boost["qr_enhance_mode"] = en
+                else:
+                    if sw == "none":
+                        c.qr_boost["qr_software_enhance"] = False
+                    else:
+                        c.qr_boost["qr_software_enhance"] = True
+                        c.qr_boost["qr_enhance_mode"] = sw
+            except Exception as e:
+                log.debug("qr software enhance set failed: %r", e)
         applied = c.apply_tuning(body)
-        return {"ok": True, "status": "ok", "cam": cam, "controls": applied}
+        return {"ok": True, "status": "ok", "cam": cam, "controls": applied, "qr_boost": dict(c.qr_boost)}
 
     @app.get("/api/camera/{cam}/controls")
     async def get_controls(cam: str):

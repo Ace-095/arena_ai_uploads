@@ -47,6 +47,10 @@ cameras:
     autofocus: true
     rotation_deg: 0
     jpeg_quality: 80
+    qr_boost:
+      enabled: true
+      profile: "front_qr_boost"
+      software_mode: "qr_boost"
   bottom:
     model: "Waveshare IMX477 IR-CUT B"
     sensor: "IMX477"
@@ -60,7 +64,17 @@ cameras:
     ir_cut: true
     rotation_deg: 0
     jpeg_quality: 80
+    qr_boost:
+      enabled: true
+      profile: "bottom_qr_boost"
+      software_mode: "ground_suppress"
   single_cam_role: bottom
+
+qr_boost:
+  enabled: true
+  profile: "auto"
+  mode: "qr_boost_day"
+  software_mode: "qr_boost"
 
 detector:
   kind: auto

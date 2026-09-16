@@ -56,6 +56,11 @@ cameras:
     autofocus: true
     rotation_deg: 0
     jpeg_quality: 80
+    # Kabaddi setting — make QR pop more than ground: high contrast, high sharp, low sat
+    qr_boost:
+      enabled: true
+      profile: "front_qr_boost"   # contrast 1.6 sat 0.8 sharp 1.8 exp 6ms
+      software_mode: "qr_boost"   # CLAHE + unsharp + green suppression
 
   # Waveshare IMX477 IR-CUT B, 113° — from cam.txt
   # IMX477, 12.3 MP, 4056x3040, 7.9mm diag, 1.55um, f/2.8, 113° diag ~100° HFOV ~75° VFOV, fixed
@@ -74,6 +79,11 @@ cameras:
     ir_cut: true
     rotation_deg: 0
     jpeg_quality: 80
+    # Kabaddi setting — ground suppress: high contrast 1.9, sat 0.6 (grass desat), sharp 2.0, dark -12
+    qr_boost:
+      enabled: true
+      profile: "bottom_qr_boost"  # contrast 1.9 sat 0.6 sharp 2.0 exp 5ms — QR B/W pops vs green/brown ground
+      software_mode: "ground_suppress"  # strong green/brown desat + CLAHE
 
   single_cam_role: bottom
 
@@ -119,6 +129,16 @@ mission:
   coverage_mode: "fov_optimal"   # max coverage using cam FOV per cam.txt
   min_overlap: 0.2
 
+qr_boost:
+  enabled: true              # Global enable — makes QR pop vs ground (Kabaddi setting)
+  profile: "auto"            # auto = bottom_qr_boost for bottom, front_qr_boost for front
+  mode: "qr_boost_day"       # fallback profile: qr_boost_day / qr_boost_aggressive / qr_boost_lowlight
+  software_mode: "qr_boost"  # software enhance: qr_boost / ground_suppress / adaptive / none
+  # Hardware ISP tuning — high contrast + high sharpness + low saturation = QR B/W pops vs green/brown ground
+  # Bottom IMX477 B: contrast 1.9 sat 0.6 sharp 2.0 brightness -12 exp 5ms — ground suppressed
+  # Front Pi Cam3: contrast 1.6 sat 0.8 sharp 1.8 — AF continuous
+  # Aggressive: contrast 2.0 sat 0.5 sharp 2.2 — ground almost gray
+
 relay:
   interval_s: 2.0
   window_s: 15.0
@@ -126,7 +146,7 @@ relay:
   store_path: logs/pending_results.jsonl
   flush_poll_s: 5.0
 
-# --- A3 QR at 10/15 m notes ---
+# --- A3 QR at 10/15 m + Kabaddi camera setting (QR pop vs ground) ---
 # A3 297×420 mm at 15 m bottom 100° HFOV: footprint 35.7 m, 2028 px → 56.8 px/m → A3 ~17 px? Wait full-res 4056 → 34 px
 # Actually 2028×1520 binned: 2028/35.7=56.8 px/m → 0.297 m → 16.9 px full frame, tile 676 px → 640 input 16 px — detectable with 3x3 tiling
 # At 10 m: 2028/23.8=85 px/m → A3 25 px full, tile 24 px input — easier

@@ -220,6 +220,44 @@
       <p class="hint">Sliders apply live to selected camera (debounced). CAM1 = Pi Cam3 Standard 66° HFOV, CAM2 = IMX477 B 113° diag (~100° HFOV). Coverage uses bottom cam footprint for max area.</p>
     </div>
 
+    <div class="card" id="cardQrBoost" style="border-left: 3px solid #f59e0b;">
+      <h2>QR BOOST <span class="hint-inline">(Kabaddi setting · QR pops vs ground)</span></h2>
+      <div class="kv"><span>purpose</span><b>Make A3 QR B/W pop more than green/brown ground at 10/15 m</b></div>
+      <div class="row wrap">
+        <label class="inline">profile
+          <select id="qrBoostProfile">
+            <option value="normal">normal — auto</option>
+            <option value="qr_boost_day" selected>qr_boost_day — day 15m (contrast 1.8 sat 0.7 sharp 2.0)</option>
+            <option value="qr_boost_aggressive">aggressive — contrast 2.0 sat 0.5 sharp 2.2 (ground almost gray)</option>
+            <option value="qr_boost_lowlight">lowlight — overcast</option>
+            <option value="bottom_qr_boost">bottom IMX477 B — contrast 1.9 sat 0.6 sharp 2.0 (ground suppressed)</option>
+            <option value="front_qr_boost">front Pi Cam3 — contrast 1.6 sat 0.8 sharp 1.8</option>
+          </select>
+        </label>
+        <button id="btnQrBoostApply" class="btn small" style="background:#f59e0b;color:#111;">apply QR boost ISP</button>
+      </div>
+      <div class="row wrap">
+        <label class="inline">software enhance
+          <select id="qrSwMode">
+            <option value="none">none</option>
+            <option value="qr_boost" selected>qr_boost — CLAHE + unsharp + green suppress</option>
+            <option value="ground_suppress">ground_suppress — strong green/brown desat</option>
+            <option value="adaptive">adaptive — auto by brightness</option>
+          </select>
+        </label>
+        <button id="btnQrSwApply" class="btn small">apply software</button>
+        <button id="btnQrBoostOff" class="btn small">reset to normal</button>
+      </div>
+      <div class="kv"><span>how it works</span><b id="qrBoostInfo" style="font-size:11px; line-height:1.3;">High contrast 1.8-2.0 makes black/white QR pop vs mid-tone ground, low sat 0.5-0.7 desaturates green grass/brown dirt, high sharp 2.0+ makes finder patterns crisp at 15 m, slightly dark -10 avoids washout, manual exp 5 ms reduces blur.</b></div>
+      <div class="row wrap">
+        <button id="btnQrBoostDay" class="btn small" title="Day profile for A3 at 15 m">day 15m boost</button>
+        <button id="btnQrBoostAgg" class="btn small" title="Aggressive ground suppression">aggressive</button>
+        <button id="btnQrBoostBottom" class="btn small" title="Bottom cam ground suppress">bottom boost</button>
+        <button id="btnQrBoostFront" class="btn small" title="Front cam">front boost</button>
+      </div>
+      <p class="hint">Kabaddi setting: QR is on ground, so ground is noise. ISP: contrast HIGH (1.8-2.0) → QR B/W contrast vs ground, saturation LOW (0.5-0.7) → green/brown grass desaturated to gray, QR B/W stays, sharpness HIGH (2.0) → finder patterns crisp at 10/15 m, brightness -10 → white ground not blown, exposure manual 5 ms → less motion blur. Software: CLAHE on L channel + unsharp mask + HSV green/brown mask desat 40% + V boost. See docs/arena_test1/00_DETECTION... for pixel budget.</p>
+    </div>
+
     <div class="card" id="cardQr">
       <h2>QR / RESULT</h2>
       <div class="kv"><span>streak</span><b id="qrStreak">—</b></div>
