@@ -9,6 +9,20 @@ each one ends with an acceptance checklist; do not skip a checklist.
 | 02 | [`02_PI5_AI_HAT_CAMERAS_BENCH.md`](02_PI5_AI_HAT_CAMERAS_BENCH.md) | Raspberry Pi 5 + Hailo AI HAT + two CSI cameras brought up against the **simulated** vehicle | SITL | Pi 5, AI HAT+, Pi Cam 3, IMX477, field router |
 | 03 | [`03_REAL_FLIGHT_INTEGRATION.md`](03_REAL_FLIGHT_INTEGRATION.md) | Everything physically connected: Pixhawk, telemetry radio, Pi onboard, failsafes, flight-day procedure | real airframe | the full aircraft |
 
+## arena/test1 — Polygon + Configurable Height + FOV Coverage + A3 QR at 10/15 m
+
+New branch `arena/test1` adds polygon primary, fence inclusion conversion, configurable max height 5/10/15 m, FOV-optimal coverage per cam.txt, and tuned detection for A3 at 10/15 m.
+
+| # | Doc | What it covers |
+|---|-----|----------------|
+| 00 | [`arena_test1/00_DETECTION_AT_10_15M_A3_QR_HEF.md`](arena_test1/00_DETECTION_AT_10_15M_A3_QR_HEF.md) | **Why detection fails at 15 m, HEF impact, A3 pixel budget, and how to make it work every time** |
+| 01 | [`arena_test1/01_SITL_GAZEBO_POP_OS_WINDOWS11.md`](arena_test1/01_SITL_GAZEBO_POP_OS_WINDOWS11.md) | **Method 1:** Pop!_OS SITL + Gazebo + mission_pi, Windows 11 MP + UI bridge (two-laptop) |
+| 02 | [`arena_test1/02_PI5_AI_HAT_BENCH.md`](arena_test1/02_PI5_AI_HAT_BENCH.md) | **Method 2:** Real bench test Pi 5 + Hailo AI HAT + cams, no props |
+| 03 | [`arena_test1/03_REAL_FLIGHT.md`](arena_test1/03_REAL_FLIGHT.md) | **Method 3:** Real flight integration, preflight, flight day |
+
+Quick start: [`arena_test1/README.md`](arena_test1/README.md) — index of new features + which doc to read.
+
+
 ## Which one do I want?
 
 * *"The UI can't see the Pi / nothing works and I don't know which side is

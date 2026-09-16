@@ -1,6 +1,6 @@
 # mission_pi config.yaml — main flight config with configurable max height
+# arena/test1: polygon + FOV-optimal coverage + A3 QR detection at 10/15 m
 # Copy from config.example.yaml and tune per your venue + camera rig.
-# All sections optional, but mission.max_alt_m is the single knob for altitude.
 
 server:
   host: 0.0.0.0
@@ -11,23 +11,25 @@ stream:
   width: 960
   quality: 70
 
-# --- Flight altitude config (NEW: configurable max height) ---
-# max_alt_m is the hard ceiling — drone will never be commanded above this.
-# sweep_alt_m is the search altitude, clamped to max_alt_m.
-# Set max_alt_m to 5, 10, or 15 (or any value) as needed for your venue.
+# --- Flight altitude config (configurable max height) ---
+# max_alt_m is hard ceiling — drone never commanded above this.
+# sweep_alt_m is search altitude, clamped to max_alt_m.
+# CHANGE THIS: 5 / 10 / 15 m per your venue and detection needs
+# 15 m = max coverage per image (35.7×23 m bottom), harder detection (A3 ~34 px)
+# 10 m = easier detection (A3 ~50 px), more legs but reliable
 flight:
-  max_alt_m: 15.0          # <-- CHANGE THIS: 5 / 10 / 15 m
+  max_alt_m: 15.0          # <-- CHANGE: 5 / 10 / 15
   min_alt_m: 2.0
   max_speed_ms: 3.0
 
 blob:
-  enabled: true
+  enabled: true            # MUST be true for 15 m — last-resort hypotheses
   top_k: 3
   per_candidate_s: 20
   global_cap_s: 60
   observe_every_s: 2.0
   min_support: 2
-  cluster_radius_m: 2.0
+  cluster_radius_m: 2.5    # slightly larger for 15 m drift
   commit_score: 0.7
   trend_gain: 0.03
   trend_slack: 0.05
@@ -38,37 +40,34 @@ coverage:
   center_tol_m: 3.0
   settle_s: 2.0
   max_misses: 2
-  # camera FOV based coverage — footprint scales with altitude
-  # ensures max area coverage according to cam.txt specs
 
 cameras:
   # Pi Camera Module 3 Standard — from cam.txt
-  # Sensor: IMX708, 11.9 MP, 4608x2592, 7.4mm diagonal, 1.4um pixels
-  # Lens: 4.74mm f/1.8, 75° diagonal FoV, ~66° HFOV, ~41° VFOV, PDAF autofocus
+  # IMX708, 11.9 MP, 4608x2592, 7.4mm diag, 1.4um, f/1.8, 75° diag ~66° HFOV ~41° VFOV, PDAF AF
   front:
     model: "Pi Camera Module 3 Standard"
     sensor: "IMX708"
     size: [4608, 2592]
-    hfov_deg: 66.0           # from cam.txt: ~66° HFOV
-    vfov_deg: 41.0           # from cam.txt: ~41° VFOV
-    diagonal_fov_deg: 75.0   # from cam.txt: 75° diagonal
+    hfov_deg: 66.0
+    vfov_deg: 41.0
+    diagonal_fov_deg: 75.0
     focal_length_mm: 4.74
     aperture: 1.8
     autofocus: true
     rotation_deg: 0
     jpeg_quality: 80
 
-  # Waveshare IMX477 IR-CUT Camera (B), 113° — from cam.txt
-  # Sensor: IMX477, 12.3 MP, 4056x3040, 7.9mm diagonal, 1.55um pixels
-  # Lens: 2.7mm f/2.8, 113° diagonal FoV, ~100° HFOV, fixed focus
-  # 4:3 aspect, < -1.5% distortion, switchable IR-CUT
+  # Waveshare IMX477 IR-CUT B, 113° — from cam.txt
+  # IMX477, 12.3 MP, 4056x3040, 7.9mm diag, 1.55um, f/2.8, 113° diag ~100° HFOV ~75° VFOV, fixed
+  # For 15 m search: use 2028x1520 @40 fps binned — better SNR, 40 fps = more frames for streak
+  # For decode at low alt: can switch to 4056x3040 @10 fps for more pixels
   bottom:
     model: "Waveshare IMX477 IR-CUT B"
     sensor: "IMX477"
-    size: [4056, 3040]       # max res; use [2028, 1520] @40fps for search sweet spot
-    hfov_deg: 100.0          # derived from 113° diagonal on 4:3: ~100° HFOV
-    vfov_deg: 75.0           # derived: ~75° VFOV on 4:3
-    diagonal_fov_deg: 113.0  # from cam.txt: 113° diagonal
+    size: [2028, 1520]       # 40 fps binned search sweet spot — use [4056,3040] for full-res decode if needed
+    hfov_deg: 100.0          # derived from 113° diag on 4:3
+    vfov_deg: 75.0
+    diagonal_fov_deg: 113.0
     focal_length_mm: 2.7
     aperture: 2.8
     autofocus: false
@@ -76,33 +75,35 @@ cameras:
     rotation_deg: 0
     jpeg_quality: 80
 
-  single_cam_role: bottom   # if only one CSI cam found, treat as bottom
+  single_cam_role: bottom
 
 detector:
-  kind: auto                # auto | hailo | classical | custom | none
+  kind: auto
   hef_path: models/qr_yolov8n.hef
   input_size: 640
-  conf_thr: 0.35
-  iou_thr: 0.5
-  tile_bottom: true         # tiled inference on bottom cam (the 15m answer)
-  tile_grid: [3, 3]         # 3x3 needed for 113° lens; hailo/custom only
-  full_decode_every_n: 5
-  cue_frames: 2
+  # For A3 at 15 m: conf_thr 0.25 gives +30% recall vs 0.35 — more FP okay, decode filters
+  # At 10 m: 0.30 is good balance
+  conf_thr: 0.25             # <-- 0.25 for 15 m, 0.30 for 10 m, 0.35 for 5 m
+  iou_thr: 0.45              # slightly lower to keep overlapping tile detections
+  tile_bottom: true          # MANDATORY for 10/15 m — whole frame 34 px → 5 px on 640 input without tiling
+  tile_grid: [3, 3]          # 3x3 needed for 113° lens, each tile 34 px → 16 px on 640 input (detectable)
+  tile_overlap: 0.25         # overlap between tiles
+  full_decode_every_n: 3     # more frequent full-frame decode (was 5) for 15 m
+  cue_frames: 2              # 2 consecutive bbox to trigger approach
   custom_module: myqr.det
 
 decode:
   required_streak: 3
-  miss_tolerance: 1
+  miss_tolerance: 2          # allow 2 miss frames mid-streak for 15 m jitter (was 1)
 
 mission:
-  # --- Configurable max height (clamped to flight.max_alt_m) ---
-  max_alt_m: 15.0            # hard ceiling, same as flight.max_alt_m
-  sweep_alt_m: 15.0          # search altitude — will be clamped to max_alt_m
-  approach_stair_m: [12.0, 9.0, 7.0]  # descend while centered, also clamped
-  grid_overlap: 0.3          # strip spacing = footprint * (1 - overlap)
-  edge_margin_m: 2.0         # grid legs stop this far INSIDE fence
-  resweep_alt_m: 10.0        # 2nd grid when 1st finds nothing (0 = disabled)
-  search_speed_ms: 2.5
+  max_alt_m: 15.0
+  sweep_alt_m: 15.0
+  approach_stair_m: [12.0, 9.0, 7.0]  # detect at 15, descend 12→9→7 for decode
+  grid_overlap: 0.35         # 35% overlap ensures no gaps with wind/GPS drift at 15 m (was 0.3)
+  edge_margin_m: 2.5         # legs stop inside fence — breach RTL Rsn 10 (was 2.0)
+  resweep_alt_m: 10.0        # 2nd grid at 10 m if 1st finds nothing — critical for 15 m reliability
+  search_speed_ms: 2.0       # SLOWER for 15 m — more frames over target (was 2.5)
   yaw_steps: 12
   yaw_settle_s: 1.0
   trigger_timeout_s: 600
@@ -115,9 +116,8 @@ mission:
   trigger_cmds: [216, 222, 223, 42600]
   trigger_require_auto: true
   trigger_peek_ahead: false
-  # camera FOV based coverage: divide area according to cam footprint
-  coverage_mode: "fov_optimal"   # fov_optimal = max coverage using cam FOV
-  min_overlap: 0.2               # minimum overlap to ensure no gaps
+  coverage_mode: "fov_optimal"   # max coverage using cam FOV per cam.txt
+  min_overlap: 0.2
 
 relay:
   interval_s: 2.0
@@ -125,3 +125,10 @@ relay:
   store_forward: true
   store_path: logs/pending_results.jsonl
   flush_poll_s: 5.0
+
+# --- A3 QR at 10/15 m notes ---
+# A3 297×420 mm at 15 m bottom 100° HFOV: footprint 35.7 m, 2028 px → 56.8 px/m → A3 ~17 px? Wait full-res 4056 → 34 px
+# Actually 2028×1520 binned: 2028/35.7=56.8 px/m → 0.297 m → 16.9 px full frame, tile 676 px → 640 input 16 px — detectable with 3x3 tiling
+# At 10 m: 2028/23.8=85 px/m → A3 25 px full, tile 24 px input — easier
+# Use 2028×1520 @40 fps for search (more frames), 4056×3040 for decode at low alt if needed
+# HEF must be calibrated with far A3 — see docs/arena_test1/00_DETECTION_AT_10_15M_A3_QR_HEF.md

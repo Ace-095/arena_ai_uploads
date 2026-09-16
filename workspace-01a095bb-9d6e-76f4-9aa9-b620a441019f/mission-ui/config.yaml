@@ -46,13 +46,30 @@ fence:
 
 # --- Coverage planning (FOV-based) ---
 coverage:
-  mode: "fov_optimal"       # fov_optimal = max coverage using cam FOV
-  overlap: 0.3              # 30% overlap ensures no gaps
+  mode: "fov_optimal"       # fov_optimal = max coverage using cam FOV per cam.txt
+  overlap: 0.35             # 35% overlap for 15 m ensures no gaps with wind/GPS drift (0.30 for 10 m)
   min_overlap: 0.2
   cell_m: 5.0
-  # At 15m with IMX477 100° HFOV: footprint ~36m wide, spacing ~25m with 0.3 overlap
-  # At 10m: ~24m wide, spacing ~17m
-  # At 5m: ~12m wide, spacing ~8m — more legs, better resolution
+  # Footprint math: w=2*alt*tan(HFOV/2), spacing=min(w,h)*(1-overlap)
+  # Bottom 100° HFOV: at 15 m ~35.7×23.0 m spacing ~15 m (0.35 overlap), at 10 m ~23.8×15.3 m spacing ~10 m
+  # Front 66° HFOV: at 15 m ~19.5×11.2 m spacing ~7.3 m — smaller, more legs, better for detail
+  # For A3 QR 297×420 mm: at 15 m A3 ~34 px full-res, ~16 px on 640 input with 3×3 tiling — needs tiling
+
+# --- Detection tuning for A3 at 10/15 m ---
+detection:
+  # A3 QR pixel budget: at 15 m bottom 35.7 m footprint 4056 px → 8.8 mm/px → A3 34 px
+  # With 3×3 tiling: 34 px in tile → 16 px on 640 input — detectable if HEF trained on small QR
+  # At 10 m: 50 px full-res → 23 px on 640 input — easier
+  a3_size_m: [0.297, 0.42]
+  conf_thr_15m: 0.25         # low for 15 m recall
+  conf_thr_10m: 0.30
+  conf_thr_5m: 0.35
+  tile_bottom: true
+  tile_grid: [3, 3]
+  tile_overlap: 0.25
+  search_speed_15m: 2.0      # slower for more frames
+  search_speed_10m: 2.2
+  resweep_alt: 10.0          # second grid at 10 m if 15 m fails — critical for reliability
 
 # --- Bridge / MAVLink ---
 bridge:
