@@ -232,6 +232,12 @@
             <option value="qr_boost_lowlight">lowlight — overcast</option>
             <option value="bottom_qr_boost">bottom IMX477 B — contrast 1.9 sat 0.6 sharp 2.0 (ground suppressed)</option>
             <option value="front_qr_boost">front Pi Cam3 — contrast 1.6 sat 0.8 sharp 1.8</option>
+            <option value="daylight">daylight — normal auto</option>
+            <option value="dark">dark — pitch dark 30ms 20dB bri 80</option>
+            <option value="night">night — max 50ms 24dB bri 100</option>
+            <option value="dark_qr_boost">dark_qr_boost — BEST dark QR (contrast 1.8 sat 0.6 sharp 2.0)</option>
+            <option value="qr_boost_night">qr_boost_night — night QR boost</option>
+            <option value="gazebo_dark">gazebo_dark — for gz_cam_bridge contrast 2.2 bri 1.3</option>
           </select>
         </label>
         <button id="btnQrBoostApply" class="btn small" style="background:#f59e0b;color:#111;">apply QR boost ISP</button>
@@ -254,8 +260,51 @@
         <button id="btnQrBoostAgg" class="btn small" title="Aggressive ground suppression">aggressive</button>
         <button id="btnQrBoostBottom" class="btn small" title="Bottom cam ground suppress">bottom boost</button>
         <button id="btnQrBoostFront" class="btn small" title="Front cam">front boost</button>
+        <button id="btnPresetDark" class="btn small" style="background:#ef4444;color:#fff;" title="Pitch dark you saw">dark</button>
+        <button id="btnPresetDarkQr" class="btn small" style="background:#10b981;color:#111;" title="BEST for QR in pitch dark">dark QR boost</button>
       </div>
-      <p class="hint">Kabaddi setting: QR is on ground, so ground is noise. ISP: contrast HIGH (1.8-2.0) → QR B/W contrast vs ground, saturation LOW (0.5-0.7) → green/brown grass desaturated to gray, QR B/W stays, sharpness HIGH (2.0) → finder patterns crisp at 10/15 m, brightness -10 → white ground not blown, exposure manual 5 ms → less motion blur. Software: CLAHE on L channel + unsharp mask + HSV green/brown mask desat 40% + V boost. See docs/arena_test1/00_DETECTION... for pixel budget.</p>
+      <p class="hint">Kabaddi setting: QR is on ground, so ground is noise. ISP: contrast HIGH (1.8-2.0) → QR B/W contrast vs ground, saturation LOW (0.5-0.7) → green/brown grass desaturated to gray, QR B/W stays, sharpness HIGH (2.0) → finder patterns crisp at 10/15 m, brightness -10 → white ground not blown, exposure manual 5 ms → less motion blur. Software: CLAHE on L channel + unsharp mask + HSV green/brown mask desat 40% + V boost. Dark presets: dark 30ms 20dB bri 80 for pitch dark you saw, dark_qr_boost adds QR boost.</p>
+    </div>
+
+    <div class="card" id="cardPresets" style="border-left: 3px solid #10b981;">
+      <h2>PRESETS + FAKE FILTER <span class="hint-inline">(integrated workflow · one click for dark + zero fakes)</span></h2>
+      <div class="kv"><span>active preset</span><b id="presetActive">—</b></div>
+      <div class="row wrap">
+        <label class="inline">preset
+          <select id="presetSelect">
+            <option value="daylight">daylight — normal auto</option>
+            <option value="dark">dark — pitch dark 30ms 20dB bri 80 (your dark)</option>
+            <option value="night">night — max 50ms 24dB bri 100</option>
+            <option value="dark_qr_boost" selected>dark_qr_boost — BEST dark QR (contrast 1.8 sat 0.6 sharp 2.0)</option>
+            <option value="qr_boost_day">qr_boost_day — day QR pop</option>
+            <option value="qr_boost_night">qr_boost_night — night QR boost</option>
+            <option value="gazebo_dark">gazebo_dark — gz_cam_bridge dark</option>
+          </select>
+        </label>
+        <button id="btnPresetApplyCam2" class="btn small" style="background:#10b981;color:#111;">apply to CAM2 (bottom)</button>
+        <button id="btnPresetApplyAll" class="btn small">apply to ALL cams</button>
+      </div>
+      <div class="row wrap">
+        <button id="btnPresetDay" class="btn small">daylight</button>
+        <button id="btnPresetDark" class="btn small" style="background:#ef4444;color:#fff;">dark</button>
+        <button id="btnPresetNight" class="btn small">night</button>
+        <button id="btnPresetDarkQr2" class="btn small" style="background:#10b981;color:#111;">dark QR boost (BEST)</button>
+        <button id="btnPresetGzDark" class="btn small">gazebo dark</button>
+      </div>
+      <div class="kv"><span>fake filter (grill 0.16/0.24)</span><b id="fakeFilterInfo" style="font-size:11px;">—</b></div>
+      <div class="row wrap">
+        <label class="inline"><input id="fakeEnabled" type="checkbox" checked> enabled</label>
+        <label class="inline"><input id="fakeHide" type="checkbox" checked> hide fake (orange)</label>
+        <label class="inline"><input id="fakeRequire" type="checkbox" checked> require decode (ONLY green, zero fakes)</label>
+      </div>
+      <div class="row wrap">
+        <label class="inline">conf thr <input id="fakeConf" type="number" value="0.35" min="0.05" max="0.9" step="0.05" style="width:60px;"></label>
+        <label class="inline">min size <input id="fakeMinSize" type="number" value="15" min="5" max="100" step="5" style="width:60px;"> px</label>
+        <button id="btnFakeApply" class="btn small" style="background:#10b981;color:#111;">apply fake filter</button>
+        <button id="btnFakeOff" class="btn small">show all (debug)</button>
+      </div>
+      <div class="kv"><span>preset info</span><b id="presetInfo" style="font-size:11px; line-height:1.3;">dark_qr_boost: exposure 30ms, gain 20dB, brightness 80, contrast 1.8, sat 0.6, sharp 2.0 + QR boost ground_suppress + detector require_decode=true hide_fake=true conf 0.30 — BEST for QR in pitch dark, kills grill fakes</b></div>
+      <p class="hint">Integrated workflow: one preset = Pi ISP (exposure_us/gain_db/brightness/contrast/saturation/sharpness/adaptive/af_mode) + software enhance (CLAHE+unsharp+ground suppress) + detector fake filter (aspect 0.4-2.5 min 15px conf 0.35 hide low-conf orange). For ground: use dark_qr_boost + require_decode=true = zero fakes, only green MISSION-QR-001 triggers. For room test with window grill: dark_qr_boost hides 0.16/0.24 grill fakes (raw:2 filt:0).</p>
     </div>
 
     <div class="card" id="cardQr">

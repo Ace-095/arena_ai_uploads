@@ -699,6 +699,141 @@ function boot() {
     if (btnQrBoostBottom) btnQrBoostBottom.addEventListener('click', () => { if (qrBoostProfile) qrBoostProfile.value = 'bottom_qr_boost'; applyQrBoostProfile('bottom_qr_boost'); });
     const btnQrBoostFront = $('btnQrBoostFront');
     if (btnQrBoostFront) btnQrBoostFront.addEventListener('click', () => { if (qrBoostProfile) qrBoostProfile.value = 'front_qr_boost'; applyQrBoostProfile('front_qr_boost'); });
+    const btnPresetDark = $('btnPresetDark');
+    if (btnPresetDark) btnPresetDark.addEventListener('click', () => { if (qrBoostProfile) qrBoostProfile.value = 'dark'; applyQrBoostProfile('dark'); applyPreset('dark', 'cam2', false); });
+    const btnPresetDarkQr = $('btnPresetDarkQr');
+    if (btnPresetDarkQr) btnPresetDarkQr.addEventListener('click', () => { if (qrBoostProfile) qrBoostProfile.value = 'dark_qr_boost'; applyQrBoostProfile('dark_qr_boost'); applyPreset('dark_qr_boost', 'cam2', false); });
+
+    // ---- PRESETS + FAKE FILTER — integrated workflow (one click dark + zero fakes) ----
+    const presetSelect = $('presetSelect');
+    const presetActive = $('presetActive');
+    const presetInfo = $('presetInfo');
+    const fakeFilterInfo = $('fakeFilterInfo');
+
+    function applyPreset(presetName, cam, allCams) {
+      const piBase = (S.piUrl || '').replace(/\/$/, '');
+      if (!piBase) { log('ERROR', 'no Pi URL for preset apply'); return; }
+      const body = { cam: cam || 'cam2', all: !!allCams };
+      // Try new /api/presets endpoint (integrated)
+      fetch(piBase + '/api/presets/' + presetName, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      }).then(r => r.ok ? r.json() : r.text().then(t=>{throw new Error(t)})).then(res => {
+        log('WARN', 'Preset ' + presetName + ' → ' + (body.all ? 'ALL cams' : body.cam) + ': ' + (res.description || '') + ' — ' + JSON.stringify(res.detector || {}));
+        if (presetActive) presetActive.textContent = presetName + ' → ' + (body.all ? 'ALL' : body.cam);
+        if (presetInfo) presetInfo.textContent = presetName + ': ' + (res.description || '') + ' detector ' + JSON.stringify(res.detector || {});
+        if (fakeFilterInfo) fakeFilterInfo.textContent = 'detector ' + JSON.stringify(res.detector || {}) + ' — grill 0.16/0.24 hidden';
+        // Also update QR boost dropdown to reflect
+        if ($('qrBoostProfile')) $('qrBoostProfile').value = presetName;
+        // Refresh camera controls
+        setTimeout(seedCamControls, 500);
+      }).catch(e => {
+        // Fallback to old /api/camera/controls
+        log('INFO', 'presets API failed, fallback to camera controls: ' + e.message);
+        applyQrBoostProfile(presetName);
+      });
+    }
+
+    function loadPresets() {
+      const piBase = (S.piUrl || '').replace(/\/$/, '');
+      if (!piBase) return;
+      fetch(piBase + '/api/presets').then(r => r.ok ? r.json() : Promise.reject()).then(res => {
+        if (res && res.presets) {
+          if (presetActive) presetActive.textContent = (res.active || 'dark_qr_boost') + ' (' + (res.available ? res.available.length : '?') + ' available)';
+          if (presetInfo && res.presets[res.active || 'dark_qr_boost']) {
+            const p = res.presets[res.active || 'dark_qr_boost'];
+            presetInfo.textContent = (res.active || 'dark_qr_boost') + ': ' + p.description + ' detector ' + JSON.stringify(p.detector || {});
+          }
+          log('INFO', 'presets loaded: ' + (res.available ? res.available.join(', ') : ''));
+        }
+        return fetch(piBase + '/api/detector/fake_filter');
+      }).then(r => r && r.ok ? r.json() : Promise.reject()).then(res => {
+        if (res && res.fake_filter) {
+          const ff = res.fake_filter;
+          if ($('fakeEnabled')) $('fakeEnabled').checked = ff.enabled !== false;
+          if ($('fakeHide')) $('fakeHide').checked = ff.hide_fake !== false;
+          if ($('fakeRequire')) $('fakeRequire').checked = !!ff.require_decode;
+          if ($('fakeConf')) $('fakeConf').value = ff.conf_thr || 0.35;
+          if ($('fakeMinSize')) $('fakeMinSize').value = ff.min_size || 15;
+          if (fakeFilterInfo) fakeFilterInfo.textContent = JSON.stringify(ff) + ' — grill 0.16/0.24 ' + (ff.hide_fake ? 'hidden' : 'shown');
+        }
+      }).catch(()=>{});
+    }
+
+    // Wire preset buttons
+    const btnPresetApplyCam2 = $('btnPresetApplyCam2');
+    if (btnPresetApplyCam2) btnPresetApplyCam2.addEventListener('click', () => {
+      const name = presetSelect ? presetSelect.value : 'dark_qr_boost';
+      applyPreset(name, 'cam2', false);
+    });
+    const btnPresetApplyAll = $('btnPresetApplyAll');
+    if (btnPresetApplyAll) btnPresetApplyAll.addEventListener('click', () => {
+      const name = presetSelect ? presetSelect.value : 'dark_qr_boost';
+      applyPreset(name, 'cam2', true);
+    });
+    const btnPresetDay = $('btnPresetDay');
+    if (btnPresetDay) btnPresetDay.addEventListener('click', () => applyPreset('daylight', 'cam2', false));
+    const btnPresetDark2 = $('btnPresetDark');
+    if (btnPresetDark2 && btnPresetDark2 !== $('btnPresetDark')) btnPresetDark2.addEventListener('click', () => applyPreset('dark', 'cam2', false));
+    // There are two btnPresetDark ids (QR boost card and presets card) — handle both
+    document.querySelectorAll('#btnPresetDark').forEach(el => el.addEventListener('click', () => applyPreset('dark', 'cam2', false)));
+    const btnPresetNight = $('btnPresetNight');
+    if (btnPresetNight) btnPresetNight.addEventListener('click', () => applyPreset('night', 'cam2', false));
+    const btnPresetDarkQr2 = $('btnPresetDarkQr2');
+    if (btnPresetDarkQr2) btnPresetDarkQr2.addEventListener('click', () => applyPreset('dark_qr_boost', 'cam2', false));
+    const btnPresetGzDark = $('btnPresetGzDark');
+    if (btnPresetGzDark) btnPresetGzDark.addEventListener('click', () => applyPreset('gazebo_dark', 'cam2', false));
+
+    const btnFakeApply = $('btnFakeApply');
+    if (btnFakeApply) btnFakeApply.addEventListener('click', () => {
+      const piBase = (S.piUrl || '').replace(/\/$/, '');
+      if (!piBase) { log('ERROR', 'no Pi URL'); return; }
+      const body = {
+        enabled: $('fakeEnabled') ? $('fakeEnabled').checked : true,
+        hide_fake: $('fakeHide') ? $('fakeHide').checked : true,
+        require_decode: $('fakeRequire') ? $('fakeRequire').checked : true,
+        conf_thr: parseFloat($('fakeConf') ? $('fakeConf').value : '0.35'),
+        min_size: parseInt($('fakeMinSize') ? $('fakeMinSize').value : '15', 10),
+      };
+      fetch(piBase + '/api/detector/fake_filter', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      }).then(r => r.ok ? r.json() : r.text().then(t=>{throw new Error(t)})).then(res => {
+        log('WARN', 'Fake filter applied: ' + JSON.stringify(res.fake_filter || res) + ' — grill 0.16/0.24 ' + (body.hide_fake ? 'hidden' : 'shown') + (body.require_decode ? ' ONLY decoded' : ''));
+        if (fakeFilterInfo) fakeFilterInfo.textContent = JSON.stringify(res.fake_filter || body) + ' — grill hidden, zero fakes for ground';
+      }).catch(e => log('ERROR', 'fake filter failed: ' + e.message));
+    });
+
+    const btnFakeOff = $('btnFakeOff');
+    if (btnFakeOff) btnFakeOff.addEventListener('click', () => {
+      const piBase = (S.piUrl || '').replace(/\/$/, '');
+      if (!piBase) return;
+      const body = { enabled: false, hide_fake: false, require_decode: false, conf_thr: 0.10, min_size: 5 };
+      fetch(piBase + '/api/detector/fake_filter', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      }).then(r => r.json()).then(res => {
+        log('INFO', 'Fake filter OFF — showing all raw boxes (debug): ' + JSON.stringify(res.fake_filter));
+        if (fakeFilterInfo) fakeFilterInfo.textContent = 'OFF — showing all raw (debug) ' + JSON.stringify(res.fake_filter);
+        if ($('fakeEnabled')) $('fakeEnabled').checked = false;
+        if ($('fakeHide')) $('fakeHide').checked = false;
+        if ($('fakeRequire')) $('fakeRequire').checked = false;
+      });
+    });
+
+    // Load presets after Pi probe
+    setTimeout(loadPresets, 2000);
+    // Also reload on Pi connect
+    const origOnStatus = pi ? pi.onStatus : null;
+    // Hook via polling probe result already calls probeCameras — we also load presets there
+    // For simplicity, reload presets every time cameras probed
+    const _origProbe = probeCameras;
+    probeCameras = function() {
+      const p = _origProbe.apply(this, arguments);
+      if (p && p.then) p.then(() => loadPresets());
+      else loadPresets();
+      return p;
+    };
 
     // ---- legacy fence tools (still supported) ----
     const btnDraw = $('btnDraw');
@@ -989,12 +1124,16 @@ function boot() {
     tabCam1.classList.add('on'); const t2 = $('tabCam2'); if (t2) t2.classList.remove('on');
     const c1 = $('camCtls1'); if (c1) c1.classList.remove('hidden');
     const c2 = $('camCtls2'); if (c2) c2.classList.add('hidden');
+    S.camActive = 'cam1';
   });
   if (tabCam2) tabCam2.addEventListener('click', () => {
     tabCam2.classList.add('on'); if (tabCam1) tabCam1.classList.remove('on');
     const c2 = $('camCtls2'); if (c2) c2.classList.remove('hidden');
     const c1 = $('camCtls1'); if (c1) c1.classList.add('hidden');
+    S.camActive = 'cam2';
   });
+  // default active cam
+  S.camActive = 'cam2';
 
   CAMS.forEach((c) => {
     ['Exp', 'Gain', 'Bri', 'Con', 'Sat', 'Sha'].forEach((name) => {
