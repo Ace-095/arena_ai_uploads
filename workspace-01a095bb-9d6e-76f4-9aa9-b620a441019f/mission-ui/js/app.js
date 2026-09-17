@@ -699,10 +699,10 @@ function boot() {
     if (btnQrBoostBottom) btnQrBoostBottom.addEventListener('click', () => { if (qrBoostProfile) qrBoostProfile.value = 'bottom_qr_boost'; applyQrBoostProfile('bottom_qr_boost'); });
     const btnQrBoostFront = $('btnQrBoostFront');
     if (btnQrBoostFront) btnQrBoostFront.addEventListener('click', () => { if (qrBoostProfile) qrBoostProfile.value = 'front_qr_boost'; applyQrBoostProfile('front_qr_boost'); });
-    const btnPresetDark = $('btnPresetDark');
-    if (btnPresetDark) btnPresetDark.addEventListener('click', () => { if (qrBoostProfile) qrBoostProfile.value = 'dark'; applyQrBoostProfile('dark'); applyPreset('dark', 'cam2', false); });
-    const btnPresetDarkQr = $('btnPresetDarkQr');
-    if (btnPresetDarkQr) btnPresetDarkQr.addEventListener('click', () => { if (qrBoostProfile) qrBoostProfile.value = 'dark_qr_boost'; applyQrBoostProfile('dark_qr_boost'); applyPreset('dark_qr_boost', 'cam2', false); });
+    const btnQrBoostDark = $('btnQrBoostDark') || $('btnPresetDark');
+    if (btnQrBoostDark) btnQrBoostDark.addEventListener('click', () => { if (qrBoostProfile) qrBoostProfile.value = 'dark'; applyQrBoostProfile('dark'); applyPreset('dark', 'cam2', false); });
+    const btnQrBoostDarkQr = $('btnQrBoostDarkQr') || $('btnPresetDarkQr');
+    if (btnQrBoostDarkQr) btnQrBoostDarkQr.addEventListener('click', () => { if (qrBoostProfile) qrBoostProfile.value = 'dark_qr_boost'; applyQrBoostProfile('dark_qr_boost'); applyPreset('dark_qr_boost', 'cam2', false); });
 
     // ---- PRESETS + FAKE FILTER — integrated workflow (one click dark + zero fakes) ----
     const presetSelect = $('presetSelect');
@@ -773,10 +773,8 @@ function boot() {
     });
     const btnPresetDay = $('btnPresetDay');
     if (btnPresetDay) btnPresetDay.addEventListener('click', () => applyPreset('daylight', 'cam2', false));
-    const btnPresetDark2 = $('btnPresetDark');
-    if (btnPresetDark2 && btnPresetDark2 !== $('btnPresetDark')) btnPresetDark2.addEventListener('click', () => applyPreset('dark', 'cam2', false));
-    // There are two btnPresetDark ids (QR boost card and presets card) — handle both
-    document.querySelectorAll('#btnPresetDark').forEach(el => el.addEventListener('click', () => applyPreset('dark', 'cam2', false)));
+    const btnPresetDark = $('btnPresetDark');
+    if (btnPresetDark) btnPresetDark.addEventListener('click', () => applyPreset('dark', 'cam2', false));
     const btnPresetNight = $('btnPresetNight');
     if (btnPresetNight) btnPresetNight.addEventListener('click', () => applyPreset('night', 'cam2', false));
     const btnPresetDarkQr2 = $('btnPresetDarkQr2');
