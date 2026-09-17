@@ -185,7 +185,9 @@ def load_detector(model_path, conf_thr=0.25, use_onnx=False):
         from detectors.yolo_ultralytics import YoloUltralyticsDetector
         return YoloUltralyticsDetector(model_path, conf_thr=conf_thr)
 
-def decode_qr_in_box(frame, box):
+def decode_qr_in_box(frame, box, try_enhance=True):
+    """Try to decode QR payload from box crop — returns payload or None.
+    Tries multiple methods: cv2 QR, pyzbar, enhanced gray, CLAHE"""
     x,y,w,h = box.x, box.y, box.w, box.h
     x0 = max(0, x-10)
     y0 = max(0, y-10)
@@ -194,6 +196,8 @@ def decode_qr_in_box(frame, box):
     crop = frame[y0:y1, x0:x1]
     if crop.size == 0:
         return None
+
+    # 1) cv2 QR on color crop
     try:
         detector = cv2.QRCodeDetector()
         data, bbox, _ = detector.detectAndDecode(crop)
@@ -201,6 +205,8 @@ def decode_qr_in_box(frame, box):
             return data
     except Exception:
         pass
+
+    # 2) pyzbar on color
     try:
         from pyzbar.pyzbar import decode
         from PIL import Image
@@ -210,19 +216,98 @@ def decode_qr_in_box(frame, box):
             return decoded[0].data.decode('utf-8', 'ignore')
     except Exception:
         pass
+
+    if not try_enhance:
+        return None
+
+    # 3) Enhanced attempts for dark / low contrast — gray + CLAHE + threshold
+    try:
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if len(crop.shape)==3 else crop
+        # upscale small crops for better decode (15m triple QR ~200px, but A3 34px needs 3x)
+        if min(gray.shape[:2]) < 100:
+            gray = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+
+        # CLAHE
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+        gray_enh = clahe.apply(gray)
+
+        detector = cv2.QRCodeDetector()
+        for g in (gray_enh, gray, cv2.threshold(gray_enh, 0, 255, cv2.THRESH_BINARY+cv2.THRESH_OTSU)[1]):
+            data, bbox, _ = detector.detectAndDecode(g)
+            if data:
+                return data
+
+        # pyzbar on enhanced gray
+        try:
+            from pyzbar.pyzbar import decode
+            from PIL import Image
+            pil = Image.fromarray(gray_enh)
+            decoded = decode(pil)
+            if decoded:
+                return decoded[0].data.decode('utf-8', 'ignore')
+        except Exception:
+            pass
+    except Exception:
+        pass
+
     return None
 
-def draw_boxes(frame, boxes, payloads):
+def is_fake_box(box, frame_shape=None):
+    """Heuristic to filter obvious non-QR: extreme aspect, too small, too large"""
+    x,y,w,h = box.x, box.y, box.w, box.h
+    if w < 15 or h < 15:
+        return True  # too small — noise
+    if frame_shape:
+        fh, fw = frame_shape[:2]
+        if w > fw*0.9 or h > fh*0.9:
+            return True  # almost full frame — not QR
+    # QR is roughly square: aspect 0.6-1.6, but allow some perspective
+    aspect = w / (h+1e-6)
+    if aspect < 0.4 or aspect > 2.5:
+        return True  # tall grill like your image right box
+    return False
+
+def filter_boxes(boxes, payloads, frame_shape=None, require_decode=False, hide_fake=False, min_conf=0.0):
+    """Filter YOLO boxes to remove fakes — returns filtered (boxes, payloads)"""
+    out_boxes = []
+    out_payloads = []
+    for b, p in zip(boxes, payloads):
+        # conf filter
+        if b.conf < min_conf:
+            continue
+        # fake geometry filter if hide_fake
+        if hide_fake and is_fake_box(b, frame_shape):
+            continue
+        # require decode — only keep if payload decoded (kills window grill fakes)
+        if require_decode and p is None:
+            continue
+        # hide_fake also hides low-conf non-decoded (your 0.16, 0.24 orange boxes)
+        if hide_fake and p is None and b.conf < 0.35:
+            continue
+        out_boxes.append(b)
+        out_payloads.append(p)
+    return out_boxes, out_payloads
+
+def draw_boxes(frame, boxes, payloads, show_fake=True):
     out = frame.copy()
     for i,b in enumerate(boxes):
         x,y,w,h = b.x, b.y, b.w, b.h
         conf = b.conf
         payload = payloads[i] if i < len(payloads) else None
-        color = (0,255,0) if payload else (0,165,255)
-        cv2.rectangle(out, (x,y), (x+w, y+h), color, 2)
+        if payload:
+            color = (0,255,0)  # green = real decoded
+            thick = 3
+        else:
+            if not show_fake:
+                continue
+            color = (0,165,255)  # orange = YOLO only, no decode — likely fake like grill
+            thick = 2
+        cv2.rectangle(out, (x,y), (x+w, y+h), color, thick)
         label = f"QR {conf:.2f}"
         if payload:
             label += f" {payload}"
+        else:
+            label += " (no decode)"
         cv2.putText(out, label, (x, max(15,y-8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
     return out
 
@@ -230,7 +315,7 @@ def main():
     ap = argparse.ArgumentParser(description="Test Pi YOLOv8 QR model on laptop webcam with live preset control")
     ap.add_argument("--source", default="0", help="0=webcam, 1=second cam, path=image, http://=mjpeg")
     ap.add_argument("--model", default="models/qr_yolov8n.pt", help="models/qr_yolov8n.pt (24MB) or .onnx (12MB)")
-    ap.add_argument("--conf", type=float, default=0.15, help="conf threshold 0.25 for 15m, 0.10-0.15 for laptop test")
+    ap.add_argument("--conf", type=float, default=0.35, help="conf threshold 0.35 default to kill fakes (was 0.15), 0.25 for 15m ground, 0.10 for debug")
     ap.add_argument("--onnx", action="store_true", help="force ONNX detector (lighter)")
     ap.add_argument("--tiled", action="store_true", help="use 3x3 tiled detection (mandatory for A3 at 15m 34px)")
     ap.add_argument("--save", default="", help="save result image")
@@ -244,6 +329,12 @@ def main():
     ap.add_argument("--gain", type=float, default=None, help="V4L2 gain 0..100")
     ap.add_argument("--exposure", type=float, default=None, help="V4L2 exposure 1..500")
     ap.add_argument("--v4l2-brightness", type=float, default=None, help="V4L2 brightness -64..64")
+    # Fake filtering — fix for window grill false positives you saw
+    ap.add_argument("--require-decode", action="store_true", help="ONLY show boxes that actually decode to payload — kills ALL fakes (recommended for ground)")
+    ap.add_argument("--decoded-only", action="store_true", help="alias for --require-decode")
+    ap.add_argument("--hide-fake", action="store_true", help="hide low-conf non-decoded boxes + extreme aspect (your 0.16/0.24 grill)")
+    ap.add_argument("--show-fake", action="store_true", help="show orange non-decoded boxes (debug, default now hidden for ground)")
+    ap.add_argument("--min-size", type=int, default=15, help="min box size px to keep")
     args = ap.parse_args()
 
     print(f"Loading YOLO: {args.model} conf={args.conf} onnx={args.onnx} tiled={args.tiled} preset={args.preset}")
@@ -284,9 +375,25 @@ def main():
     sw_enabled = True
     conf_thr = args.conf
     tiled = args.tiled
+    # Fake filtering defaults — for ground you want no fakes
+    require_decode = bool(args.require_decode or args.decoded_only)
+    hide_fake = bool(args.hide_fake or require_decode)  # if require decode, also hide fake geometry
+    # If user didn't specify show-fake, default to hide fakes for ground test (your image)
+    # To debug, use --show-fake
+    show_fake = bool(args.show_fake)
+    if not require_decode and not args.hide_fake and not args.show_fake:
+        # default for ground: hide fake low-conf orange boxes, but keep decoded green
+        # User's image had 0.16/0.24 fake — these will be hidden by default now
+        hide_fake = True
+        show_fake = False
+    if args.show_fake:
+        show_fake = True
+        hide_fake = False  # if explicitly show fake, don't hide
+
+    print(f"Fake filter: require_decode={require_decode} hide_fake={hide_fake} show_fake={show_fake} conf_thr={conf_thr} — press f to toggle, v to toggle require-decode")
 
     if is_image:
-        print(f"Testing image: {source} with preset {current_preset_name} sw={sw_settings}")
+        print(f"Testing image: {source} with preset {current_preset_name} sw={sw_settings} filter reqDecode={require_decode} hideFake={hide_fake}")
         frame = cv2.imread(source)
         if frame is None:
             sys.exit(f"failed to read {source}")
@@ -303,11 +410,16 @@ def main():
         else:
             boxes = det.detect(frame)
         t1 = time.time()
-        payloads = [decode_qr_in_box(frame, b) for b in boxes]
-        print(f"Detected {len(boxes)} boxes in {1000*(t1-t0):.0f}ms: {boxes}")
-        for i,p in enumerate(payloads):
-            print(f"  Box {i}: payload={p}")
-        vis = draw_boxes(frame, boxes, payloads)
+        payloads_raw = [decode_qr_in_box(frame, b) for b in boxes]
+        boxes_f, payloads_f = filter_boxes(boxes, payloads_raw, frame_shape=frame.shape, require_decode=require_decode, hide_fake=hide_fake)
+        print(f"Detected {len(boxes)} raw, {len(boxes_f)} after filter in {1000*(t1-t0):.0f}ms")
+        for i,p in enumerate(payloads_raw):
+            print(f"  Box {i} raw: {boxes[i]} payload={p} fake={is_fake_box(boxes[i], frame.shape)}")
+        for i,p in enumerate(payloads_f):
+            print(f"  Box {i} filt: {boxes_f[i]} payload={p}")
+        boxes_draw = boxes_f if (hide_fake or require_decode) else boxes
+        payloads_draw = payloads_f if (hide_fake or require_decode) else payloads_raw
+        vis = draw_boxes(frame, boxes_draw, payloads_draw, show_fake=show_fake or not (hide_fake or require_decode))
         if args.save:
             cv2.imwrite(args.save, vis)
             print(f"Saved {args.save}")
@@ -367,16 +479,31 @@ def main():
             else:
                 boxes = det.detect(enhanced)
             t1 = time.time()
-            payloads = [decode_qr_in_box(enhanced, b) for b in boxes]
-            for p in payloads:
+            # Decode all
+            payloads_raw = [decode_qr_in_box(enhanced, b) for b in boxes]
+            for p in payloads_raw:
                 if p:
                     decoded_payloads.add(p)
-            vis = draw_boxes(enhanced, boxes, payloads)
 
-            # Overlay info — preset + controls
+            # Filter fakes — this kills your window grill 0.16/0.24
+            boxes_f, payloads_f = filter_boxes(boxes, payloads_raw, frame_shape=enhanced.shape,
+                                               require_decode=require_decode, hide_fake=hide_fake, min_conf=0.0)
+            # For drawing, use filtered if hide_fake/require_decode, else show all but with colors
+            if hide_fake or require_decode:
+                boxes_draw = boxes_f
+                payloads_draw = payloads_f
+            else:
+                boxes_draw = boxes
+                payloads_draw = payloads_raw
+
+            vis = draw_boxes(enhanced, boxes_draw, payloads_draw, show_fake=show_fake or not (hide_fake or require_decode))
+
+            # Overlay info — preset + controls + filter status
             fps = frame_n / (time.time() - fps_t + 1e-6)
-            info1 = f"{det.name} {len(boxes)} boxes {1000*(t1-t0):.0f}ms {fps:.1f}fps conf={conf_thr:.2f} tiled={tiled} sw={'ON' if sw_enabled else 'OFF'}"
-            cv2.putText(vis, info1, (10,25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,255,255), 2)
+            raw_cnt = len(boxes)
+            filt_cnt = len(boxes_f)
+            info1 = f"{det.name} raw:{raw_cnt} filt:{filt_cnt} {1000*(t1-t0):.0f}ms {fps:.1f}fps conf={conf_thr:.2f} tiled={tiled} sw={'ON' if sw_enabled else 'OFF'} filter: reqDecode={require_decode} hideFake={hide_fake}"
+            cv2.putText(vis, info1, (10,25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 2)
 
             preset_info = PRESETS[current_preset_name]
             info2 = f"Preset [{preset_idx+1}/{len(PRESET_ORDER)}] {current_preset_name}: {preset_info['desc']}"
@@ -390,10 +517,13 @@ def main():
 
             if decoded_payloads:
                 cv2.putText(vis, f"Decoded: {','.join(decoded_payloads)}", (10,115), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+            else:
+                if hide_fake or require_decode:
+                    cv2.putText(vis, f"No QR decoded — fakes hidden ({raw_cnt} raw filtered)", (10,115), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,165,255), 1)
 
             # Help line
-            help_line = "q=quit p/n=preset 1-7=direct b/B c/C s/S g/G e/E h/H r=reset d=enh t=tiled l/k=conf"
-            cv2.putText(vis, help_line, (10, vis.shape[0]-15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200,200,200), 1)
+            help_line = "q=quit p/n=preset 1-7=preset f=toggle hideFake v=reqDecode b/B c/C s/S g/G e/E h/H r=reset d=enh t=tiled l/k=conf"
+            cv2.putText(vis, help_line, (10, vis.shape[0]-15), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200,200,200), 1)
 
             if not args.no_show:
                 cv2.imshow("YOLO QR Test - Laptop Webcam (Pi model) + PRESET CONTROL", vis)
@@ -518,6 +648,17 @@ def main():
                     except:
                         pass
                     print(f"conf {conf_thr:.2f}")
+                elif key == ord('f'):
+                    hide_fake = not hide_fake
+                    if hide_fake:
+                        show_fake = False
+                    print(f">>> hide_fake={hide_fake} show_fake={show_fake} — fakes like grill 0.16/0.24 will {'hide' if hide_fake else 'show'}")
+                elif key == ord('v'):
+                    require_decode = not require_decode
+                    if require_decode:
+                        hide_fake = True
+                        show_fake = False
+                    print(f">>> require_decode={require_decode} — ONLY decoded QR shown, ALL fakes killed")
                 elif key == ord(' ') or key == ord('s'):
                     fname = f"/tmp/qr_test_{int(time.time())}_{current_preset_name}.jpg"
                     if args.save:
@@ -527,9 +668,7 @@ def main():
                     print(f"Saved {fname} and raw")
             else:
                 if frame_n % 30 == 0:
-                    print(f"frame {frame_n} {len(boxes)} boxes {1000*(t1-t0):.0f}ms preset={current_preset_name} payloads={payloads}")
-                if frame_n > 200 and not decoded_payloads:
-                    pass
+                    print(f"frame {frame_n} raw={len(boxes)} filt={len(boxes_f)} {1000*(t1-t0):.0f}ms preset={current_preset_name} decoded={decoded_payloads}")
     finally:
         cap.release()
         if not args.no_show:
