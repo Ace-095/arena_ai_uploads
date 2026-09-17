@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+# NOTE: config.yaml is NOT ignored in real_pi — it is the versioned,
+# single source of truth for the whole stack (edit it, commit it, fly it).
+snaps/
+qr_dataset/
+runs/
+# QR panel textures — now committed for Gazebo (was git-ignored, caused "no QR present")
+# If you want to regenerate: python tools/make_qr_panel.py --text MISSION-QR-001 --out sim/models/qr_panel_a3/materials/textures/qr.png --full --dpi 300
+# and same for qr_panel_big
+demo_frames/
+logs/

@@ -1,0 +1,28 @@
+# real_pi: give the flight user instant access to the Pixhawk + USB cams +
+# serial dongles (no sudo, no re-login).
+#
+#   sudo cp pixhawk-udev.rules /etc/udev/rules.d/99-drone.rules
+#   sudo udevadm control --reload-rules
+#   # unplug + replug the Pixhawk, then re-login
+#
+# "drone" group:  sudo groupadd drone && sudo usermod -aG drone $USER
+# (the dialout group is used below because it already exists on Pi OS and
+# covers serial ports out of the box.)
+
+# Pixhawk / ArduPilot (USB CDC-ACM) — vendor 0x1209 "ArduPilot", or
+# any device advertising "ArduPilot"/"Pixhawk" as its product string.
+SUBSYSTEM=="usb", ATTR{idVendor}=="1209", MODE="0666"
+KERNEL=="ttyACM*", ATTRS{idVendor}=="1209", GROUP="dialout", MODE="0660"
+SUBSYSTEM=="usb", ATTR{product}=="ArduPilot*", MODE="0666"
+
+# Generic serial ports — any ttyACM / ttyUSB into the dialout group.
+KERNEL=="ttyACM*", GROUP="dialout", MODE="0660"
+KERNEL=="ttyUSB*", GROUP="dialout", MODE="0660"
+
+# Common USB webcam vendors (auto-detect assigns them to cam roles).
+SUBSYSTEM=="video4linux", ATTRS{idVendor}=="174c", MODE="0666"   # INFICOM
+SUBSYSTEM=="video4linux", ATTRS{idVendor}=="1bcf", MODE="0666"   # Sunplus
+SUBSYSTEM=="video4linux", ATTRS{idVendor}=="046d", MODE="0666"   # Logitech
+SUBSYSTEM=="video4linux", ATTRS{idVendor}=="0ac8", MODE="0666"   # Z-Star
+SUBSYSTEM=="video4linux", ATTRS{idVendor}=="1d57", MODE="0666"   # Gembird
+SUBSYSTEM=="video4linux", ATTRS{idVendor}=="2bcf", MODE="0666"   # Sunplus

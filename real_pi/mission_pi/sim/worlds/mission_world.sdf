@@ -1,0 +1,179 @@
+<?xml version="1.0" ?>
+<!--
+  mission_world: the mission_pi closed-loop bench world (Gazebo Harmonic).
+
+  = upstream iris_runway.sdf, with three changes:
+    1. iris_with_gimbal  ->  iris_dualcam (our fixed front+bottom cameras,
+       same flight plugins verbatim, no gimbal).
+    2. qr_target          ->  qr_panel_a3 TRIPLE SIZE (1782x2520 mm, 6x A3 linear, 3x double) at (8,0):
+       User 2026-09-17: "double triple the size btw it's small" — was 594x840 2x-A3, now 1782x2520 6x-A3.
+       QR IS entire panel (95% fill) — QR covers entire white part, not small QR in big white.
+       Triple size = ~204px @15m vs 34px original, huge easy to see. qr_panel_big is now
+       3564x5040 (12x A3, 3x previous double) as even bigger fallback.
+       3564x5040 (12x A3, 3x previous double) as even bigger fallback.
+    3. ground plane       ->  400x400 m safety net at z=-0.01. (Upstream's
+       only ground is the far-away runway strip; without this the iris
+       and the panel would sit on void near the origin.)
+
+  Run:  gz sim -v4 -r sim/worlds/mission_world.sdf   (from mission_pi/)
+  Needs GZ_SIM_RESOURCE_PATH to include mission_pi/sim/models
+  (plus ~/ardupilot_gazebo/models for iris_with_standoffs + runway).
+-->
+<sdf version="1.9">
+  <world name="mission_world">
+    <physics name="1ms" type="ignore">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+    </physics>
+
+    <plugin filename="gz-sim-physics-system"
+      name="gz::sim::systems::Physics">
+    </plugin>
+    <plugin
+      filename="gz-sim-sensors-system"
+      name="gz::sim::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+    <plugin filename="gz-sim-user-commands-system"
+      name="gz::sim::systems::UserCommands">
+    </plugin>
+    <plugin filename="gz-sim-scene-broadcaster-system"
+      name="gz::sim::systems::SceneBroadcaster">
+    </plugin>
+    <plugin filename="gz-sim-imu-system"
+      name="gz::sim::systems::Imu">
+    </plugin>
+    <plugin filename="gz-sim-navsat-system"
+      name="gz::sim::systems::NavSat">
+    </plugin>
+
+    <scene>
+      <ambient>1.0 1.0 1.0</ambient>
+      <background>0.8 0.8 0.8</background>
+      <sky></sky>
+    </scene>
+
+    <spherical_coordinates>
+      <latitude_deg>-35.363262</latitude_deg>
+      <longitude_deg>149.165237</longitude_deg>
+      <elevation>584</elevation>
+      <heading_deg>0</heading_deg>
+      <surface_model>EARTH_WGS84</surface_model>
+    </spherical_coordinates>
+
+    <light type="directional" name="sun">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 10 0 0 0</pose>
+      <diffuse>0.8 0.8 0.8 1</diffuse>
+      <specular>0.8 0.8 0.8 1</specular>
+      <attenuation>
+        <range>1000</range>
+        <constant>0.9</constant>
+        <linear>0.01</linear>
+        <quadratic>0.001</quadratic>
+      </attenuation>
+      <direction>-0.5 0.1 -0.9</direction>
+    </light>
+
+    <!-- safety-net ground (see header): neutral dry-grass grey-green -->
+    <model name="bench_ground">
+      <static>true</static>
+      <link name="link">
+        <pose>0 0 -0.01 0 0 0</pose>
+        <visual name="grass">
+          <geometry><plane><normal>0 0 1</normal><size>400 400</size></plane></geometry>
+          <material>
+            <ambient>0.45 0.47 0.38 1</ambient>
+            <diffuse>0.45 0.47 0.38 1</diffuse>
+          </material>
+        </visual>
+        <collision name="ground">
+          <geometry><plane><normal>0 0 1</normal><size>400 400</size></plane></geometry>
+        </collision>
+      </link>
+    </model>
+
+    <model name="axes">
+      <static>1</static>
+      <link name="link">
+        <visual name="r">
+          <cast_shadows>0</cast_shadows>
+          <pose>5 0 0.1 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>10 0.01 0.01</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>1 0 0 0.8</ambient>
+            <diffuse>1 0 0 0.8</diffuse>
+            <emissive>1 0 0 0.8</emissive>
+            <specular>0.5 0.5 0.5 0.8</specular>
+          </material>
+        </visual>
+        <visual name="g">
+          <cast_shadows>0</cast_shadows>
+          <pose>0 5 0.1 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.01 10 0.01</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0 1 0 0.8</ambient>
+            <diffuse>0 1 0 0.8</diffuse>
+            <emissive>0 1 0 0.8</emissive>
+            <specular>0.5 0.5 0.5 0.8</specular>
+          </material>
+        </visual>
+        <visual name="b">
+          <cast_shadows>0</cast_shadows>
+          <pose>0 0 5.1 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>0.01 0.01 10</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0 0 1 0.8</ambient>
+            <diffuse>0 0 1 0.8</diffuse>
+            <emissive>0 0 1 0.8</emissive>
+            <specular>0.5 0.5 0.5 0.8</specular>
+          </material>
+        </visual>
+        <sensor name="navsat_sensor" type="navsat">
+          <always_on>1</always_on>
+          <update_rate>1</update_rate>
+        </sensor>
+      </link>
+    </model>
+
+    <include>
+      <uri>model://runway</uri>
+      <pose degrees="true">-29 545 0 0 0 363</pose>
+    </include>
+
+    <include>
+      <uri>model://iris_dualcam</uri>
+      <pose degrees="true">0 0 0.195 0 0 90</pose>
+    </include>
+
+    <!-- TRIPLE SIZE QR targets: QR IS entire panel (95% fill)
+         User 2026-09-17: "double triple the size btw it's small" — was 594x840 2x-A3, now 1782x2520 6x-A3.
+         qr_panel_a3: 1.782x2.52 m (6x A3) ~204px @15m, easy detection.
+         qr_panel_big: 3.564x5.04 m (12x A3) ~408px @15m, even bigger fallback.
+         Both spawned so Gazebo always has QR visible.
+    -->
+    <include>
+      <uri>model://qr_panel_a3</uri>
+      <name>qr_target_a3</name>
+      <pose>8 0 0 0 0 0</pose>
+    </include>
+    <include>
+      <uri>model://qr_panel_big</uri>
+      <name>qr_target_big</name>
+      <pose>12 0 0 0 0 0</pose>
+    </include>
+
+  </world>
+</sdf>
