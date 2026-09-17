@@ -209,6 +209,23 @@ class Mission:
     def _worker(self, cam):
         from decoder import decode_frame
         from detector import detect_tiles
+        # Fake filtering — kills window grill 0.16/0.24 and ground texture fakes (integrated preset workflow)
+        try:
+            from qr_filter import filter_boxes, filter_cue_box
+            _has_filter = True
+        except Exception:
+            filter_boxes = None
+            filter_cue_box = None
+            _has_filter = False
+
+        dcfg = self.cfg.get("detector", {}) if isinstance(self.cfg, dict) else {}
+        fake_cfg = dcfg.get("fake_filter", {}) if isinstance(dcfg, dict) else {}
+        fake_enabled = bool(fake_cfg.get("enabled", True))
+        fake_require_decode = bool(fake_cfg.get("require_decode", False))
+        fake_hide = bool(fake_cfg.get("hide_fake", True))
+        fake_conf_thr = float(fake_cfg.get("conf_thr", dcfg.get("conf_thr", 0.35)))
+        fake_min_size = int(fake_cfg.get("min_size", 15))
+
         tiled = (self.tile_bottom and cam.facing == "bottom"
                  and self.detector.name != "classical")
         n = 0
@@ -231,13 +248,38 @@ class Mission:
                 time.sleep(0.1)
                 continue
             self.stats["frames"] += 1
-            cam.set_overlay([(b.x, b.y, b.w, b.h, "qr %.2f" % b.conf) for b in boxes])
+
+            # Decode first few for real vs fake + payload
+            payloads_for_boxes = []
             payload = None
             if boxes:
-                for b in boxes[:3]:
-                    payload = decode_frame(frame, (b.x, b.y, b.w, b.h))
-                    if payload:
-                        break
+                for b in boxes[:5]:
+                    p = decode_frame(frame, (b.x, b.y, b.w, b.h))
+                    payloads_for_boxes.append(p)
+                    if p and payload is None:
+                        payload = p
+                while len(payloads_for_boxes) < len(boxes):
+                    payloads_for_boxes.append(None)
+
+            # Filter — kills grill fakes
+            boxes_filtered = boxes
+            if _has_filter and fake_enabled and boxes:
+                try:
+                    boxes_filtered, _ = filter_boxes(
+                        boxes, payloads_for_boxes,
+                        frame_shape=frame.shape,
+                        require_decode=fake_require_decode,
+                        hide_fake=fake_hide,
+                        min_conf=0.0,
+                        min_size=fake_min_size
+                    )
+                except Exception as e:
+                    log.debug("filter_boxes failed: %r", e)
+                    boxes_filtered = boxes
+
+            overlay_boxes = boxes_filtered if (fake_enabled and fake_hide) else boxes
+            cam.set_overlay([(b.x, b.y, b.w, b.h, "qr %.2f" % b.conf) for b in overlay_boxes])
+
             if payload is None and n % self.full_decode_every == 0:
                 payload = decode_frame(frame)
             if payload:
@@ -245,11 +287,23 @@ class Mission:
             newly, _st = self._consensus.update(payload)
             if newly:
                 self._on_payload(payload, cam.name)
-            # bbox cue (steers flight before any decode exists)
-            if boxes and payload is None:
-                b = max(boxes, key=lambda b: b.conf)
-                self._on_cue(cam, b)
-            elif not boxes:
+
+            # bbox cue — ONLY from filtered boxes, avoids steering to fakes
+            cue_boxes = boxes_filtered if fake_enabled else boxes
+            if cue_boxes and payload is None:
+                best = None
+                best_conf = -1
+                for b in cue_boxes:
+                    if _has_filter and fake_enabled:
+                        ok, _reason = filter_cue_box(b, frame_shape=frame.shape, conf_thr=fake_conf_thr)
+                        if not ok:
+                            continue
+                    if b.conf > best_conf:
+                        best = b
+                        best_conf = b.conf
+                if best:
+                    self._on_cue(cam, best)
+            elif not cue_boxes:
                 with self._lock:
                     if self._cue and self._cue[0] == cam.name and \
                             time.time() - self._cue[5] > 2.0:

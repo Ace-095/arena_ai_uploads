@@ -85,13 +85,29 @@ detector:
   model_path: models/qr_yolov8n.pt   # 24MB, needs ultralytics — or use models/qr_yolov8n.onnx (12MB, needs onnxruntime)
   hef_path: models/qr_yolov8n.hef    # kept for Pi5, but laptop uses pt/onnx
   input_size: 640
-  conf_thr: 0.25             # LOW for 15m A3 — 0.25 gives +30% recall vs 0.35
+  conf_thr: 0.35             # 0.35 default kills grill fakes (your 0.16/0.24), 0.25 for max recall at 15m if you accept some fakes
   iou_thr: 0.45
   tile_bottom: true          # 3x3 tiling MANDATORY for A3 at 15m (34px -> 15px on 640 tile)
   tile_grid: [3, 3]
   tile_overlap: 0.25
   full_decode_every_n: 3
   cue_frames: 2
+  # --- FAKE FILTER — integrated preset workflow (kills window grill fakes) ---
+  fake_filter:
+    enabled: true            # enable fake filtering (aspect + size + low-conf)
+    hide_fake: true          # hide orange non-decoded boxes (your grill)
+    require_decode: false    # for Gazebo: false = show high-conf even if not decoded yet, true = ONLY decoded (zero fakes, best for ground)
+    conf_thr: 0.35           # cue only if conf >= this (grill 0.16/0.24 blocked)
+    min_size: 15             # min box px
+
+# --- PRESET WORKFLOW — easy dark control + fake filter combined ---
+# Presets: daylight, dark, night, dark_qr_boost, qr_boost_day, qr_boost_night, gazebo_dark
+# Use via API: POST /api/camera/controls {cam: cam2, qr_boost_profile: dark_qr_boost}
+# Or via tools: python3 tools/camera_tune.py --pi http://... --preset dark_qr_boost --cam cam2
+# Or laptop test: python3 tools/test_yolo_webcam_qr.py --source 0 --preset dark_qr_boost --require-decode
+presets:
+  active: dark_qr_boost      # default preset for pitch dark ground
+  available: [daylight, dark, night, dark_qr_boost, qr_boost_day, qr_boost_night, gazebo_dark]
 
 decode:
   required_streak: 3

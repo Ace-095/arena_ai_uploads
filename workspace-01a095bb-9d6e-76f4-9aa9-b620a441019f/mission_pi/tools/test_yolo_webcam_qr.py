@@ -50,47 +50,32 @@ except Exception as e:
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Presets — both V4L2 hardware and software enhance
-# V4L2 ranges observed on your laptop: brightness 0..64 (set 80->64), contrast 0..100 default 45, sat 0..100 default 63, gain 0..100 default 0, exposure 1..500 default 50, sharp 0..100 default 100
-PRESETS = {
-    "daylight": {
-        "v4l2": {"brightness": 0, "contrast": 45, "saturation": 63, "gain": 0, "exposure": 50, "sharpness": 100},
-        "sw": {"brightness": 1.0, "contrast": 1.0, "saturation": 1.0, "sharpness": 1.0},
-        "desc": "Daylight — normal auto, default"
-    },
-    "dark": {
-        "v4l2": {"brightness": 64, "contrast": 75, "saturation": 70, "gain": 20, "exposure": 300, "sharpness": 100},
-        "sw": {"brightness": 1.3, "contrast": 1.5, "saturation": 1.2, "sharpness": 1.3},
-        "desc": "Pitch dark — high exposure 30ms, gain 20dB, bright 80 — for dark you saw"
-    },
-    "night": {
-        "v4l2": {"brightness": 64, "contrast": 80, "saturation": 63, "gain": 40, "exposure": 400, "sharpness": 100},
-        "sw": {"brightness": 1.5, "contrast": 1.8, "saturation": 1.0, "sharpness": 1.5},
-        "desc": "Night max — 50ms exposure, 24dB gain, brightness max"
-    },
-    "dark_qr_boost": {
-        "v4l2": {"brightness": 64, "contrast": 90, "saturation": 30, "gain": 20, "exposure": 300, "sharpness": 100},
-        "sw": {"brightness": 1.2, "contrast": 2.2, "saturation": 0.6, "sharpness": 2.5},
-        "desc": "Dark + QR boost — BEST for QR in pitch dark, QR pops vs ground"
-    },
-    "qr_boost_day": {
-        "v4l2": {"brightness": 0, "contrast": 75, "saturation": 30, "gain": 0, "exposure": 50, "sharpness": 100},
-        "sw": {"brightness": 1.0, "contrast": 1.8, "saturation": 0.6, "sharpness": 2.0},
-        "desc": "Daylight QR boost — contrast high, sat low, sharp high"
-    },
-    "qr_boost_night": {
-        "v4l2": {"brightness": 64, "contrast": 90, "saturation": 30, "gain": 30, "exposure": 350, "sharpness": 100},
-        "sw": {"brightness": 1.3, "contrast": 2.0, "saturation": 0.6, "sharpness": 2.5},
-        "desc": "Night QR boost — dark + QR boost, best for night QR"
-    },
-    "gazebo_dark": {
-        "v4l2": {"brightness": 64, "contrast": 85, "saturation": 50, "gain": 20, "exposure": 300, "sharpness": 100},
-        "sw": {"brightness": 1.3, "contrast": 2.2, "saturation": 0.8, "sharpness": 2.5},
-        "desc": "Gazebo dark — for gz_cam_bridge --qr-boost --contrast 2.2 --brightness 1.3"
-    },
-}
-
-PRESET_ORDER = list(PRESETS.keys())
+# Presets — integrated workflow (same as qr_filter + camera_tune)
+# Import from qr_filter if available, else fallback
+try:
+    from qr_filter import PRESETS as FILTER_PRESETS, list_presets
+    PRESETS = {}
+    for k, v in FILTER_PRESETS.items():
+        PRESETS[k] = {
+            "v4l2": v.get("v4l2", {}),
+            "sw": v.get("sw", {}),
+            "desc": v.get("description", ""),
+            "detector": v.get("detector", {}),
+            "pi": v.get("pi", {}),
+        }
+    PRESET_ORDER = list_presets()
+except Exception:
+    # Fallback if qr_filter not available
+    PRESETS = {
+        "daylight": {"v4l2": {"brightness": 0, "contrast": 45, "saturation": 63, "gain": 0, "exposure": 50, "sharpness": 100}, "sw": {"brightness": 1.0, "contrast": 1.0, "saturation": 1.0, "sharpness": 1.0}, "desc": "Daylight — normal auto, default", "detector": {"conf_thr": 0.35, "require_decode": False, "hide_fake": True}},
+        "dark": {"v4l2": {"brightness": 64, "contrast": 75, "saturation": 70, "gain": 20, "exposure": 300, "sharpness": 100}, "sw": {"brightness": 1.3, "contrast": 1.5, "saturation": 1.2, "sharpness": 1.3}, "desc": "Pitch dark — high exposure 30ms, gain 20dB, bright 80 — for dark you saw", "detector": {"conf_thr": 0.30, "require_decode": True, "hide_fake": True}},
+        "night": {"v4l2": {"brightness": 64, "contrast": 80, "saturation": 63, "gain": 40, "exposure": 400, "sharpness": 100}, "sw": {"brightness": 1.5, "contrast": 1.8, "saturation": 1.0, "sharpness": 1.5}, "desc": "Night max — 50ms exposure, 24dB gain, brightness max", "detector": {"conf_thr": 0.30, "require_decode": True, "hide_fake": True}},
+        "dark_qr_boost": {"v4l2": {"brightness": 64, "contrast": 90, "saturation": 30, "gain": 20, "exposure": 300, "sharpness": 100}, "sw": {"brightness": 1.2, "contrast": 2.2, "saturation": 0.6, "sharpness": 2.5}, "desc": "Dark + QR boost — BEST for QR in pitch dark, QR pops vs ground", "detector": {"conf_thr": 0.30, "require_decode": True, "hide_fake": True}},
+        "qr_boost_day": {"v4l2": {"brightness": 0, "contrast": 75, "saturation": 30, "gain": 0, "exposure": 50, "sharpness": 100}, "sw": {"brightness": 1.0, "contrast": 1.8, "saturation": 0.6, "sharpness": 2.0}, "desc": "Daylight QR boost — contrast high, sat low, sharp high", "detector": {"conf_thr": 0.35, "require_decode": True, "hide_fake": True}},
+        "qr_boost_night": {"v4l2": {"brightness": 64, "contrast": 90, "saturation": 30, "gain": 30, "exposure": 350, "sharpness": 100}, "sw": {"brightness": 1.3, "contrast": 2.0, "saturation": 0.6, "sharpness": 2.5}, "desc": "Night QR boost — dark + QR boost, best for night QR", "detector": {"conf_thr": 0.30, "require_decode": True, "hide_fake": True}},
+        "gazebo_dark": {"v4l2": {"brightness": 64, "contrast": 85, "saturation": 50, "gain": 20, "exposure": 300, "sharpness": 100}, "sw": {"brightness": 1.3, "contrast": 2.2, "saturation": 0.8, "sharpness": 2.5}, "desc": "Gazebo dark — for gz_cam_bridge --qr-boost --contrast 2.2 --brightness 1.3", "detector": {"conf_thr": 0.25, "require_decode": False, "hide_fake": True}},
+    }
+    PRESET_ORDER = list(PRESETS.keys())
 V4L2_PROPS = {
     "brightness": cv2.CAP_PROP_BRIGHTNESS,
     "contrast": cv2.CAP_PROP_CONTRAST,
@@ -252,41 +237,44 @@ def decode_qr_in_box(frame, box, try_enhance=True):
 
     return None
 
-def is_fake_box(box, frame_shape=None):
-    """Heuristic to filter obvious non-QR: extreme aspect, too small, too large"""
-    x,y,w,h = box.x, box.y, box.w, box.h
-    if w < 15 or h < 15:
-        return True  # too small — noise
-    if frame_shape:
-        fh, fw = frame_shape[:2]
-        if w > fw*0.9 or h > fh*0.9:
-            return True  # almost full frame — not QR
-    # QR is roughly square: aspect 0.6-1.6, but allow some perspective
-    aspect = w / (h+1e-6)
-    if aspect < 0.4 or aspect > 2.5:
-        return True  # tall grill like your image right box
-    return False
+# Use qr_filter module if available (integrated workflow)
+try:
+    from qr_filter import is_fake_box as _is_fake_box, filter_boxes as _filter_boxes
+    def is_fake_box(box, frame_shape=None):
+        fake, _ = _is_fake_box(box, frame_shape)
+        return fake
+    def filter_boxes(boxes, payloads, frame_shape=None, require_decode=False, hide_fake=False, min_conf=0.0):
+        return _filter_boxes(boxes, payloads, frame_shape, require_decode, hide_fake, min_conf)
+except Exception:
+    def is_fake_box(box, frame_shape=None):
+        """Heuristic to filter obvious non-QR: extreme aspect, too small, too large"""
+        x,y,w,h = box.x, box.y, box.w, box.h
+        if w < 15 or h < 15:
+            return True
+        if frame_shape:
+            fh, fw = frame_shape[:2]
+            if w > fw*0.9 or h > fh*0.9:
+                return True
+        aspect = w / (h+1e-6)
+        if aspect < 0.4 or aspect > 2.5:
+            return True
+        return False
 
-def filter_boxes(boxes, payloads, frame_shape=None, require_decode=False, hide_fake=False, min_conf=0.0):
-    """Filter YOLO boxes to remove fakes — returns filtered (boxes, payloads)"""
-    out_boxes = []
-    out_payloads = []
-    for b, p in zip(boxes, payloads):
-        # conf filter
-        if b.conf < min_conf:
-            continue
-        # fake geometry filter if hide_fake
-        if hide_fake and is_fake_box(b, frame_shape):
-            continue
-        # require decode — only keep if payload decoded (kills window grill fakes)
-        if require_decode and p is None:
-            continue
-        # hide_fake also hides low-conf non-decoded (your 0.16, 0.24 orange boxes)
-        if hide_fake and p is None and b.conf < 0.35:
-            continue
-        out_boxes.append(b)
-        out_payloads.append(p)
-    return out_boxes, out_payloads
+    def filter_boxes(boxes, payloads, frame_shape=None, require_decode=False, hide_fake=False, min_conf=0.0):
+        out_boxes = []
+        out_payloads = []
+        for b, p in zip(boxes, payloads):
+            if b.conf < min_conf:
+                continue
+            if hide_fake and is_fake_box(b, frame_shape):
+                continue
+            if require_decode and p is None:
+                continue
+            if hide_fake and p is None and b.conf < 0.35:
+                continue
+            out_boxes.append(b)
+            out_payloads.append(p)
+        return out_boxes, out_payloads
 
 def draw_boxes(frame, boxes, payloads, show_fake=True):
     out = frame.copy()

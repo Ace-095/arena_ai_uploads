@@ -494,6 +494,121 @@ def create_app(rig, mission, fc, streams=None, bringup=None, pulse_s=2.0,
     async def qr_status():
         return _qr_snapshot()
 
+    # ---- Presets + fake filter — integrated workflow for dark + zero fakes ----
+    @app.get("/api/presets")
+    async def get_presets():
+        """List available presets (daylight/dark/night/dark_qr_boost/...) with descriptions"""
+        try:
+            from qr_filter import PRESETS as FILTER_PRESETS
+            # Merge with camera boost profiles
+            from qr_camera_boost import QR_BOOST_PROFILES
+            merged = {}
+            for k in set(list(FILTER_PRESETS.keys()) + list(QR_BOOST_PROFILES.keys())):
+                fp = FILTER_PRESETS.get(k, {})
+                qp = QR_BOOST_PROFILES.get(k, {})
+                merged[k] = {
+                    "name": k,
+                    "description": fp.get("description") or qp.get("description") or "",
+                    "detector": fp.get("detector", {}),
+                    "pi": fp.get("pi", qp),
+                    "v4l2": fp.get("v4l2", {}),
+                    "sw": fp.get("sw", {}),
+                }
+            active = None
+            try:
+                if mission and hasattr(mission, "cfg"):
+                    active = mission.cfg.get("presets", {}).get("active")
+            except Exception:
+                pass
+            return {"ok": True, "active": active, "presets": merged, "available": sorted(merged.keys())}
+        except Exception as e:
+            return {"ok": False, "error": repr(e)}
+
+    @app.post("/api/presets/{preset_name}")
+    async def apply_preset(preset_name: str, req: Request):
+        """Apply preset to both cameras + detector fake filter — one command for dark + zero fakes"""
+        try:
+            body = {}
+            try:
+                body = await req.json()
+            except Exception:
+                body = {}
+            cam = str(body.get("cam", "cam2"))  # default bottom cam for QR
+            apply_all = bool(body.get("all", False))
+
+            from qr_filter import get_preset
+            preset = get_preset(preset_name)
+            if not preset:
+                return JSONResponse({"detail": f"unknown preset {preset_name}"}, 404)
+
+            # Apply to cameras via qr_camera_boost profile
+            applied_cams = {}
+            try:
+                for cname in (["cam1", "cam2"] if apply_all else [cam]):
+                    c = rig.get(cname) if rig else None
+                    if c:
+                        # Try qr_boost profile first (ISP)
+                        try:
+                            c.apply_qr_profile(preset_name)
+                        except Exception:
+                            pass
+                        # Also apply pi tuning from preset
+                        pi_tuning = preset.get("pi", {})
+                        if pi_tuning:
+                            c.apply_tuning(pi_tuning)
+                        applied_cams[cname] = c.get_tuning()
+            except Exception as e:
+                log.warning("preset camera apply failed: %r", e)
+
+            # Apply detector fake filter settings if mission exists
+            try:
+                if mission and hasattr(mission, "cfg"):
+                    det_cfg = mission.cfg.setdefault("detector", {})
+                    fake_cfg = det_cfg.setdefault("fake_filter", {})
+                    det_preset = preset.get("detector", {})
+                    for k, v in det_preset.items():
+                        fake_cfg[k] = v
+                    # Also update conf_thr
+                    if "conf_thr" in det_preset:
+                        det_cfg["conf_thr"] = det_preset["conf_thr"]
+            except Exception as e:
+                log.debug("preset detector apply failed: %r", e)
+
+            hub.push("event", {"type": "preset", "preset": preset_name, "cams": list(applied_cams.keys()), "source": "ui"})
+            return {"ok": True, "preset": preset_name, "description": preset.get("description"), "applied_cams": applied_cams, "detector": preset.get("detector")}
+        except Exception as e:
+            return JSONResponse({"detail": f"preset apply failed: {e}"}, 500)
+
+    @app.get("/api/detector/fake_filter")
+    async def get_fake_filter():
+        try:
+            cfg = mission.cfg.get("detector", {}).get("fake_filter", {}) if mission and hasattr(mission, "cfg") else {}
+            return {"ok": True, "fake_filter": cfg}
+        except Exception as e:
+            return {"ok": False, "error": repr(e)}
+
+    @app.post("/api/detector/fake_filter")
+    async def set_fake_filter(req: Request):
+        try:
+            body = await req.json()
+        except Exception:
+            body = None
+        if not isinstance(body, dict):
+            return JSONResponse({"detail": "want JSON {enabled, hide_fake, require_decode, conf_thr}"}, 400)
+        try:
+            if mission and hasattr(mission, "cfg"):
+                det_cfg = mission.cfg.setdefault("detector", {})
+                fake_cfg = det_cfg.setdefault("fake_filter", {})
+                for k in ("enabled", "hide_fake", "require_decode", "conf_thr", "min_size"):
+                    if k in body:
+                        fake_cfg[k] = body[k]
+                hub.push("event", {"type": "fake_filter", "config": fake_cfg, "source": "ui"})
+                return {"ok": True, "fake_filter": fake_cfg}
+            else:
+                return JSONResponse({"detail": "no mission cfg"}, 503)
+        except Exception as e:
+            return JSONResponse({"detail": f"set failed: {e}"}, 500)
+
     # ---- UI-driven fence + alt — Pi owns fence, MP sees instantly ----
     @app.get("/api/fence")
     async def get_fence():

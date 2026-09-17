@@ -50,32 +50,28 @@ QR_BOOST_PROFILES = {
         "description": "Auto — default"
     },
     # Daytime QR boost — main profile for A3 on ground at 10/15 m
-    # High contrast + high sharpness makes QR edges crisp, low saturation suppresses green grass
-    # Slightly dark brightness avoids washout, manual exposure 5000-6000 us reduces motion blur
     "qr_boost_day": {
         "adaptive": False,
-        "exposure_us": 5000,      # manual 5 ms — less blur at 2 m/s, avoids overexposure of white ground
-        "gain_db": 2.0,           # low gain — less noise, QR still high contrast
-        "brightness": -10.0,      # slightly darker — white ground not blown, black QR stays black
-        "contrast": 1.8,          # HIGH — makes black/white QR pop vs mid-tone ground
-        "saturation": 0.7,        # LOW — desaturate green/brown ground, QR B/W unaffected
-        "sharpness": 2.0,         # HIGH — QR finder patterns sharper at distance
-        "af_mode": "continuous",  # for front cam; bottom fixed focus ignores this
+        "exposure_us": 5000,
+        "gain_db": 2.0,
+        "brightness": -10.0,
+        "contrast": 1.8,
+        "saturation": 0.7,
+        "sharpness": 2.0,
+        "af_mode": "continuous",
         "description": "QR boost day — high contrast 1.8, sharpness 2.0, sat 0.7, dark -10, exp 5ms"
     },
-    # Aggressive QR boost — for difficult ground (bright grass, shadows)
     "qr_boost_aggressive": {
         "adaptive": False,
         "exposure_us": 4000,
         "gain_db": 1.0,
         "brightness": -15.0,
-        "contrast": 2.0,          # max contrast
-        "saturation": 0.5,        # strong desat — ground almost gray, QR still B/W
+        "contrast": 2.0,
+        "saturation": 0.5,
         "sharpness": 2.2,
         "af_mode": "continuous",
         "description": "Aggressive — contrast 2.0, sat 0.5, sharp 2.2, very dark — ground suppressed"
     },
-    # Low light / overcast
     "qr_boost_lowlight": {
         "adaptive": False,
         "exposure_us": 8000,
@@ -87,19 +83,17 @@ QR_BOOST_PROFILES = {
         "af_mode": "continuous",
         "description": "Low light — brighter, higher gain, contrast 1.6"
     },
-    # Bottom cam specific — fixed focus, infinity, ground suppress
     "bottom_qr_boost": {
         "adaptive": False,
         "exposure_us": 5000,
         "gain_db": 2.0,
         "brightness": -12.0,
         "contrast": 1.9,
-        "saturation": 0.6,        # desaturate green grass
+        "saturation": 0.6,
         "sharpness": 2.0,
-        "af_mode": "manual",      # bottom fixed focus — manual
+        "af_mode": "manual",
         "description": "Bottom IMX477 B — contrast 1.9 sat 0.6 sharp 2.0 — ground suppressed, QR pops"
     },
-    # Front cam specific — AF continuous, slightly less aggressive
     "front_qr_boost": {
         "adaptive": False,
         "exposure_us": 6000,
@@ -110,6 +104,73 @@ QR_BOOST_PROFILES = {
         "sharpness": 1.8,
         "af_mode": "continuous",
         "description": "Front Pi Cam3 — AF cont, contrast 1.6 sat 0.8 — QR visible while flying"
+    },
+    # --- DARK PRESETS — pitch dark you saw, integrated with camera_tune.py ---
+    "daylight": {
+        "adaptive": True,
+        "exposure_us": 8333,
+        "gain_db": 6.0,
+        "brightness": 0.0,
+        "contrast": 1.0,
+        "saturation": 1.0,
+        "sharpness": 1.0,
+        "af_mode": "continuous",
+        "description": "Daylight — normal auto, default"
+    },
+    "dark": {
+        "adaptive": False,
+        "exposure_us": 30000,
+        "gain_db": 20.0,
+        "brightness": 80.0,
+        "contrast": 1.5,
+        "saturation": 1.2,
+        "sharpness": 1.3,
+        "af_mode": "continuous",
+        "description": "Pitch dark — high exposure 30ms, high gain 20dB, brightness 80 — for dark you saw"
+    },
+    "night": {
+        "adaptive": False,
+        "exposure_us": 50000,
+        "gain_db": 24.0,
+        "brightness": 100.0,
+        "contrast": 1.8,
+        "saturation": 1.0,
+        "sharpness": 1.5,
+        "af_mode": "continuous",
+        "description": "Night — max exposure 50ms, max gain 24dB, brightness 100"
+    },
+    "dark_qr_boost": {
+        "adaptive": False,
+        "exposure_us": 30000,
+        "gain_db": 20.0,
+        "brightness": 80.0,
+        "contrast": 1.8,
+        "saturation": 0.6,
+        "sharpness": 2.0,
+        "af_mode": "continuous",
+        "description": "Dark + QR boost — BEST for QR in pitch dark, QR pops vs ground"
+    },
+    "qr_boost_night": {
+        "adaptive": False,
+        "exposure_us": 30000,
+        "gain_db": 20.0,
+        "brightness": 80.0,
+        "contrast": 1.8,
+        "saturation": 0.6,
+        "sharpness": 2.0,
+        "af_mode": "continuous",
+        "description": "Night QR boost — dark settings + QR boost, best for night QR"
+    },
+    "gazebo_dark": {
+        "adaptive": False,
+        "exposure_us": 30000,
+        "gain_db": 20.0,
+        "brightness": 80.0,
+        "contrast": 2.2,
+        "saturation": 0.8,
+        "sharpness": 2.5,
+        "af_mode": "continuous",
+        "description": "Gazebo dark — for gz_cam_bridge --qr-boost --contrast 2.2 --brightness 1.3 --saturation 0.8 --sharpness 2.5"
     },
 }
 

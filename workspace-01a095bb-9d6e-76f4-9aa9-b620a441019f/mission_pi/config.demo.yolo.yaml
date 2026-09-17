@@ -16,6 +16,12 @@ detector:
   tile_overlap: 0.25
   full_decode_every_n: 3
   cue_frames: 2
+  fake_filter:
+    enabled: true
+    hide_fake: true
+    require_decode: true
+    conf_thr: 0.35
+    min_size: 15
 decode:
   required_streak: 3
   miss_tolerance: 1
@@ -48,3 +54,7 @@ coverage: { cell_m: 5.0, push_every_s: 5.0, center_tol_m: 3.0, settle_s: 1.0, ma
 relay: { interval_s: 2.0, window_s: 10.0, store_forward: true, store_path: logs/pending_results.jsonl, flush_poll_s: 5.0 }
 qr_boost: { enabled: true, profile: "qr_boost_day", mode: "qr_boost_day", software_mode: "qr_boost" }
 flight: { max_alt_m: 15.0, min_alt_m: 2.0 }
+
+presets:
+  active: dark_qr_boost
+  available: [daylight, dark, night, dark_qr_boost, qr_boost_day, qr_boost_night, gazebo_dark]

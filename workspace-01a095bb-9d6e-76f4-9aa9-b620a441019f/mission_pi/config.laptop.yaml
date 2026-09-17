@@ -70,6 +70,12 @@ detector:
   tile_overlap: 0.25
   full_decode_every_n: 3
   cue_frames: 2
+  fake_filter:
+    enabled: true
+    hide_fake: true
+    require_decode: true
+    conf_thr: 0.35
+    min_size: 15
 
 decode:
   required_streak: 3
@@ -105,3 +111,7 @@ relay:
   store_forward: true
   store_path: logs/pending_results.jsonl
   flush_poll_s: 5.0
+
+presets:
+  active: dark_qr_boost
+  available: [daylight, dark, night, dark_qr_boost, qr_boost_day, qr_boost_night, gazebo_dark]

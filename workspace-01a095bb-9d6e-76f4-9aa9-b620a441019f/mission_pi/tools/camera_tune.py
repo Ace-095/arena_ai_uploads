@@ -49,132 +49,39 @@ except:
     requests = None
     _HAVE_REQUESTS = False
 
-# Presets for easy control — especially for dark
-PRESETS = {
-    "daylight": {
-        "exposure_us": 8333,
-        "gain_db": 6.0,
-        "brightness": 0.0,
-        "contrast": 1.0,
-        "saturation": 1.0,
-        "sharpness": 1.0,
-        "adaptive": True,
-        "af_mode": "continuous",
-        "qr_boost_enabled": False,
-        "qr_software_enhance": True,
-        "qr_enhance_mode": "none",
-        "description": "Normal daylight — auto exposure, default",
-        "v4l2": {"brightness": 0, "contrast": 45, "saturation": 63, "gain": 0, "exposure": 50, "sharpness": 100},
-        "sw": {"brightness": 1.0, "contrast": 1.0, "saturation": 1.0, "sharpness": 1.0},
-    },
-    "dark": {
-        "exposure_us": 30000,
-        "gain_db": 20.0,
-        "brightness": 80.0,
-        "contrast": 1.5,
-        "saturation": 1.2,
-        "sharpness": 1.3,
-        "adaptive": False,
-        "af_mode": "continuous",
-        "qr_boost_enabled": False,
-        "qr_software_enhance": True,
-        "qr_enhance_mode": "none",
-        "description": "Pitch dark — high exposure 30ms, high gain 20dB, brightness 80 — for dark you saw",
-        "v4l2": {"brightness": 64, "contrast": 75, "saturation": 70, "gain": 20, "exposure": 300, "sharpness": 100},
-        "sw": {"brightness": 1.3, "contrast": 1.5, "saturation": 1.2, "sharpness": 1.3},
-    },
-    "night": {
-        "exposure_us": 50000,
-        "gain_db": 24.0,
-        "brightness": 100.0,
-        "contrast": 1.8,
-        "saturation": 1.0,
-        "sharpness": 1.5,
-        "adaptive": False,
-        "af_mode": "continuous",
-        "qr_boost_enabled": False,
-        "qr_software_enhance": True,
-        "qr_enhance_mode": "none",
-        "description": "Night — max exposure 50ms, max gain 24dB, brightness 100",
-        "v4l2": {"brightness": 64, "contrast": 80, "saturation": 63, "gain": 40, "exposure": 400, "sharpness": 100},
-        "sw": {"brightness": 1.5, "contrast": 1.8, "saturation": 1.0, "sharpness": 1.5},
-    },
-    "dark_qr_boost": {
-        "exposure_us": 30000,
-        "gain_db": 20.0,
-        "brightness": 80.0,
-        "contrast": 1.8,
-        "saturation": 0.6,
-        "sharpness": 2.0,
-        "adaptive": False,
-        "af_mode": "continuous",
-        "qr_boost_enabled": True,
-        "qr_boost_mode": "bottom_qr_boost",
-        "qr_software_enhance": True,
-        "qr_enhance_mode": "ground_suppress",
-        "description": "Dark + QR boost — best for QR in pitch dark, QR pops vs ground",
-        "v4l2": {"brightness": 64, "contrast": 90, "saturation": 30, "gain": 20, "exposure": 300, "sharpness": 100},
-        "sw": {"brightness": 1.2, "contrast": 2.2, "saturation": 0.6, "sharpness": 2.5},
-    },
-    "qr_boost_day": {
-        "exposure_us": 8333,
-        "gain_db": 6.0,
-        "brightness": 0.0,
-        "contrast": 1.8,
-        "saturation": 0.6,
-        "sharpness": 2.0,
-        "adaptive": True,
-        "af_mode": "continuous",
-        "qr_boost_enabled": True,
-        "qr_boost_mode": "bottom_qr_boost",
-        "qr_software_enhance": True,
-        "qr_enhance_mode": "ground_suppress",
-        "description": "Daylight QR boost — contrast high, sat low, sharp high, QR pops",
-        "v4l2": {"brightness": 0, "contrast": 75, "saturation": 30, "gain": 0, "exposure": 50, "sharpness": 100},
-        "sw": {"brightness": 1.0, "contrast": 1.8, "saturation": 0.6, "sharpness": 2.0},
-    },
-    "qr_boost_night": {
-        "exposure_us": 30000,
-        "gain_db": 20.0,
-        "brightness": 80.0,
-        "contrast": 1.8,
-        "saturation": 0.6,
-        "sharpness": 2.0,
-        "adaptive": False,
-        "af_mode": "continuous",
-        "qr_boost_enabled": True,
-        "qr_boost_mode": "bottom_qr_boost",
-        "qr_software_enhance": True,
-        "qr_enhance_mode": "ground_suppress",
-        "description": "Night QR boost — dark settings + QR boost, best for night QR",
-        "v4l2": {"brightness": 64, "contrast": 90, "saturation": 30, "gain": 30, "exposure": 350, "sharpness": 100},
-        "sw": {"brightness": 1.3, "contrast": 2.0, "saturation": 0.6, "sharpness": 2.5},
-    },
-    "gazebo_dark": {
-        "contrast": 2.2,
-        "saturation": 0.8,
-        "sharpness": 2.5,
-        "brightness": 1.3,
-        "qr_boost": True,
-        "enhance_mode": "ground_suppress",
-        "description": "Gazebo dark — for gz_cam_bridge.py --qr-boost --contrast 2.2 --brightness 1.3 --saturation 0.8 --sharpness 2.5",
-        "v4l2": {"brightness": 64, "contrast": 85, "saturation": 50, "gain": 20, "exposure": 300, "sharpness": 100},
-        "sw": {"brightness": 1.3, "contrast": 2.2, "saturation": 0.8, "sharpness": 2.5},
-    },
-    "gazebo_bright": {
-        "contrast": 1.0,
-        "saturation": 1.0,
-        "sharpness": 1.0,
-        "brightness": 1.0,
-        "qr_boost": False,
-        "enhance_mode": "none",
-        "description": "Gazebo normal",
-        "v4l2": {"brightness": 0, "contrast": 45, "saturation": 63, "gain": 0, "exposure": 50, "sharpness": 100},
-        "sw": {"brightness": 1.0, "contrast": 1.0, "saturation": 1.0, "sharpness": 1.0},
+# Presets — integrated workflow (same as qr_filter)
+try:
+    from qr_filter import PRESETS as FILTER_PRESETS, list_presets
+    PRESETS = FILTER_PRESETS
+    PRESET_ORDER = list_presets()
+except Exception:
+    PRESETS = {
+        "daylight": {
+            "exposure_us": 8333, "gain_db": 6.0, "brightness": 0.0, "contrast": 1.0, "saturation": 1.0, "sharpness": 1.0, "adaptive": True, "af_mode": "continuous", "qr_boost_enabled": False, "qr_software_enhance": True, "qr_enhance_mode": "none", "description": "Normal daylight — auto exposure, default", "v4l2": {"brightness": 0, "contrast": 45, "saturation": 63, "gain": 0, "exposure": 50, "sharpness": 100}, "sw": {"brightness": 1.0, "contrast": 1.0, "saturation": 1.0, "sharpness": 1.0},
+        },
+        "dark": {
+            "exposure_us": 30000, "gain_db": 20.0, "brightness": 80.0, "contrast": 1.5, "saturation": 1.2, "sharpness": 1.3, "adaptive": False, "af_mode": "continuous", "qr_boost_enabled": False, "qr_software_enhance": True, "qr_enhance_mode": "none", "description": "Pitch dark — high exposure 30ms, high gain 20dB, brightness 80 — for dark you saw", "v4l2": {"brightness": 64, "contrast": 75, "saturation": 70, "gain": 20, "exposure": 300, "sharpness": 100}, "sw": {"brightness": 1.3, "contrast": 1.5, "saturation": 1.2, "sharpness": 1.3},
+        },
+        "night": {
+            "exposure_us": 50000, "gain_db": 24.0, "brightness": 100.0, "contrast": 1.8, "saturation": 1.0, "sharpness": 1.5, "adaptive": False, "af_mode": "continuous", "qr_boost_enabled": False, "qr_software_enhance": True, "qr_enhance_mode": "none", "description": "Night — max exposure 50ms, max gain 24dB, brightness 100", "v4l2": {"brightness": 64, "contrast": 80, "saturation": 63, "gain": 40, "exposure": 400, "sharpness": 100}, "sw": {"brightness": 1.5, "contrast": 1.8, "saturation": 1.0, "sharpness": 1.5},
+        },
+        "dark_qr_boost": {
+            "exposure_us": 30000, "gain_db": 20.0, "brightness": 80.0, "contrast": 1.8, "saturation": 0.6, "sharpness": 2.0, "adaptive": False, "af_mode": "continuous", "qr_boost_enabled": True, "qr_boost_mode": "bottom_qr_boost", "qr_software_enhance": True, "qr_enhance_mode": "ground_suppress", "description": "Dark + QR boost — best for QR in pitch dark, QR pops vs ground", "v4l2": {"brightness": 64, "contrast": 90, "saturation": 30, "gain": 20, "exposure": 300, "sharpness": 100}, "sw": {"brightness": 1.2, "contrast": 2.2, "saturation": 0.6, "sharpness": 2.5},
+        },
+        "qr_boost_day": {
+            "exposure_us": 8333, "gain_db": 6.0, "brightness": 0.0, "contrast": 1.8, "saturation": 0.6, "sharpness": 2.0, "adaptive": True, "af_mode": "continuous", "qr_boost_enabled": True, "qr_boost_mode": "bottom_qr_boost", "qr_software_enhance": True, "qr_enhance_mode": "ground_suppress", "description": "Daylight QR boost — contrast high, sat low, sharp high, QR pops", "v4l2": {"brightness": 0, "contrast": 75, "saturation": 30, "gain": 0, "exposure": 50, "sharpness": 100}, "sw": {"brightness": 1.0, "contrast": 1.8, "saturation": 0.6, "sharpness": 2.0},
+        },
+        "qr_boost_night": {
+            "exposure_us": 30000, "gain_db": 20.0, "brightness": 80.0, "contrast": 1.8, "saturation": 0.6, "sharpness": 2.0, "adaptive": False, "af_mode": "continuous", "qr_boost_enabled": True, "qr_boost_mode": "bottom_qr_boost", "qr_software_enhance": True, "qr_enhance_mode": "ground_suppress", "description": "Night QR boost — dark settings + QR boost, best for night QR", "v4l2": {"brightness": 64, "contrast": 90, "saturation": 30, "gain": 30, "exposure": 350, "sharpness": 100}, "sw": {"brightness": 1.3, "contrast": 2.0, "saturation": 0.6, "sharpness": 2.5},
+        },
+        "gazebo_dark": {
+            "contrast": 2.2, "saturation": 0.8, "sharpness": 2.5, "brightness": 1.3, "qr_boost": True, "enhance_mode": "ground_suppress", "description": "Gazebo dark — for gz_cam_bridge.py --qr-boost --contrast 2.2 --brightness 1.3 --saturation 0.8 --sharpness 2.5", "v4l2": {"brightness": 64, "contrast": 85, "saturation": 50, "gain": 20, "exposure": 300, "sharpness": 100}, "sw": {"brightness": 1.3, "contrast": 2.2, "saturation": 0.8, "sharpness": 2.5},
+        },
+        "gazebo_bright": {
+            "contrast": 1.0, "saturation": 1.0, "sharpness": 1.0, "brightness": 1.0, "qr_boost": False, "enhance_mode": "none", "description": "Gazebo normal", "v4l2": {"brightness": 0, "contrast": 45, "saturation": 63, "gain": 0, "exposure": 50, "sharpness": 100}, "sw": {"brightness": 1.0, "contrast": 1.0, "saturation": 1.0, "sharpness": 1.0},
+        }
     }
-}
-
-PRESET_ORDER = list(PRESETS.keys())
+    PRESET_ORDER = list(PRESETS.keys())
 
 def pi_request(pi_url, method="GET", path="", json_data=None):
     if not _HAVE_REQUESTS:
@@ -219,15 +126,36 @@ def tune_pi(pi_url, cam, preset_name=None, manual=None):
             print(f"Unknown preset {preset_name}, available: {list(PRESETS.keys())}")
             sys.exit(1)
         preset = PRESETS[preset_name]
-        print(f"Applying preset {preset_name}: {preset['description']}")
-        print(f"Values: {json.dumps({k:v for k,v in preset.items() if k not in ('v4l2','sw')}, indent=2)}")
+        desc = preset.get("description", "")
+        print(f"Applying preset {preset_name}: {desc}")
+        # Build payload from pi tuning + detector if present
+        pi_part = preset.get("pi", {})
+        # If preset is old flat style, use whole preset except v4l2/sw/detector
+        if not pi_part and "v4l2" not in preset:
+            pi_part = {k:v for k,v in preset.items() if k not in ("description","v4l2","sw","detector","presets")}
+        # Merge detector conf if present for logging
+        det_part = preset.get("detector", {})
+        print(f"Pi tuning: {json.dumps(pi_part, indent=2)}")
+        if det_part:
+            print(f"Detector filter: {json.dumps(det_part, indent=2)}")
         payload = {"cam": cam}
-        payload.update({k:v for k,v in preset.items() if k not in ("description","v4l2","sw")})
-        result = pi_request(pi_url, "POST", "/api/camera/controls", json_data=payload)
-        if result:
-            print(f"Result: {json.dumps(result, indent=2)}")
+        payload.update(pi_part)
+        # Also try new /api/presets endpoint first (integrated workflow)
+        result = pi_request(pi_url, "POST", f"/api/presets/{preset_name}", json_data={"cam": cam, "all": False})
+        if result and result.get("ok"):
+            print(f"Result via /api/presets: {json.dumps(result, indent=2)}")
         else:
-            print("Failed — Pi not reachable (expected if testing laptop webcam only)")
+            # Fallback to old /api/camera/controls
+            result = pi_request(pi_url, "POST", "/api/camera/controls", json_data=payload)
+            if result:
+                print(f"Result via /api/camera/controls: {json.dumps(result, indent=2)}")
+            else:
+                print("Failed — Pi not reachable (expected if testing laptop webcam only)")
+        # Also set fake filter if present
+        if det_part:
+            ff_res = pi_request(pi_url, "POST", "/api/detector/fake_filter", json_data=det_part)
+            if ff_res:
+                print(f"Fake filter set: {json.dumps(ff_res, indent=2)}")
     elif manual:
         print(f"Tuning {cam} manual: {manual}")
         payload = {"cam": cam}
