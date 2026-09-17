@@ -135,6 +135,57 @@ camera FOV automatically.
 * MAVLink sends are deadline-bounded — a wedged link can never block the
   control loop.
 
+### 8. Fake-QR filter + environment presets  (`qr_filter.py`, `config.yaml qr_filter/qr_presets:`)
+A diamond **window grill** read as "qr" at conf 0.16-0.24 and painted the
+whole ground view with orange boxes — useless noise. Every detector box
+must now pass a gate before it can draw an overlay or steer the drone:
+
+| gate | default | kills |
+|---|---|---|
+| `min_conf` | 0.35 | the grill band (0.15-0.30); real 15 m QRs score ~0.5 |
+| `min_side_px` | 15 px | specks |
+| `aspect_min/max` | 0.4-2.5 | tall/narrow diamond shards (QRs are ~square) |
+| `require_decode_for_cue` | per preset | flight cues from boxes that never decoded |
+
+**Presets** = one named environment setting (detector conf, tile grid,
+decode cadence, cue strictness, ISP boost profile), defined ONCE in
+`config.yaml qr_presets:` and applied everywhere from the same table —
+mission pipeline, REST, and the webcam bench tool can never drift apart:
+
+| key | preset | use |
+|---|---|---|
+| 1 | `day` | daylight 15 m search (default, conf 0.35, 3×3 tiles) |
+| 2 | `far` | max range — more recall, still above the grill conf |
+| 3 | `dark` | night ground — a.k.a. `dark_qr_boost`; **only decodes count** |
+| 4 | `kabaddi` | ground level, close range — full frame, only real QRs trigger |
+| 5 | `low` | indoor low light — sensitive but strict on cues |
+| 6 | `aggressive` | bright high-contrast day |
+| 7 | `bench` | SITL/bench — full frame, fastest |
+
+Switch at runtime (no restart):
+```bash
+curl -X POST http://<pi>:8000/api/qr/preset -d '{"preset":"dark"}'   # switch
+curl http://<pi>:8000/api/qr/presets                                  # list
+```
+or live in the webcam bench tool: keys `p` / `1-7`, plus `f` (hide fakes),
+`v` (toggle require-decode), `k/l` (conf ±0.05), `t` (tile on/off).
+
+**Ground rule (field report): use a require-decode preset for ground runs**
+(`dark` at night + `--tiled`, `kabaddi` at ground level) — only a box that
+decodes to a real payload (e.g. `QR 0.85 MISSION-QR-001`) counts. The
+decode→consensus path was already decode-only; this closes the cue path too,
+so a window can never steer the drone.
+
+```bash
+# webcam bench tool — the same detector/filter/presets as the mission
+python3 tools/test_yolo_webcam_qr.py --source 0 \
+    --model models/qr_yolov8n.onnx --onnx --preset dark --require-decode --tiled
+python3 tools/test_yolo_webcam_qr.py --source /tmp/demo.mp4 --headless  # CI
+```
+Green thick box = decoded QR (the only boxes that matter), green thin =
+filter survivor, orange = REJECTED fake (with the reason). HUD shows
+`raw:N filt:M` so you can watch the grill die in real time.
+
 ---
 
 ## Bring-up (ladder — test each rung before the next)
@@ -215,6 +266,9 @@ The load-bearing ones:
 | `fc.bauds / dead_s / retry_s` | connect order + link-loss supervision |
 | `detector.kind / prefer / conf_thr` | hailo→onnx→pt→classical ladder |
 | `detector.tile_bottom / tile_grid` | the 15 m answer (3×3 tiles) |
+| `detector.preset` | active `qr_presets` entry (startup) |
+| `qr_filter.min_conf / min_side_px / aspect` | the fake-QR (window-grill) gate |
+| `qr_presets.*` | 7 named environments, live-switchable |
 | `decode.required_streak` | confirm streak (mission completion) |
 | `flight.max_alt_m` | **the** ceiling — everything clamps to it |
 | `mission.sweep_alt_m / resweep_alt_m` | search + re-sweep altitudes |

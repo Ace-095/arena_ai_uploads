@@ -57,6 +57,14 @@ class Detector:
         """Return [BBox, ...] in FULL-FRAME pixel coords. Never raises."""
         raise NotImplementedError
 
+    def set_thresholds(self, conf_thr=None, iou_thr=None):
+        """Live re-tuning (QR presets / webcam tool k-l keys). Detectors
+        that have no thresholds (classical) simply no-op."""
+        if conf_thr is not None and hasattr(self, "conf_thr"):
+            self.conf_thr = float(conf_thr)
+        if iou_thr is not None and hasattr(self, "iou_thr"):
+            self.iou_thr = float(iou_thr)
+
     def close(self):
         pass
 

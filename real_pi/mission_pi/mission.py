@@ -29,6 +29,7 @@ import time
 
 import geo
 from consensus import ConsensusBuffer
+from qr_filter import QrFilter, apply_preset
 
 log = logging.getLogger("mission")
 
@@ -92,6 +93,22 @@ class Mission:
         self.tile_rows, self.tile_cols = int(tg[0]), int(tg[1])
         self.full_decode_every = int(d.get("full_decode_every_n", 5))
         self.cue_frames = int(d.get("cue_frames", 2))
+        # ---- real_pi fake-QR filter + environment presets ---------------
+        # The window-grill fix: every detector box must pass conf/size/
+        # aspect gates before it can drive a cue or an overlay (see
+        # qr_filter.py). detector.preset selects the active environment
+        # preset; POST /api/qr/preset switches it live (and the webcam
+        # bench tool shares the SAME preset table from config.yaml).
+        self.qf = QrFilter.from_config(cfg)
+        self.preset_name = str(d.get("preset", "day"))
+        try:
+            if apply_preset(self, self.preset_name, cfg=cfg) is None:
+                # unknown preset in config — fall back to the built-in
+                # `day` preset rather than flying with a broken config.
+                self.preset_name = "day"
+                apply_preset(self, "day", cfg=cfg)
+        except Exception as e:
+            log.warning("preset %r failed to apply: %r", self.preset_name, e)
 
         self.phase = "BOOT"
         self.detail = "init"
@@ -193,7 +210,22 @@ class Mission:
                     "max_alt_m": getattr(self, "max_alt_m", 15.0),
                     "sweep_alt_m": getattr(self, "sweep_alt", 15.0),
                     "fov": fov_info,
-                    "coverage_mode": getattr(self, "coverage_mode", "fov_optimal")}
+                    "coverage_mode": getattr(self, "coverage_mode", "fov_optimal"),
+                    "qr_preset": getattr(self, "preset_name", "day"),
+                    "qr_filter": getattr(self, "qf", None) and self.qf.as_dict()}
+
+    def set_preset(self, name):
+        """Runtime environment switch (POST /api/qr/preset). Returns the
+        applied preset dict, or None for an unknown name."""
+        p = apply_preset(self, name, cfg=self.cfg)
+        if p is not None:
+            try:
+                self.hub.push("event", {"type": "qr_preset", "preset": name,
+                                        "preset_cfg": p})
+            except Exception:
+                pass
+            self._log("WARN", "QR preset -> %s (%s)" % (name, p.get("desc", "")))
+        return p
 
     def request_takeover(self):
         self._takeover.set()
@@ -244,17 +276,26 @@ class Mission:
                 time.sleep(0.1)
                 continue
             self.stats["frames"] += 1
-            cam.set_overlay([(b.x, b.y, b.w, b.h, "qr %.2f" % b.conf) for b in boxes])
+            # real_pi fake-QR filter: grill/speck/odd-aspect boxes die HERE,
+            # before they can touch the overlay or raise a flight cue.
+            boxes = self.qf.filter_boxes(boxes)
             payload = None
+            payload_box = None
             if boxes:
                 for b in boxes[:3]:
                     payload = decode_frame(frame, (b.x, b.y, b.w, b.h))
                     if payload:
+                        payload_box = b
                         break
             if payload is None and n % self.full_decode_every == 0:
                 payload = decode_frame(frame)
             if payload:
                 self.stats["decodes"] += 1
+            # overlay: green-ish labels for survivors, and the decoded box
+            # gets the payload text (matches the webcam bench tool).
+            cam.set_overlay([(b.x, b.y, b.w, b.h,
+                              "QR %.2f %s" % (b.conf, payload) if b is payload_box
+                              else "qr %.2f" % b.conf) for b in boxes])
             # real_pi STAGE 1 (no-delay): the moment a payload decodes in a
             # SINGLE frame — before the confirm-streak has any say — put
             # QR_SEEN:<payload> on STATUSTEXT so Mission Planner's Messages
@@ -265,16 +306,32 @@ class Mission:
             newly, _st = self._consensus.update(payload)
             if newly:
                 self._on_payload(payload, cam.name)
-            # bbox cue (steers flight before any decode exists)
-            if boxes and payload is None:
-                b = max(boxes, key=lambda b: b.conf)
-                self._on_cue(cam, b)
-            elif not boxes:
-                with self._lock:
-                    if self._cue and self._cue[0] == cam.name and \
-                            time.time() - self._cue[5] > 2.0:
-                        self._cue = None
-                        self._cue_hits = 0
+            # bbox cue (steers flight before any decode exists).
+            # real_pi: strict presets (ground/night/kabaddi) set
+            # require_decode_for_cue — then ONLY a box that actually decoded
+            # to a payload raises a cue, so a window grill can never steer
+            # the drone. Default presets keep the fast bbox cue (survivors
+            # are geometry-filtered, and the flight path still needs cues
+            # at 15 m where the QR cannot decode yet).
+            if self.qf.require_decode_for_cue:
+                if boxes and payload_box is not None:
+                    self._on_cue(cam, payload_box)
+                elif not boxes:
+                    self._clear_stale_cue(cam)
+            else:
+                if boxes and payload is None:
+                    b = max(boxes, key=lambda b: b.conf)
+                    self._on_cue(cam, b)
+                elif not boxes:
+                    self._clear_stale_cue(cam)
+
+    def _clear_stale_cue(self, cam):
+        """Drop this camera's cue once it has been box-less for > 2 s."""
+        with self._lock:
+            if self._cue and self._cue[0] == cam.name and \
+                    time.time() - self._cue[5] > 2.0:
+                self._cue = None
+                self._cue_hits = 0
 
     def _on_cue(self, cam, box):
         with self._lock:

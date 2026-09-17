@@ -131,13 +131,98 @@ detector:
   hef_path: models/qr_yolov8n.hef     # used by the Hailo rung (if present)
   prefer: [onnx, pt]       # CPU rung order (onnx first on the Pi 5)
   input_size: 640
-  conf_thr: 0.25           # LOW for 15 m — recall over precision
-  iou_thr: 0.45
+  conf_thr: 0.25           # START value — the active preset (below) overrides
+  iou_thr: 0.45            #   it at startup and on every preset switch
+  preset: day              # ACTIVE qr_presets entry (runtime: POST /api/qr/preset)
   tile_bottom: true        # MANDATORY for 15 m
   tile_grid: [3, 3]
   tile_overlap: 0.25
   full_decode_every_n: 3   # full-frame decode attempt every Nth frame
   cue_frames: 2            # consecutive bbox frames to raise a flight cue
+
+# ----------------------------------------------------------------------------
+# FAKE-QR FILTER + ENVIRONMENT PRESETS (the window-grill fix)
+#
+# A diamond window grill read as "qr" at conf 0.16-0.24 and filled the view
+# with orange boxes — useless on the ground. Every detector box must now
+# pass these gates before it can draw an overlay or steer the drone:
+#
+#   min_conf           0.35  — above the grill band (real 15 m QRs score ~0.5)
+#   min_side_px        15    — kill specks
+#   aspect_min..max    0.4-2.5 — QRs are ~square; grill shards are diamonds
+#   require_decode_for_cue — when true, a FLIGHT CUE only comes from a box
+#                            that actually decoded a payload (only real QRs
+#                            trigger the mission). Presets set this per
+#                            environment (see below); the decode/consensus
+#                            path was ALREADY decode-only.
+#
+# PRESETS: one named environment setting (detector conf, tile grid, decode
+# cadence, cue strictness, ISP boost). Switch at runtime with
+#   curl -X POST http://<pi>:8000/api/qr/preset -d '{"preset":"dark"}'
+# or keys p / 1-7 in tools/test_yolo_webcam_qr.py.
+#
+# RECOMMENDED (from the field report):
+#   * ground runs (kabaddi/night): preset `dark` or `kabaddi` — always
+#     require-decode.  Night + tiled: conf 0.30 + dark boost.
+#   * flight 15 m search: preset `day` (default).
+# ----------------------------------------------------------------------------
+qr_filter:
+  min_conf: 0.35
+  min_side_px: 15
+  aspect_min: 0.4
+  aspect_max: 2.5
+  require_decode_for_cue: false
+
+qr_presets:
+  day:          # key 1 — daylight 15 m search (default)
+    conf_thr: 0.35
+    tile_grid: [3, 3]
+    full_decode_every_n: 3
+    require_decode_for_cue: false
+    boost: qr_boost_day
+    desc: "daylight 15 m search (default)"
+  far:          # key 2 — max range, more recall
+    conf_thr: 0.30
+    tile_grid: [3, 3]
+    full_decode_every_n: 3
+    require_decode_for_cue: false
+    boost: qr_boost_day
+    desc: "max range 15 m — more recall, still above grill conf"
+  dark:         # key 3 — night ground (a.k.a. dark_qr_boost)
+    conf_thr: 0.30
+    tile_grid: [3, 3]
+    full_decode_every_n: 2
+    require_decode_for_cue: true
+    boost: qr_boost_lowlight
+    desc: "night ground (dark_qr_boost) — only decodes count"
+  kabaddi:      # key 4 — ground level, close range
+    conf_thr: 0.30
+    tile_grid: [1, 1]
+    full_decode_every_n: 1
+    require_decode_for_cue: true
+    boost: qr_boost_lowlight
+    desc: "ground level, close range — full frame, only real QRs trigger"
+  low:          # key 5 — indoor low light
+    conf_thr: 0.25
+    tile_grid: [3, 3]
+    full_decode_every_n: 2
+    require_decode_for_cue: true
+    boost: qr_boost_lowlight
+    desc: "indoor low light — sensitive but strict on cues"
+  aggressive:   # key 6 — bright high-contrast day
+    conf_thr: 0.25
+    tile_grid: [3, 3]
+    full_decode_every_n: 2
+    require_decode_for_cue: false
+    boost: qr_boost_aggressive
+    desc: "bright high-contrast day — detector sensitivity up"
+  bench:        # key 7 — SITL/bench
+    conf_thr: 0.35
+    tile_grid: [1, 1]
+    full_decode_every_n: 1
+    require_decode_for_cue: false
+    boost: normal
+    desc: "SITL/bench — full frame, fastest, no boost"
 
 # ----------------------------------------------------------------------------
 # Decode confirm — how many CONSECUTIVE identical decodes confirm a payload

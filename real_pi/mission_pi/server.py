@@ -549,6 +549,50 @@ def create_app(rig, mission, fc, streams=None, bringup=None, pulse_s=2.0,
     async def qr_status():
         return _qr_snapshot()
 
+    # ---- real_pi QR environment presets (fake-QR / window-grill fix) ----
+    @app.get("/api/qr/presets")
+    async def qr_presets():
+        """List every preset the mission can switch to (same table the
+        webcam bench tool uses, from config.yaml `qr_presets:`)."""
+        try:
+            from qr_filter import load_presets, preset_names
+            return {"active": getattr(mission, "preset_name", "day"),
+                    "names": preset_names(cfg),
+                    "presets": load_presets(cfg),
+                    "filter": (mission.qf.as_dict()
+                               if hasattr(mission, "qf") else None)}
+        except Exception as e:
+            return JSONResponse({"detail": "presets: %r" % e}, 500)
+
+    @app.post("/api/qr/preset")
+    async def qr_preset_switch(req: Request):
+        """Switch the live environment preset:
+        POST /api/qr/preset {"preset": "dark"}
+        Applies detector conf, tile grid, decode cadence, cue strictness,
+        and the ISP boost profile to the bottom cam — no restart."""
+        try:
+            body = await req.json()
+        except Exception:
+            body = None
+        if not isinstance(body, dict) or not body.get("preset"):
+            return JSONResponse({"detail": 'want {"preset": "day|far|dark|..."}'}, 400)
+        name = str(body.get("preset"))
+        try:
+            from qr_filter import normalize_preset_name
+            name = normalize_preset_name(name)
+        except Exception:
+            pass
+        try:
+            applied = mission.set_preset(name)
+        except Exception as e:
+            return JSONResponse({"detail": "preset switch failed: %r" % e}, 500)
+        if applied is None:
+            from qr_filter import preset_names as _pn
+            return JSONResponse(
+                {"detail": "unknown preset %r (have %s)" % (name, _pn(cfg))}, 404)
+        return {"ok": True, "preset": name, "applied": applied,
+                "filter": mission.qf.as_dict()}
+
     # ---- UI-driven fence + alt — Pi owns fence, MP sees instantly ----
     @app.get("/api/fence")
     async def get_fence():
