@@ -983,6 +983,177 @@ class Server:
         except Exception:
             jbody = {}
 
+        # --- arena/test1: config.yaml + polygon + FOV coverage endpoints ---
+        # Serve mission-ui/config.yaml as /config.yaml (so map.js can fetch it)
+        if p in ("/config.yaml", "/mission-ui/config.yaml") and method == "GET":
+            for cand in (os.path.join(ROOT, "config.yaml"), os.path.join(ROOT, "mission-ui", "config.yaml")):
+                if os.path.isfile(cand):
+                    with open(cand, "rb") as f:
+                        data = f.read()
+                    return 200, "text/yaml; charset=utf-8", data, {}
+            # fallback: inline default config
+            default_cfg = b"flight:\n  max_alt_m: 15.0\n  default_sweep_alt_m: 15.0\ncameras:\n  front: {hfov_deg: 66.0, vfov_deg: 41.0}\n  bottom: {hfov_deg: 100.0, vfov_deg: 75.0}\n"
+            return 200, "text/yaml; charset=utf-8", default_cfg, {}
+
+        if p == "/api/config" and method == "GET":
+            # Return parsed config.yaml as JSON for UI
+            cfg_path = None
+            for cand in (os.path.join(ROOT, "config.yaml"), os.path.join(ROOT, "mission-ui", "config.yaml")):
+                if os.path.isfile(cand):
+                    cfg_path = cand
+                    break
+            cfg = {}
+            if cfg_path:
+                try:
+                    import yaml
+                    with open(cfg_path) as f:
+                        cfg = yaml.safe_load(f) or {}
+                except Exception:
+                    # manual parse fallback (stdlib only)
+                    try:
+                        txt = open(cfg_path).read()
+                        # crude parse max_alt_m
+                        import re as _re
+                        m = _re.search(r"max_alt_m:\s*([\d.]+)", txt)
+                        if m:
+                            cfg = {"flight": {"max_alt_m": float(m.group(1))}}
+                    except Exception:
+                        cfg = {}
+            if not cfg:
+                cfg = {"flight": {"max_alt_m": 15.0, "default_sweep_alt_m": 15.0},
+                       "cameras": {"front": {"hfov_deg": 66.0, "vfov_deg": 41.0},
+                                   "bottom": {"hfov_deg": 100.0, "vfov_deg": 75.0}},
+                       "coverage": {"overlap": 0.3, "mode": "fov_optimal"}}
+            return self.json(cfg)
+
+        if p == "/api/polygon" and method == "POST":
+            # Polygon -> fence inclusion conversion
+            # Body: {vertices: [{lat,lon}], convert_to_fence: bool, max_alt_m: float}
+            verts = jbody.get("vertices", [])
+            if not (3 <= len(verts) <= 255):
+                return self.json({"detail": "polygon needs 3-255 vertices"}, 400)
+            try:
+                for v in verts:
+                    lat, lon = float(v["lat"]), float(v["lon"])
+                    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                        raise ValueError
+            except Exception:
+                return self.json({"detail": "vertices must be {lat,lon} valid"}, 400)
+            convert = bool(jbody.get("convert_to_fence", False))
+            max_alt = jbody.get("max_alt_m")
+            if convert:
+                if self.mav.sender is None:
+                    return self.json({"detail": "no MAVLink link — cannot upload fence"}, 503)
+                try:
+                    status = await asyncio.to_thread(
+                        self.mav.fence_upload,
+                        [(float(v["lat"]), float(v["lon"])) for v in verts], 10.0)
+                except Exception as e:
+                    return self.json({"detail": "polygon->fence upload failed: %s" % e}, 500)
+                return self.json({"polygon": verts, "fence": status,
+                                  "converted": True, "max_alt_m": max_alt,
+                                  "message": "polygon converted to fence inclusion (shows on MP)"})
+            else:
+                # just validate polygon, return area estimate
+                # crude area calc using ENU
+                try:
+                    olat = sum(float(v["lat"]) for v in verts) / len(verts)
+                    olon = sum(float(v["lon"]) for v in verts) / len(verts)
+                    enu = [mav_geo_to_enu(float(v["lat"]), float(v["lon"]), olat, olon) for v in verts]
+                    area = 0.0
+                    for i in range(len(enu)):
+                        x0, y0 = enu[i]
+                        x1, y1 = enu[(i+1) % len(enu)]
+                        area += x0*y1 - x1*y0
+                    area = abs(area)/2.0
+                except Exception:
+                    area = 0.0
+                return self.json({"polygon": verts, "area_m2": area,
+                                  "converted": False, "max_alt_m": max_alt,
+                                  "message": "polygon validated (use convert_to_fence=true to upload as fence)"})
+
+        if p == "/api/coverage" and method == "POST":
+            # FOV-based coverage planning: divide polygon by cam FOV
+            # Body: {polygon: [{lat,lon}], alt_m, max_alt_m, camera, overlap}
+            poly = jbody.get("polygon") or jbody.get("vertices") or []
+            if len(poly) < 3:
+                return self.json({"detail": "need polygon with ≥3 vertices"}, 400)
+            alt_m = float(jbody.get("alt_m", jbody.get("sweep_alt_m", 15.0)))
+            max_alt_m = float(jbody.get("max_alt_m", 15.0))
+            camera = str(jbody.get("camera", "bottom"))
+            overlap = float(jbody.get("overlap", 0.3))
+            alt_m = max(1.0, min(max_alt_m, alt_m))
+            # camera specs from cam.txt
+            cam_specs = {
+                "front": {"hfov_deg": 66.0, "vfov_deg": 41.0, "resolution": [4608, 2592]},
+                "bottom": {"hfov_deg": 100.0, "vfov_deg": 75.0, "resolution": [4056, 3040]},
+            }
+            spec = cam_specs.get(camera, cam_specs["bottom"])
+            hfov = spec["hfov_deg"]
+            vfov = spec["vfov_deg"]
+            img_w, img_h = spec["resolution"]
+            # footprint
+            fw = 2 * alt_m * math.tan(math.radians(hfov)/2)
+            fh = 2 * alt_m * math.tan(math.radians(vfov)/2)
+            spacing = max(1.0, min(fw, fh) * (1 - overlap))
+            # lawnmower waypoints (reuse same logic as map.js)
+            try:
+                olat = sum(float(v["lat"]) for v in poly) / len(poly)
+                olon = sum(float(v["lon"]) for v in poly) / len(poly)
+                enu_poly = [mav_geo_to_enu(float(v["lat"]), float(v["lon"]), olat, olon) for v in poly]
+                xs = [p[0] for p in enu_poly]
+                ys = [p[1] for p in enu_poly]
+                x0, x1 = min(xs), max(xs)
+                y0, y1 = min(ys), max(ys)
+                rows = max(1, int((y1 - y0) / spacing) + 1)
+                wps = []
+                for r in range(rows):
+                    y = y0 + min(r * spacing, y1 - y0)
+                    n = max(2, int((x1 - x0) / (spacing/4)) + 1)
+                    inside = []
+                    for i in range(n):
+                        x = x0 + (x1 - x0) * i / (n-1) if n>1 else x0
+                        if _pip(x, y, enu_poly):
+                            inside.append((x, y))
+                    if not inside:
+                        continue
+                    x_lo = inside[0][0] + 2.0
+                    x_hi = inside[-1][0] - 2.0
+                    if x_hi < x_lo:
+                        continue
+                    pts = [(x_lo, y)] if x_hi==x_lo else [(x_lo, y), (x_hi, y)]
+                    if r % 2 == 1:
+                        pts = pts[::-1]
+                    for (x, yy) in pts:
+                        la, lo = enu_to_latlon_js(x, yy, olat, olon)
+                        wps.append({"lat": la, "lon": lo, "alt_m": alt_m})
+                # area
+                area = 0.0
+                for i in range(len(enu_poly)):
+                    x0_, y0_ = enu_poly[i]
+                    x1_, y1_ = enu_poly[(i+1)%len(enu_poly)]
+                    area += x0_*y1_ - x1_*y0_
+                area = abs(area)/2.0
+            except Exception as e:
+                return self.json({"detail": "coverage calc failed: %s" % e}, 500)
+            return self.json({
+                "camera": camera,
+                "hfov_deg": hfov,
+                "vfov_deg": vfov,
+                "alt_m": alt_m,
+                "max_alt_m": max_alt_m,
+                "footprint_w_m": round(fw, 2),
+                "footprint_h_m": round(fh, 2),
+                "footprint_area_m2": round(fw*fh, 2),
+                "spacing_m": round(spacing, 2),
+                "overlap": overlap,
+                "area_m2": round(area, 2),
+                "waypoints": wps,
+                "waypoint_count": len(wps),
+                "estimated_footprints_needed": math.ceil(area / (fw*fh*(1-overlap))) if fw*fh>0 else 0,
+                "message": "FOV-optimal coverage: %d waypoints cover %.0f m² at %.1f m using %s (%.0f° HFOV)" % (len(wps), area, alt_m, camera, hfov)
+            })
+
         # --- offline tiles (MBTiles) ---
         if p.startswith("/tiles/") and p.endswith(".png") and method == "GET":
             try:

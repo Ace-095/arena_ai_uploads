@@ -27,11 +27,11 @@ ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 
 def rand_payload(rng, nchars=6):
-    return "".join(rng.choice(ALPHABET) for _ in range(nchars))
+    return "".join(rng.choice(list(ALPHABET)) for _ in range(nchars))
 
 
 def make_background(rng, size):
-    kind = rng.randrange(4)
+    kind = rng.integers(0,4)
     base = [(88, 110, 72), (110, 110, 112), (128, 118, 100), (70, 90, 60)][kind]
     bg = np.full((size, size, 3), base, np.uint8)
     noise = rng.integers(-28, 28, (size, size, 3)).astype(np.int16)

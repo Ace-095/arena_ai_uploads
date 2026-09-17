@@ -5,12 +5,12 @@
   = upstream iris_runway.sdf, with three changes:
     1. iris_with_gimbal  ->  iris_dualcam (our fixed front+bottom cameras,
        same flight plugins verbatim, no gimbal).
-    2. qr_target          ->  qr_panel_big (2x-A3 linear, 594x840 mm) at
-       (8, 0): DETECTION-TEST config. The classical bench detector needs
-       the code ~80+ px; 2x-A3 gives ~54 px @ 15 m / ~81 px @ 10 m, so the
-       full loop (cue->track->decode->transmit) is provable today.
-       qr_panel_a3 (true 297x420 mm, commented below) is the honest
-       target and waits for the YOLO model (~26 px @ 15 m, YOLO-only).
+    2. qr_target          ->  qr_panel_a3 TRIPLE SIZE (1782x2520 mm, 6x A3 linear, 3x double) at (8,0):
+       User 2026-09-17: "double triple the size btw it's small" — was 594x840 2x-A3, now 1782x2520 6x-A3.
+       QR IS entire panel (95% fill) — QR covers entire white part, not small QR in big white.
+       Triple size = ~204px @15m vs 34px original, huge easy to see. qr_panel_big is now
+       3564x5040 (12x A3, 3x previous double) as even bigger fallback.
+       3564x5040 (12x A3, 3x previous double) as even bigger fallback.
     3. ground plane       ->  400x400 m safety net at z=-0.01. (Upstream's
        only ground is the far-away runway strip; without this the iris
        and the panel would sit on void near the origin.)
@@ -158,21 +158,22 @@
       <pose degrees="true">0 0 0.195 0 0 90</pose>
     </include>
 
-    <!-- DETECTION-TEST target: 2x-A3 (classical needs ~80+ px in frame).
-         Honest-A3 swap (YOLO runs only): comment this include, uncomment
-         the qr_panel_a3 one below. -->
-    <include>
-      <uri>model://qr_panel_big</uri>
-      <name>qr_target</name>
-      <pose>8 0 0 0 0 0</pose>
-    </include>
-    <!-- ... honest-A3 (YOLO-only):
+    <!-- TRIPLE SIZE QR targets: QR IS entire panel (95% fill)
+         User 2026-09-17: "double triple the size btw it's small" — was 594x840 2x-A3, now 1782x2520 6x-A3.
+         qr_panel_a3: 1.782x2.52 m (6x A3) ~204px @15m, easy detection.
+         qr_panel_big: 3.564x5.04 m (12x A3) ~408px @15m, even bigger fallback.
+         Both spawned so Gazebo always has QR visible.
+    -->
     <include>
       <uri>model://qr_panel_a3</uri>
-      <name>qr_target</name>
+      <name>qr_target_a3</name>
       <pose>8 0 0 0 0 0</pose>
     </include>
-    -->
+    <include>
+      <uri>model://qr_panel_big</uri>
+      <name>qr_target_big</name>
+      <pose>12 0 0 0 0 0</pose>
+    </include>
 
   </world>
 </sdf>

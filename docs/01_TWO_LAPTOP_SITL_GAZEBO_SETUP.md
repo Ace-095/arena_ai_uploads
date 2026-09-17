@@ -434,21 +434,25 @@ Tools/autotest/sim_vehicle.py -v ArduCopter -f gazebo-iris --model JSON --no-mav
 # note --model JSON + frame gazebo-iris; same two-port trick as §4.2
 ```
 
-### 5.3 Terminal C — the camera bridge (**system** python3, *not* the venv)
+### 5.3 Terminal C — the camera bridge + QR boost Kabaddi (**system** python3, *not* the venv)
 
 The gz-transport python bindings are installed system-wide, so activating the
-venv here breaks the import:
+venv here breaks the import. Bridge now has QR boost (Kabaddi) — makes QR pop vs ground in SITL same as real Pi:
 
 ```bash
 cd ~/arena_ai_uploads/workspace-01a095bb-9d6e-76f4-9aa9-b620a441019f/mission_pi
-python3 tools/gz_cam_bridge.py --port 8099
+# Install once: sudo apt install python3-gz-transport13 python3-gz-msgs10 python3-pil python3-opencv
+
+# With QR boost — contrast HIGH 1.8 B/W pop, sat LOW 0.6 grass gray, sharp HIGH 2.0 finder crisp, ground_suppress desat green 35-85 brown 10-30
+python3 tools/gz_cam_bridge.py --port 8099 --qr-boost --contrast 1.8 --saturation 0.6 --sharpness 2.0 --brightness 0.9 --enhance-mode ground_suppress --verbose
 # want: subscribe /iris/front/image -> OK, /iris/bottom/image -> OK, then
-#       "front: N frames age=0.0x" lines
-curl -s http://127.0.0.1:8099/health     # both ages < 1 s, sizes [2560, 1440]
+#       "front: N frames age=0.0x qr_boost=True" lines
+#       QR boost: ON (contrast 1.8 sat 0.6 sharp 2.0 bright 0.9 mode ground_suppress)
+curl -s http://127.0.0.1:8099/health | python3 -m json.tool   # both ages < 1 s, sizes [2560,1440], qr_boost true
 ```
 
 Check the pictures **before** flying: browser → `http://127.0.0.1:8099/` — front
-pane = horizon, bottom pane = ground (and the panel after takeoff).
+pane = horizon (boosted), bottom pane = ground with QR white/black crisp vs gray ground (boosted). Raw endpoints `/front_raw.mjpg` `/bottom_raw.mjpg` show without boost for comparison. `config.gazebo.yaml` now has `qr_boost enabled true` + per-camera blocks, so second-stage software enhance (ground_suppress/qr_boost) applies after bridge boost — two-stage suppression.
 
 ### 5.4 Terminal D — mission_pi on the sim cameras
 

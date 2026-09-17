@@ -227,6 +227,43 @@ def bring_up_thread(cfg, args, fc, rig, det_box, streams, mission, hub, bu):
                 say("cameras", "ok", ", ".join(
                     "%s=%s/%s" % (n, c.model, c.facing)
                     for n, c in sorted(rig.cams.items())))
+
+                # --- QR boost: make QR pop more than ground (Kabaddi setting) ---
+                try:
+                    cam_cfg = cfg.get("cameras", {}) or {}
+                    qr_boost_cfg = cfg.get("qr_boost", {}) or {}
+                    global_enabled = qr_boost_cfg.get("enabled", True)
+                    for cam_name, cam in rig.cams.items():
+                        role = cam.facing
+                        role_cfg = cam_cfg.get(role, {}) or {}
+                        per_cam_qr = role_cfg.get("qr_boost", {}) or {}
+                        enabled = per_cam_qr.get("enabled", global_enabled)
+                        if not enabled:
+                            continue
+                        profile = per_cam_qr.get("profile") or qr_boost_cfg.get("profile")
+                        if not profile:
+                            if role == "bottom":
+                                profile = "bottom_qr_boost"
+                            elif role == "front":
+                                profile = "front_qr_boost"
+                            else:
+                                profile = qr_boost_cfg.get("mode", "qr_boost_day")
+                        try:
+                            cam.apply_qr_profile(profile)
+                            say("cameras", "ok", "%s QR boost: %s" % (cam_name, profile))
+                            hub.push("log", {"level": "INFO",
+                                             "msg": "%s QR boost %s — contrast high, sat low, sharp high, QR pops vs ground" % (cam_name, profile)})
+                        except Exception as e:
+                            log.warning("%s QR boost %r failed: %r", cam_name, profile, e)
+                        sw_mode = per_cam_qr.get("software_mode") or qr_boost_cfg.get("software_mode", "qr_boost")
+                        if sw_mode:
+                            cam.qr_boost["qr_software_enhance"] = True
+                            cam.qr_boost["qr_enhance_mode"] = sw_mode
+                            log.info("%s software QR enhance %s enabled (CLAHE+unsharp+green suppress)", cam_name, sw_mode)
+                except Exception as e:
+                    log.warning("QR boost setup failed: %r", e)
+                    hub.push("log", {"level": "WARN", "msg": "QR boost setup failed: %s" % e})
+
             else:
                 bu.mark("cameras", "failed", "no camera assigned")
                 hub.push("log", {"level": "ERROR",
@@ -252,6 +289,20 @@ def bring_up_thread(cfg, args, fc, rig, det_box, streams, mission, hub, bu):
         return
     fc_cfg = cfg.get("fc", {}) or {}
     device = (args.device or fc_cfg.get("conn") or fc_cfg.get("device"))
+    # Self-checked fix: try both 5760 and 5762 — user reports Pi needs MP first on 5762
+    # Old config only tried 5762, failed when MP not yet connected or SITL only on 5760
+    # New: build list of candidates: configured device + fallbacks 5760,5762,14550
+    candidates = []
+    if device:
+        candidates.append(device)
+    # Add fallbacks if not already
+    for fb in ("tcp:127.0.0.1:5762", "tcp:127.0.0.1:5760", "tcp:127.0.0.1:5760", "udp:127.0.0.1:14550"):
+        if fb not in candidates:
+            candidates.append(fb)
+    # Also try 0.0.0.0 variants for 2-laptop
+    for fb in ("tcp:0.0.0.0:5762", "tcp:0.0.0.0:5760"):
+        if fb not in candidates:
+            candidates.append(fb)
     bauds = (args.baud,) if args.baud else (115200, 57600, 921600)
     retry_s = float(fc_cfg.get("retry_s", args.fc_retry or 5.0))
     timeout_s = float(fc_cfg.get("connect_timeout_s", args.fc_timeout or 0))
@@ -265,28 +316,35 @@ def bring_up_thread(cfg, args, fc, rig, det_box, streams, mission, hub, bu):
         hub.push("event", {"type": "fc_link", "state": kind, "detail": detail})
         bu.note("fc", "%s — %s" % (kind, detail))
     attempt, t0 = 0, time.time()
+    # Self-checked fix: try all candidates round-robin, not just configured device
+    # Old loop only tried `device`, so if MP not yet on 5760, 5762 had no heartbeat and failed forever
+    # New: cycle through candidates list (5762,5760,14550,0.0.0.0 variants)
+    cand_idx = 0
     while not bu.stop.is_set():
         attempt += 1
+        # Pick candidate in round-robin
+        cur_device = candidates[cand_idx % len(candidates)] if candidates else device
+        cand_idx += 1
         try:
-            dev = fc.connect(device=device, bauds=bauds, supervise=True,
+            dev = fc.connect(device=cur_device, bauds=bauds, supervise=True,
                              on_event=fc_event,
                              dead_s=float(fc_cfg.get("dead_s", 10.0)),
                              retry_s=max(2.0, retry_s))
-            say("fc", "ok", "%s (attempt %d)" % (dev, attempt))
+            say("fc", "ok", "%s (attempt %d, tried %s)" % (dev, attempt, cur_device))
             break
         except Exception as e:
             msg = "%s" % e
-            hint = fc_hint(device, e)
-            bu.note("fc", "attempt %d failed: %s" % (attempt, msg))
+            hint = fc_hint(cur_device, e)
+            bu.note("fc", "attempt %d failed (%s): %s" % (attempt, cur_device, msg))
             if attempt == 1 or attempt % 6 == 0:
                 hub.push("log", {"level": "ERROR",
-                                 "msg": "FC link attempt %d failed: %s%s"
-                                        % (attempt, msg,
+                                 "msg": "FC link attempt %d failed (%s): %s%s"
+                                        % (attempt, cur_device, msg,
                                            (" — " + hint) if hint else "")})
             if attempt == 1:
                 bu.fail("fc", RuntimeError(msg + ((" — " + hint) if hint else "")))
-                bu.mark("fc", "pending", "retrying every %.0fs" % retry_s)
-            log.warning("FC link attempt %d failed: %s%s", attempt, msg,
+                bu.mark("fc", "pending", "retrying every %.0fs over %s" % (retry_s, ", ".join(candidates[:3])))
+            log.warning("FC link attempt %d failed (%s): %s%s", attempt, cur_device, msg,
                         (" — " + hint) if hint else "")
             if timeout_s and (time.time() - t0) > timeout_s:
                 bu.mark("fc", "failed", "gave up after %.0fs" % timeout_s)

@@ -3,13 +3,21 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Mission Companion — UI v2</title>
+<title>Mission Companion — UI v2 + arena/test1</title>
 <link rel="stylesheet" href="vendor/leaflet/leaflet.css">
 <link rel="stylesheet" href="css/app.css">
+<style>
+  .card.polygon-card { border-left: 3px solid #a78bfa; }
+  .card.config-card { border-left: 3px solid #5fb3ff; }
+  .card.coverage-card { border-left: 3px solid #5fd97a; }
+  .btn.polygon { background: #a78bfa; color: #111; }
+  .btn.polygon:hover { background: #c4b5fd; }
+  .btn.fov { background: #5fb3ff; color: #111; }
+</style>
 </head>
 <body>
 <header id="topbar">
-  <div class="brand">MISSION COMPANION <span class="sub">ui v2 · bridge + Pi · MP-forwarded MAVLink</span></div>
+  <div class="brand">MISSION COMPANION <span class="sub">ui v2 + arena/test1 · polygon + FOV coverage · MP-forwarded MAVLink</span></div>
   <div class="top-right">
     <span id="mockBadge" class="badge hidden">MOCK</span>
     <span class="lamp"><i id="lampPi" class="dot off"></i>PI</span>
@@ -21,6 +29,59 @@
 
 <main id="layout">
   <section id="panels">
+
+    <div class="card config-card" id="cardConfig">
+      <h2>CONFIG <span class="hint-inline">(config.yaml · max height)</span></h2>
+      <div class="kv"><span>max altitude</span><b id="cfgMaxAlt">15 m</b></div>
+      <div class="kv"><span>sweep altitude</span><b id="cfgSweepAlt">15 m</b></div>
+      <div class="kv"><span>config source</span><b id="cfgSource">—</b></div>
+      <div class="row wrap">
+        <label class="inline">max height <input id="cfgMaxInput" type="number" value="15" min="1" max="50" step="1"> m</label>
+        <label class="inline">sweep <input id="cfgSweepInput" type="number" value="15" min="1" max="50" step="1"> m</label>
+        <button id="btnCfgApply" class="btn small fov">apply alt</button>
+      </div>
+      <div class="row wrap">
+        <label class="inline">camera <select id="cfgCamSelect">
+          <option value="bottom">bottom · IMX477 113° (100° HFOV)</option>
+          <option value="front">front · Pi Cam3 75° (66° HFOV)</option>
+        </select></label>
+        <label class="inline">overlap <input id="cfgOverlapInput" type="number" value="0.3" min="0" max="0.8" step="0.1"></label>
+      </div>
+      <p class="hint">From cam.txt: front 66° HFOV / 41° VFOV, bottom 113° diag (~100° HFOV / 75° VFOV). Set max height to 5/10/15 m per venue — drone never exceeds it. Coverage grid auto-divides polygon by FOV footprint.</p>
+    </div>
+
+    <div class="card polygon-card" id="cardPolygon">
+      <h2>POLYGON <span class="hint-inline">(primary · shows on Mission Planner)</span></h2>
+      <div class="row wrap">
+        <button id="btnPolyDraw" class="btn small toggle polygon">draw polygon</button>
+        <button id="btnPolyUndo" class="btn small">undo</button>
+        <button id="btnPolyClear" class="btn small">clear</button>
+      </div>
+      <div class="kv"><span>vertices</span><b id="pVerts">—</b></div>
+      <div class="kv"><span>area</span><b id="pArea">—</b></div>
+      <div class="kv"><span>drawing</span><b id="pDrawing">0 pts</b></div>
+      <div class="kv"><span>converted</span><b id="pConverted">no</b></div>
+      <div class="row wrap">
+        <button id="btnPolyToFence" class="btn polygon primary">POLYGON → FENCE INCLUSION</button>
+        <button id="btnPolyApply" class="btn small">apply polygon as fence → MP</button>
+      </div>
+      <div class="row wrap">
+        <button id="btnPolyExport" class="btn small">export polygon .poly</button>
+        <button id="btnPolyShowFov" class="btn small fov">show FOV coverage</button>
+      </div>
+      <p class="hint">Draw polygon (purple) — this is what shows on Mission Planner. Click "POLYGON → FENCE INCLUSION" to turn it into geofence inclusion (green, MAV_CMD 5001) for FC. Fence is the safety boundary; polygon is the search area. Same vertices, different semantics.</p>
+    </div>
+
+    <div class="card coverage-card" id="cardCoverage">
+      <h2>FOV COVERAGE <span class="hint-inline">(cam.txt · max area)</span></h2>
+      <div class="kv"><span>camera FOV</span><b id="covFov">bottom 100° HFOV @ 15m</b></div>
+      <div id="fovCoverageInfo" style="font-size:12px; color:#9fb3c8; line-height:1.4; padding:4px 0;">— draw polygon to see coverage plan —</div>
+      <div class="row wrap">
+        <button id="btnCovClear" class="btn small">clear coverage viz</button>
+        <button id="btnCovExport" class="btn small">export waypoints .json</button>
+      </div>
+      <p class="hint">Based on cam.txt: Pi Cam3 Standard 66° HFOV (75° diag, 4.74mm f/1.8) and IMX477 B 113° diag (~100° HFOV, 2.7mm f/2.8). Footprint = 2·alt·tan(FOV/2). Spacing = footprint·(1-overlap). At 15m: IMX477 ~36m wide → ~25m spacing. At 5m: ~12m wide → ~8m spacing, more legs, max coverage.</p>
+    </div>
 
     <div class="card" id="cardMav">
       <h2>MP LINK <span class="hint-inline">(MAVLink via Mission Planner)</span></h2>
@@ -47,6 +108,7 @@
       <div class="kv"><span>ws status</span><b id="piWs">—</b></div>
       <div class="kv"><span>http probe</span><b id="piHealth">—</b></div>
       <div class="kv"><span>mode</span><b id="piMode">—</b></div>
+      <div class="kv"><span>max alt (Pi)</span><b id="piMaxAlt">—</b></div>
       <div class="row wrap">
         <input id="piUrl" class="grow" placeholder="http://<pi-ip>:8000">
         <button id="btnPiConnect" class="btn small">connect</button>
@@ -65,9 +127,9 @@
     </div>
 
     <div class="card" id="cardFence">
-      <h2>GEOFENCE <span class="hint-inline">(→ MP → FC)</span></h2>
+      <h2>GEOFENCE <span class="hint-inline">(→ MP → FC · inclusion)</span></h2>
       <div class="row wrap">
-        <button id="btnDraw" class="btn small toggle">draw</button>
+        <button id="btnDraw" class="btn small toggle">draw fence</button>
         <button id="btnUndo" class="btn small">undo</button>
         <button id="btnClearDraw" class="btn small">clear</button>
       </div>
@@ -94,7 +156,7 @@
         <button id="btnFenceRefresh" class="btn small">refresh from FC</button>
       </div>
       <button id="btnExportLap" class="btn small">export .lap</button>
-      <p class="hint">Fence uploads via the MP link (FENCE mission type) with FC readback verify, then FENCE_ENABLE + FENCE_ACTION + FENCE_TYPE params. Confirm the polygon in MP before flight.</p>
+      <p class="hint">Fence uploads via the MP link (FENCE mission type, CMD 5001 inclusion) with FC readback verify, then FENCE_ENABLE + FENCE_ACTION + FENCE_TYPE params. Polygon → fence conversion does same upload.</p>
     </div>
 
     <div class="card" id="cardTelem">
@@ -118,14 +180,15 @@
     </div>
 
     <div class="card" id="cardCam">
-      <h2>CAMERAS <span class="hint-inline">(Pi, live)</span></h2>
+      <h2>CAMERAS <span class="hint-inline">(Pi, live · cam.txt FOV)</span></h2>
       <div class="row">
-        <button id="tabCam1" class="btn small toggle on">CAM1 · pi-cam3</button>
-        <button id="tabCam2" class="btn small toggle">CAM2 · imx477</button>
+        <button id="tabCam1" class="btn small toggle on">CAM1 · pi-cam3 66°</button>
+        <button id="tabCam2" class="btn small toggle">CAM2 · imx477 100°</button>
       </div>
       <div id="camCtls1" class="camctls">
         <div class="kv"><span>CAM1 stream</span><b id="c1Mode">—</b></div>
         <div class="kv"><span>CAM1 latency</span><b id="c1Lat">—</b></div>
+        <div class="kv"><span>CAM1 FOV</span><b>66° HFOV / 41° VFOV / 75° diag (4.74mm f/1.8)</b></div>
         <div class="ctl"><label>exposure µs <output id="c1ExpV">8333</output></label><input id="c1Exp" type="range" min="100" max="66000" step="100" value="8333"></div>
         <div class="ctl"><label>gain dB <output id="c1GainV">6</output></label><input id="c1Gain" type="range" min="0" max="32" step="0.5" value="6"></div>
         <div class="row wrap">
@@ -141,6 +204,7 @@
       <div id="camCtls2" class="camctls hidden">
         <div class="kv"><span>CAM2 stream</span><b id="c2Mode">—</b></div>
         <div class="kv"><span>CAM2 latency</span><b id="c2Lat">—</b></div>
+        <div class="kv"><span>CAM2 FOV</span><b>100° HFOV / 75° VFOV / 113° diag (2.7mm f/2.8, fixed)</b></div>
         <div class="ctl"><label>exposure µs <output id="c2ExpV">8333</output></label><input id="c2Exp" type="range" min="100" max="66000" step="100" value="8333"></div>
         <div class="ctl"><label>gain dB <output id="c2GainV">6</output></label><input id="c2Gain" type="range" min="0" max="32" step="0.5" value="6"></div>
         <div class="row wrap">
@@ -153,7 +217,45 @@
         <div class="ctl"><label>sharpness <output id="c2ShaV">1.0</output></label><input id="c2Sha" type="range" min="0" max="2" step="0.1" value="1"></div>
         <div class="kv"><span>CAM2 live-apply</span><b id="c2Live">idle</b></div>
       </div>
-      <p class="hint">Sliders apply live to the selected camera (debounced); no Apply button. Watch the feed update in real time.</p>
+      <p class="hint">Sliders apply live to selected camera (debounced). CAM1 = Pi Cam3 Standard 66° HFOV, CAM2 = IMX477 B 113° diag (~100° HFOV). Coverage uses bottom cam footprint for max area.</p>
+    </div>
+
+    <div class="card" id="cardQrBoost" style="border-left: 3px solid #f59e0b;">
+      <h2>QR BOOST <span class="hint-inline">(Kabaddi setting · QR pops vs ground)</span></h2>
+      <div class="kv"><span>purpose</span><b>Make A3 QR B/W pop more than green/brown ground at 10/15 m</b></div>
+      <div class="row wrap">
+        <label class="inline">profile
+          <select id="qrBoostProfile">
+            <option value="normal">normal — auto</option>
+            <option value="qr_boost_day" selected>qr_boost_day — day 15m (contrast 1.8 sat 0.7 sharp 2.0)</option>
+            <option value="qr_boost_aggressive">aggressive — contrast 2.0 sat 0.5 sharp 2.2 (ground almost gray)</option>
+            <option value="qr_boost_lowlight">lowlight — overcast</option>
+            <option value="bottom_qr_boost">bottom IMX477 B — contrast 1.9 sat 0.6 sharp 2.0 (ground suppressed)</option>
+            <option value="front_qr_boost">front Pi Cam3 — contrast 1.6 sat 0.8 sharp 1.8</option>
+          </select>
+        </label>
+        <button id="btnQrBoostApply" class="btn small" style="background:#f59e0b;color:#111;">apply QR boost ISP</button>
+      </div>
+      <div class="row wrap">
+        <label class="inline">software enhance
+          <select id="qrSwMode">
+            <option value="none">none</option>
+            <option value="qr_boost" selected>qr_boost — CLAHE + unsharp + green suppress</option>
+            <option value="ground_suppress">ground_suppress — strong green/brown desat</option>
+            <option value="adaptive">adaptive — auto by brightness</option>
+          </select>
+        </label>
+        <button id="btnQrSwApply" class="btn small">apply software</button>
+        <button id="btnQrBoostOff" class="btn small">reset to normal</button>
+      </div>
+      <div class="kv"><span>how it works</span><b id="qrBoostInfo" style="font-size:11px; line-height:1.3;">High contrast 1.8-2.0 makes black/white QR pop vs mid-tone ground, low sat 0.5-0.7 desaturates green grass/brown dirt, high sharp 2.0+ makes finder patterns crisp at 15 m, slightly dark -10 avoids washout, manual exp 5 ms reduces blur.</b></div>
+      <div class="row wrap">
+        <button id="btnQrBoostDay" class="btn small" title="Day profile for A3 at 15 m">day 15m boost</button>
+        <button id="btnQrBoostAgg" class="btn small" title="Aggressive ground suppression">aggressive</button>
+        <button id="btnQrBoostBottom" class="btn small" title="Bottom cam ground suppress">bottom boost</button>
+        <button id="btnQrBoostFront" class="btn small" title="Front cam">front boost</button>
+      </div>
+      <p class="hint">Kabaddi setting: QR is on ground, so ground is noise. ISP: contrast HIGH (1.8-2.0) → QR B/W contrast vs ground, saturation LOW (0.5-0.7) → green/brown grass desaturated to gray, QR B/W stays, sharpness HIGH (2.0) → finder patterns crisp at 10/15 m, brightness -10 → white ground not blown, exposure manual 5 ms → less motion blur. Software: CLAHE on L channel + unsharp mask + HSV green/brown mask desat 40% + V boost. See docs/arena_test1/00_DETECTION... for pixel budget.</p>
     </div>
 
     <div class="card" id="cardQr">
@@ -221,7 +323,7 @@
       <div class="camview">
         <video id="videoCam1" muted playsinline></video>
         <img id="imgCam1" alt="cam1 frame">
-        <div class="camhead"><b>CAM1 · pi-cam3</b><span id="camStats1">—</span></div>
+        <div class="camhead"><b>CAM1 · pi-cam3 66°</b><span id="camStats1">—</span></div>
         <div id="camHint1" class="camhint">connecting…</div>
         <button id="btnModalCam1" class="btn small">enlarge</button>
         <button id="btnPauseCam1" class="btn small">pause</button>
@@ -229,7 +331,7 @@
       <div class="camview" id="camView2">
         <video id="videoCam2" muted playsinline></video>
         <img id="imgCam2" alt="cam2 frame">
-        <div class="camhead"><b>CAM2 · imx477</b><span id="camStats2">—</span></div>
+        <div class="camhead"><b>CAM2 · imx477 100°</b><span id="camStats2">—</span></div>
         <div id="camHint2" class="camhint">connecting…</div>
         <button id="btnModalCam2" class="btn small">enlarge</button>
         <button id="btnPauseCam2" class="btn small">pause</button>
@@ -247,6 +349,7 @@
 </div>
 
 <script src="vendor/leaflet/leaflet.js"></script>
+<script src="js/geo.js"></script>
 <script src="js/links.js"></script>
 <script src="js/camera.js"></script>
 <script src="js/map.js"></script>
