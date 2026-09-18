@@ -63,13 +63,13 @@
       <div class="kv"><span>converted</span><b id="pConverted">no</b></div>
       <div class="row wrap">
         <button id="btnPolyToFence" class="btn polygon primary">POLYGON → FENCE INCLUSION</button>
-        <button id="btnPolyApply" class="btn small">apply polygon as fence → MP</button>
+        <button id="btnPolyApply" class="btn small">upload polygon as FC fence</button>
       </div>
       <div class="row wrap">
         <button id="btnPolyExport" class="btn small">export polygon .poly</button>
         <button id="btnPolyShowFov" class="btn small fov">show FOV coverage</button>
       </div>
-      <p class="hint">Draw polygon (purple) — this is what shows on Mission Planner. Click "POLYGON → FENCE INCLUSION" to turn it into geofence inclusion (green, MAV_CMD 5001) for FC. Fence is the safety boundary; polygon is the search area. Same vertices, different semantics.</p>
+      <p class="hint">Draw polygon (purple), then upload it as the FC inclusion fence (MAV_CMD 5001). Conversion alone is local; only a successful upload plus FC readback confirms storage. Verify fence enforcement separately in Mission Planner.</p>
     </div>
 
     <div class="card coverage-card" id="cardCoverage">
@@ -114,7 +114,7 @@
         <button id="btnPiConnect" class="btn small">connect</button>
         <button id="btnPiProbe" class="btn small" title="HTTP check of /health — says why the socket will not open">probe</button>
       </div>
-      <p class="hint" id="piHint">Paste the URL mission_pi prints on startup (http://&lt;pi-ip&gt;:8000). UI only reads Pi mission/fsm/system events; fence + flight go via the MP link, camera tuning is the only write.</p>
+      <p class="hint" id="piHint">Paste the URL mission_pi prints on startup (http://&lt;pi-ip&gt;:8000). The selected Pi receives fence, altitude, camera and preset commands. RTL/LAND still use the MP bridge link.</p>
     </div>
 
     <div class="card" id="cardFsm">
@@ -123,7 +123,7 @@
       <div class="kv"><span>state</span><b id="fsmState">—</b></div>
       <div class="kv"><span>acknowledged</span><b id="fsmReason">—</b></div>
       <div class="kv"><span>plan (from FC)</span><b id="planInfo">—</b></div>
-      <div class="kv"><span>armable</span><b id="armableInfo">—</b></div>
+      <div class="kv"><span>fence check</span><b id="armableInfo">—</b></div>
     </div>
 
     <div class="card" id="cardFence">
@@ -151,12 +151,12 @@
       <div class="kv"><span>drawing</span><b id="fDrawing">0 pts</b></div>
       <div class="kv"><span>draw area</span><b id="drawArea">—</b></div>
       <div class="row wrap">
-        <button id="btnFenceApply" class="btn primary">APPLY FENCE → MP</button>
+        <button id="btnFenceApply" class="btn primary">UPLOAD FENCE → FC</button>
         <button id="btnFenceClear" class="btn small danger">clear on FC</button>
         <button id="btnFenceRefresh" class="btn small">refresh from FC</button>
       </div>
       <button id="btnExportLap" class="btn small">export .lap</button>
-      <p class="hint">Fence uploads via the MP link (FENCE mission type, CMD 5001 inclusion) with FC readback verify, then FENCE_ENABLE + FENCE_ACTION + FENCE_TYPE params. Polygon → fence conversion does same upload.</p>
+      <p class="hint">Disarmed only: upload through the selected Pi, then verify FC readback. This does NOT enable enforcement or change FENCE_ENABLE, FENCE_ACTION or FENCE_TYPE. Verify those separately in Mission Planner; download/refresh its Fence view if needed.</p>
     </div>
 
     <div class="card" id="cardTelem">

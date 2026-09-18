@@ -3,3 +3,6 @@ logs/
 __pycache__/
 *.pyc
 .venv/
+
+# optional UI test dependencies
+node_modules/

@@ -134,7 +134,8 @@ detector:
   conf_thr: 0.25           # START value — the active preset (below) overrides
   iou_thr: 0.45            #   it at startup and on every preset switch
   preset: day              # ACTIVE qr_presets entry (runtime: POST /api/qr/preset)
-  tile_bottom: true        # MANDATORY for 15 m
+  tile_bottom: true        # helps small QR candidates; cannot guarantee 15 m decode
+  tile_front: false        # enable for distant Cam3 QRs; 3x3 = 9 inferences/frame
   tile_grid: [3, 3]
   tile_overlap: 0.25
   full_decode_every_n: 3   # full-frame decode attempt every Nth frame

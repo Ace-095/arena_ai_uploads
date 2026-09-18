@@ -1,0 +1,6 @@
+{
+  "name": "real-pi-ui-tests",
+  "private": true,
+  "description": "Optional DOM command regression dependencies; production UI has no npm runtime dependency",
+  "devDependencies": {"jsdom": "^26.1.0"}
+}

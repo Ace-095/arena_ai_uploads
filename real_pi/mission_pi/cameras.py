@@ -344,7 +344,7 @@ class _BaseCamera:
             # Map profile to contract tuning
             tuning = {k: v for k, v in prof.items() if k in self.TUNING_DEFAULTS}
             # QR boost meta
-            self.qr_boost["qr_boost_enabled"] = True
+            self.qr_boost["qr_boost_enabled"] = profile_name != "normal"
             self.qr_boost["qr_boost_mode"] = profile_name
             # Apply ISP tuning via backend
             return self.apply_tuning(tuning)

@@ -333,7 +333,7 @@ def create_app(rig, mission, fc, streams=None, bringup=None, pulse_s=2.0,
         before = {n: (c.kind, c.model, c.facing)
                   for n, c in (rig.cams or {}).items()}
         try:
-            changed = rig.rescan()
+            changed = await asyncio.to_thread(rig.rescan)
         except Exception as e:
             return JSONResponse({"detail": "rescan failed: %r" % e}, 500)
         after = {n: (c.kind, c.model, c.facing)
@@ -476,7 +476,7 @@ def create_app(rig, mission, fc, streams=None, bringup=None, pulse_s=2.0,
         if profile:
             try:
                 # apply_qr_profile handles ISP tuning for QR pop vs ground
-                c.apply_qr_profile(profile)
+                await asyncio.to_thread(c.apply_qr_profile, profile)
             except Exception as e:
                 log.warning("qr boost profile %r failed: %r", profile, e)
         # Software enhance mode
@@ -499,7 +499,7 @@ def create_app(rig, mission, fc, streams=None, bringup=None, pulse_s=2.0,
                         c.qr_boost["qr_enhance_mode"] = sw
             except Exception as e:
                 log.debug("qr software enhance set failed: %r", e)
-        applied = c.apply_tuning(body)
+        applied = await asyncio.to_thread(c.apply_tuning, body)
         return {"ok": True, "status": "ok", "cam": cam, "controls": applied, "qr_boost": dict(c.qr_boost)}
 
     @app.get("/api/camera/{cam}/controls")
@@ -585,7 +585,7 @@ def create_app(rig, mission, fc, streams=None, bringup=None, pulse_s=2.0,
         except Exception:
             pass
         try:
-            applied = mission.set_preset(name)
+            applied = await asyncio.to_thread(mission.set_preset, name)
         except Exception as e:
             return JSONResponse({"detail": "preset switch failed: %r" % e}, 500)
         if applied is None:
@@ -597,96 +597,77 @@ def create_app(rig, mission, fc, streams=None, bringup=None, pulse_s=2.0,
         return {"ok": True, "preset": name, "applied": applied,
                 "filter": mission.qf.as_dict()}
 
-    # ---- UI-driven fence + alt — Pi owns fence, MP sees instantly ----
+    # Fence is a verified FC transaction, not a local drawing. Slow serial
+    # work runs off the ASGI event loop so MJPEG/health/WS keep flowing.
+    from fence import normalize as normalize_fence, matches as fence_matches
+    from contextlib import nullcontext
+    fence_lock = asyncio.Lock()
+
+    def fence_state(vertices, confirmed=False, reason="", **extra):
+        verts = [tuple(v) for v in vertices]
+        return {"ok": confirmed, "source": "pi", "loaded": bool(verts),
+                "confirmed": confirmed, "reason": reason,
+                "count": len(verts), "vertex_count": len(verts),
+                "fence": verts, "fc_fence": verts if confirmed else [],
+                "fc_count": len(verts) if confirmed else 0,
+                "vertices_latlon": [{"lat": a, "lon": b} for a, b in verts],
+                **extra}
+
+    def fence_transaction(vertices=None, clear=False):
+        if not fc or not fc.link_ok():
+            return 503, fence_state([], reason="No FC link; fence NOT changed", detail="No FC link")
+        # Do not edit the FC safety boundary during flight from this UI.
+        if (clear or vertices is not None) and getattr(fc, "armed", False):
+            return 409, fence_state([], reason="Disarm before editing fence", detail="FC is armed")
+        try:
+            with getattr(fc, "_mission_lock", nullcontext()):
+                if clear:
+                    if not fc.clear_fence():
+                        raise RuntimeError("FC did not acknowledge fence clear")
+                elif vertices is not None:
+                    fc.upload_fence(vertices, timeout=10.0)
+                actual = fc.read_fence(timeout=4.0)
+                wanted = [] if clear else vertices
+                if wanted is not None and not fence_matches(wanted, actual):
+                    raise RuntimeError("FC readback mismatch; refresh fence before continuing")
+                if mission is not None:
+                    mission.fence = list(actual)
+            state = fence_state(actual, True, "FC readback verified (not an arming/enforcement check)",
+                                fc_uploaded=vertices is not None, cleared=clear)
+            hub.push("fence", state)
+            return 200, state
+        except Exception as e:
+            # Never replace mission.fence with an unconfirmed UI drawing.
+            return 502, fence_state([], reason=str(e), detail=str(e), fc_uploaded=False)
+
+    async def run_fence(vertices=None, clear=False):
+        if fence_lock.locked():
+            return JSONResponse({"detail": "Fence transaction in progress; retry"}, 409)
+        async with fence_lock:
+            code, result = await asyncio.to_thread(fence_transaction, vertices, clear)
+        return JSONResponse(result, code)
+
     @app.get("/api/fence")
     async def get_fence():
-        """Return current fence from mission (Pi-owned) + FC readback if available."""
-        fence = []
-        try:
-            fence = list(getattr(mission, "fence", []) or [])
-        except Exception:
-            fence = []
-        fc_fence = []
-        try:
-            if fc and fc.link_ok():
-                fc_fence = fc.read_fence(timeout=4.0)
-        except Exception as e:
-            log.debug("fc read_fence failed: %r", e)
-        return {"ok": True, "fence": fence, "fc_fence": fc_fence, "count": len(fence), "fc_count": len(fc_fence)}
+        return await run_fence()
 
     @app.post("/api/fence")
     async def post_fence(req: Request):
-        """UI pushes fence polygon to Pi — Pi stores + uploads to FC, MP sees instantly.
-
-        Body: {vertices: [[lat,lon], ...] or [{lat,lon}, ...], clear: bool}
-        Returns: {ok, count, fc_uploaded}
-        """
         try:
             body = await req.json()
-        except Exception:
-            body = None
-        if not isinstance(body, dict):
-            return JSONResponse({"detail": "want JSON {vertices: [[lat,lon],...]}"}, 400)
-        if body.get("clear"):
-            try:
-                if fc and fc.link_ok():
-                    fc.clear_fence()
-                if mission is not None:
-                    mission.fence = []
-                hub.push("event", {"type": "fence", "action": "clear", "source": "ui"})
-                return {"ok": True, "cleared": True, "count": 0}
-            except Exception as e:
-                return JSONResponse({"detail": "clear failed: %r" % e}, 500)
-        verts = body.get("vertices") or body.get("polygon") or body.get("fence") or []
-        # Normalize: [[lat,lon]] or [{lat,lon}]
-        norm = []
-        for v in verts:
-            try:
-                if isinstance(v, dict):
-                    lat = float(v.get("lat") or v.get("y") or v.get("latitude"))
-                    lon = float(v.get("lon") or v.get("x") or v.get("longitude"))
-                elif isinstance(v, (list, tuple)) and len(v) >= 2:
-                    lat, lon = float(v[0]), float(v[1])
-                else:
-                    continue
-                norm.append((lat, lon))
-            except Exception:
-                continue
-        if len(norm) < 3:
-            return JSONResponse({"detail": "fence needs >=3 vertices, got %d" % len(norm)}, 400)
-        # Store in mission
-        try:
-            if mission is not None:
-                mission.fence = list(norm)
-        except Exception as e:
-            log.warning("mission.fence set failed: %r", e)
-        # Upload to FC if link ok — MP sees instantly because FC broadcasts
-        fc_ok = False
-        fc_err = None
-        try:
-            if fc and fc.link_ok():
-                fc.upload_fence(norm, timeout=10.0)
-                fc_ok = True
-            else:
-                fc_err = "no FC link"
-        except Exception as e:
-            fc_err = str(e)
-            log.warning("fc upload_fence failed: %r", e)
-        hub.push("event", {"type": "fence", "action": "upload", "count": len(norm), "fc_ok": fc_ok, "source": "ui"})
-        hub.push("fsm", _mission_snapshot())
-        return {"ok": True, "count": len(norm), "fc_uploaded": fc_ok, "fc_error": fc_err, "fence": norm}
+            if not isinstance(body, dict):
+                raise ValueError("want JSON object")
+            if body.get("clear") is True:
+                return await run_fence(clear=True)
+            verts = next((body[k] for k in ("vertices", "polygon", "fence") if k in body), None)
+            norm = normalize_fence(verts)
+        except (ValueError, TypeError) as e:
+            return JSONResponse({"detail": str(e)}, 400)
+        return await run_fence(vertices=norm)
 
     @app.delete("/api/fence")
     async def delete_fence():
-        try:
-            if fc and fc.link_ok():
-                fc.clear_fence()
-            if mission is not None:
-                mission.fence = []
-            hub.push("event", {"type": "fence", "action": "clear", "source": "ui"})
-            return {"ok": True, "cleared": True}
-        except Exception as e:
-            return JSONResponse({"detail": "clear failed: %r" % e}, 500)
+        return await run_fence(clear=True)
 
     @app.get("/api/config")
     async def get_config():
@@ -707,70 +688,41 @@ def create_app(rig, mission, fc, streams=None, bringup=None, pulse_s=2.0,
 
     @app.post("/api/config")
     async def post_config(req: Request):
-        """UI sets alt — Pi owns alt, MP sees via FC params or mission status.
-
-        Body: {max_alt_m: 15, sweep_alt_m: 12} or {flight: {max_alt_m: 15}}
-        """
+        """Runtime Pi settings + honest FC parameter acknowledgement, no disk save."""
+        import math
+        if mission is None:
+            return JSONResponse({"detail": "mission not started"}, 503)
         try:
             body = await req.json()
-        except Exception:
-            body = None
-        if not isinstance(body, dict):
-            return JSONResponse({"detail": "want JSON {max_alt_m: 15, sweep_alt_m: 12}"}, 400)
-        max_alt = body.get("max_alt_m")
-        if max_alt is None:
-            flight = body.get("flight") or {}
-            if isinstance(flight, dict):
-                max_alt = flight.get("max_alt_m")
-        sweep_alt = body.get("sweep_alt_m")
-        if sweep_alt is None:
-            mission_cfg = body.get("mission") or {}
-            if isinstance(mission_cfg, dict):
-                sweep_alt = mission_cfg.get("sweep_alt_m")
-        updated = {}
-        try:
-            if max_alt is not None:
-                v = float(max_alt)
-                # Clamp 1..50
-                v = max(1.0, min(50.0, v))
-                if mission is not None:
-                    mission.max_alt_m = v
-                    # Also update cfg for persistence in status
-                    try:
-                        if hasattr(mission, "cfg") and isinstance(mission.cfg, dict):
-                            mission.cfg.setdefault("flight", {})["max_alt_m"] = v
-                            mission.cfg.setdefault("mission", {})["max_alt_m"] = v
-                    except Exception:
-                        pass
-                # Try set param on FC so MP sees instantly — WPNAV_SPEED or WP_SPD or FENCE_ALT_MAX
-                try:
-                    if fc and fc.link_ok():
-                        # Set FENCE_ALT_MAX if available, else just log
-                        try:
-                            fc.set_param("FENCE_ALT_MAX", v, timeout=3.0)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-                updated["max_alt_m"] = v
-            if sweep_alt is not None:
-                v = float(sweep_alt)
-                if mission is not None:
-                    # Clamp to max_alt
-                    max_a = getattr(mission, "max_alt_m", 15.0) or 15.0
-                    v = max(1.0, min(max_a, v))
-                    mission.sweep_alt = v
-                    try:
-                        if hasattr(mission, "cfg") and isinstance(mission.cfg, dict):
-                            mission.cfg.setdefault("mission", {})["sweep_alt_m"] = v
-                    except Exception:
-                        pass
-                updated["sweep_alt_m"] = v
-            hub.push("event", {"type": "config", "updated": updated, "source": "ui"})
-            hub.push("fsm", _mission_snapshot())
-            return {"ok": True, "updated": updated, "max_alt_m": getattr(mission, "max_alt_m", None) if mission else None}
-        except Exception as e:
-            return JSONResponse({"detail": "config update failed: %r" % e}, 500)
+            if not isinstance(body, dict):
+                raise ValueError("want a JSON object")
+            max_alt = body.get("max_alt_m", (body.get("flight") or {}).get("max_alt_m"))
+            sweep = body.get("sweep_alt_m", (body.get("mission") or {}).get("sweep_alt_m"))
+            if max_alt is None and sweep is None:
+                raise ValueError("supply max_alt_m or sweep_alt_m")
+            max_alt = float(max_alt if max_alt is not None else mission.max_alt_m)
+            sweep = float(sweep if sweep is not None else mission.sweep_alt)
+            if not (math.isfinite(max_alt) and math.isfinite(sweep) and
+                    1 <= max_alt <= 50 and sweep >= 1):
+                raise ValueError("finite max altitude 1..50m and sweep >=1m required")
+            sweep = min(max_alt, sweep)
+        except (ValueError, TypeError, AttributeError) as e:
+            return JSONResponse({"detail": str(e)}, 400)
+        mission.max_alt_m, mission.sweep_alt = max_alt, sweep
+        mission.cfg.setdefault("flight", {})["max_alt_m"] = max_alt
+        mission.cfg.setdefault("mission", {}).update(max_alt_m=max_alt, sweep_alt_m=sweep)
+        fc_updated, fc_error = False, "no FC link"
+        if fc and fc.link_ok():
+            try:
+                echo = await asyncio.to_thread(fc.set_param, "FENCE_ALT_MAX", max_alt, timeout=3.0)
+                fc_updated = echo is not None and math.isclose(float(echo), max_alt, abs_tol=0.01)
+                fc_error = None if fc_updated else "FENCE_ALT_MAX echo mismatch"
+            except Exception as e:
+                fc_error = str(e)
+        updated = {"max_alt_m": max_alt, "sweep_alt_m": sweep}
+        hub.push("event", {"type": "config", "updated": updated, "source": "ui"})
+        return {"ok": True, "updated": updated, "max_alt_m": max_alt,
+                "fc_updated": fc_updated, "fc_error": fc_error, "persisted": False}
 
     @app.post("/api/fsm/start")
     async def fsm_start():

@@ -6,8 +6,8 @@
  *  - polygon (primary, shows on MP) + conversion to fence inclusion (button)
  *  - configurable max height via config.yaml (flight.max_alt_m) — 5/10/15 m etc
  *  - FOV-based coverage: drone covers max area according to cam FOV (cam.txt)
- *  - OUT to FC: fence/polygon upload/clear, RTL/LAND, param read — via bridge MP link
- *  - OUT to Pi: camera tuning only
+ *  - OUT to FC: RTL/LAND, param read — via bridge MP link
+ *  - OUT to Pi: verified fence transactions, camera tuning/presets, runtime altitude
  */
 (function () {
 'use strict';
@@ -152,10 +152,11 @@ function renderPlan(p) {
 }
 
 function renderArmable() {
-  const ok = !!(S.mav && S.mav.connected && S.fence && S.fence.loaded && S.fence.confirmed);
+  const ok = !!(S.fence && S.fence.loaded && S.fence.confirmed &&
+    (S.fence.source === 'pi' || (S.mav && S.mav.connected)));
   const el = $('armableInfo');
   if (!el) return;
-  el.textContent = ok ? 'YES — fence confirmed on FC (from polygon)' : 'NO — need MAVLink link + confirmed fence (draw polygon → fence)';
+  el.textContent = ok ? 'Fence readback verified — NOT a flight-readiness or FENCE_ENABLE check' : 'NOT verified — connect Pi/FC, upload and check readback';
   el.style.color = ok ? '#5fd97a' : '#ff6b6b';
 }
 
@@ -284,6 +285,7 @@ function onEnvelope(env) {
   if (!env || !env.channel) return;
   const d = env.data || {};
   switch (env.channel) {
+    case 'fence': renderFence(d); break;
     case 'system': renderSystem(d); break;
     case 'event': renderEvent(d); break;
     case 'qr': renderQrUpdate(d); log('WARN', 'QR via pi-ws: ' + (d.payload || '?')); break;
@@ -395,6 +397,39 @@ function postJson(url, body) {
   });
 }
 
+// Exactly ONE writer. A second bridge upload is not a visualization call:
+// it starts another MAVLink mission transfer and can race the Pi.
+let fenceBusy = false;
+async function runFenceAction(action, vertices) {
+  if (fenceBusy) return;
+  fenceBusy = true;
+  const ids = ['btnFenceApply', 'btnPolyApply', 'btnFenceClear', 'btnFenceRefresh'];
+  ids.forEach(id => { if ($(id)) $(id).disabled = true; });
+  const base = (S.piUrl || '').replace(/\/$/, '');
+  const url = base ? base + '/api/fence' : '/api/mp/fence';
+  try {
+    let st;
+    if (action === 'upload') st = await postJson(url, { vertices });
+    else {
+      const r = await fetch(url, { method: action === 'clear' ? 'DELETE' : 'GET', cache: 'no-store' });
+      if (!r.ok) throw new Error('HTTP ' + r.status + ': ' + (await r.text()).slice(0, 200));
+      st = await r.json();
+    }
+    if (!st.confirmed) throw new Error(st.reason || st.fc_error || 'FC readback NOT confirmed');
+    renderFence(st);
+    if ($('pConverted')) $('pConverted').textContent = action === 'clear'
+      ? 'cleared (FC readback)' : 'FC verified: ' + st.vertex_count + ' vertices';
+    log('INFO', 'fence ' + action + ': FC readback verified. Refresh/download Fence in MP if needed.');
+  } catch (e) {
+    renderFence({ ...(S.fence || {}), loaded: false, confirmed: false, reason: e.message });
+    if ($('pConverted')) $('pConverted').textContent = 'NOT confirmed — ' + e.message;
+    log('ERROR', 'fence ' + action + ' failed: ' + e.message);
+  } finally {
+    fenceBusy = false;
+    ids.forEach(id => { if ($(id)) $(id).disabled = false; });
+  }
+}
+
 function loadUiConfig() {
   // arena/test1: load config.yaml for max height + FOV
   fetch('/config.yaml').then(r => r.ok ? r.text() : Promise.reject()).then(txt => {
@@ -492,19 +527,20 @@ function boot() {
       if (isNaN(maxV) || maxV < 1 || maxV > 50) { log('ERROR', 'bad max height'); return; }
       if (isNaN(sweepV) || sweepV < 1) { log('ERROR', 'bad sweep alt'); return; }
       const clampedSweep = Math.min(sweepV, maxV);
-      S.config.max_alt_m = maxV;
-      S.config.sweep_alt_m = clampedSweep;
-      map.setMaxAlt(maxV);
-      map.setSweepAlt(clampedSweep);
-      if ($('cfgMaxAlt')) $('cfgMaxAlt').textContent = maxV + ' m';
-      if ($('cfgSweepAlt')) $('cfgSweepAlt').textContent = clampedSweep + ' m';
-      if ($('cfgSource')) $('cfgSource').textContent = 'manual (' + maxV + 'm max, ' + clampedSweep + 'm sweep)';
-      log('WARN', 'altitude config: max=' + maxV + 'm sweep=' + clampedSweep + 'm (pushing to Pi, MP sees via FENCE_ALT_MAX)');
+      log('INFO', 'Requesting Pi runtime altitude: max=' + maxV + 'm sweep=' + clampedSweep + 'm');
       const piBase = (S.piUrl || '').replace(/\/$/, '');
       if (piBase) {
         postJson(piBase + '/api/config', { max_alt_m: maxV, sweep_alt_m: clampedSweep })
           .then((st) => {
-            log('INFO', 'Pi alt updated: max=' + st.max_alt_m + 'm sweep=' + (st.updated.sweep_alt_m || clampedSweep) + 'm — MP Fence alt instant via FENCE_ALT_MAX param');
+            S.config.max_alt_m = maxV;
+            S.config.sweep_alt_m = clampedSweep;
+            map.setMaxAlt(maxV);
+            map.setSweepAlt(clampedSweep);
+            if ($('cfgMaxAlt')) $('cfgMaxAlt').textContent = maxV + ' m';
+            if ($('cfgSweepAlt')) $('cfgSweepAlt').textContent = clampedSweep + ' m';
+            if ($('cfgSource')) $('cfgSource').textContent = 'Pi runtime (' + maxV + 'm max, ' + clampedSweep + 'm sweep)';
+
+            log(st.fc_updated ? 'INFO' : 'WARN', 'Pi runtime alt updated: max=' + st.max_alt_m + 'm sweep=' + st.updated.sweep_alt_m + 'm; FC FENCE_ALT_MAX ' + (st.fc_updated ? 'echo verified' : 'NOT verified: ' + st.fc_error) + '; not saved to config.yaml');
           })
           .catch((e) => log('ERROR', 'Pi alt push failed: ' + e.message));
       }
@@ -555,7 +591,7 @@ function boot() {
       if (!verts) return;
       S.polygon = verts;
       renderPolygon(verts);
-      if ($('pConverted')) { $('pConverted').textContent = 'yes → fence inclusion'; $('pConverted').style.color = '#5fd97a'; }
+      if ($('pConverted')) { $('pConverted').textContent = 'local conversion only — upload required'; $('pConverted').style.color = '#5fd97a'; }
       log('WARN', 'polygon → fence inclusion: ' + verts.length + ' verts (now can APPLY FENCE → MP)');
     });
 
@@ -567,26 +603,9 @@ function boot() {
         verts = map.getVertices();
         if (verts.length < 3) { log('ERROR', 'need ≥3 polygon vertices (have ' + verts.length + ')'); return; }
       }
-      if (!window.confirm('Apply ' + verts.length + '-vertex POLYGON as FENCE via Pi to FC? MP will see instantly.')) return;
-      const piBase = (S.piUrl || '').replace(/\/$/, '');
-      if (piBase) {
-        postJson(piBase + '/api/fence', { vertices: verts })
-          .then((st) => {
-            log('WARN', 'Pi polygon->fence: ' + st.count + ' verts, FC=' + st.fc_uploaded + ' — MP Fence tab instant');
-            if ($('pConverted')) { $('pConverted').textContent = 'uploaded via Pi ✓ ' + st.count + ' verts'; $('pConverted').style.color = '#5fd97a'; }
-            return postJson('/api/mp/fence', { vertices: verts, mission_type: 'fence', fence_action: null }).catch(()=>st);
-          })
-          .then((st) => { renderFence(st); })
-          .catch((e) => log('ERROR', 'Pi polygon fence upload failed: ' + e.message));
-      } else {
-        postJson('/api/mp/fence', { vertices: verts, mission_type: 'fence', fence_action: null })
-          .then((st) => {
-            renderFence(st);
-            if ($('pConverted')) { $('pConverted').textContent = 'uploaded ✓'; $('pConverted').style.color = '#5fd97a'; }
-            log('WARN', 'polygon as fence upload done via bridge: ' + st.vertex_count + ' verts, ' + (st.confirmed ? 'readback MATCH' : 'READBACK MISMATCH') + ' — check MP Fence tab');
-          })
-          .catch((e) => log('ERROR', 'polygon fence upload failed: ' + e.message));
-      }
+      if (!window.confirm('Upload this polygon as the FC fence? Vehicle must be disarmed.')) return;
+      return runFenceAction('upload', verts);
+
     });
 
     const btnPolyExport = $('btnPolyExport');
@@ -644,6 +663,7 @@ function boot() {
     const qrBoostInfo = $('qrBoostInfo');
 
     function applyQrBoostProfile(profileName) {
+      if (!S.piUrl) { log('ERROR', 'Connect the Pi first'); return; }
       const cam = S.camActive === 'cam1' ? 'cam1' : 'cam2';
       // Map profile to ISP tuning (same as qr_camera_boost.py)
       const profiles = {
@@ -657,7 +677,8 @@ function boot() {
       const tuning = profiles[profileName] || profiles.qr_boost_day;
       tuning.cam = cam;
       // POST to Pi /api/camera/controls
-      postJson('/api/camera/controls', tuning).then(() => {
+      postJson(S.piUrl + '/api/camera/controls', { ...tuning, qr_boost_profile: profileName }).then(() => {
+        seedCamControls();
         log('WARN', cam + ' QR boost ISP ' + profileName + ' applied — contrast ' + tuning.contrast + ' sat ' + tuning.saturation + ' sharp ' + tuning.sharpness + ' (QR pops vs ground)');
         if (qrBoostInfo) qrBoostInfo.textContent = profileName + ': contrast ' + tuning.contrast + ' sat ' + tuning.saturation + ' sharp ' + tuning.sharpness + ' bright ' + tuning.brightness + ' exp ' + tuning.exposure_us + 'us — ' + (profileName.includes('aggressive') ? 'ground almost gray, QR B/W stays' : 'QR B/W pops vs green/brown ground');
         // Also update sliders to reflect new values
@@ -684,8 +705,9 @@ function boot() {
     const btnQrSwApply = $('btnQrSwApply');
     if (btnQrSwApply) btnQrSwApply.addEventListener('click', () => {
       const cam = S.camActive === 'cam1' ? 'cam1' : 'cam2';
+      if (!S.piUrl) { log('ERROR', 'Connect the Pi first'); return; }
       const mode = qrSwMode ? qrSwMode.value : 'qr_boost';
-      postJson('/api/camera/controls', { cam, qr_software_enhance: mode !== 'none', qr_enhance_mode: mode }).then(() => {
+      postJson(S.piUrl + '/api/camera/controls', { cam, qr_software_enhance: mode !== 'none', qr_enhance_mode: mode }).then(() => {
         log('INFO', cam + ' software QR enhance ' + mode + ' — CLAHE+unsharp+green suppress, QR pops vs ground');
       }).catch((e) => log('ERROR', 'software enhance failed: ' + e.message));
     });
@@ -752,6 +774,7 @@ function boot() {
           (a.tile_grid || []).join('x') + ', require-decode ' + a.require_decode_for_cue +
           ', boost ' + (a.boost || '?') + ') — applied live, no restart');
         refreshQrPresets();
+        seedCamControls();
       }).catch((e) => {
         log('ERROR', 'QR preset switch failed: ' + e.message);
         if (qrPresetInfo) qrPresetInfo.textContent = 'switch failed: ' + e.message;
@@ -780,62 +803,18 @@ function boot() {
     let verts = map.getPolygonVertices ? map.getPolygonVertices() : [];
     if (verts.length < 3) verts = map.getVertices();
     if (verts.length < 3) { log('ERROR', 'fence needs ≥3 vertices (polygon or fence drawing, have ' + verts.length + ')'); return; }
-    if (!window.confirm('Apply ' + verts.length + '-vertex fence via Pi to FC? MP will see instantly.')) return;
-    // UI now drives fence via Pi — Pi owns fence, MP sees instantly because FC broadcasts
-    // Keep MP link as fallback, but Pi is primary (MP not involved much)
-    const piBase = (S.piUrl || '').replace(/\/$/, '');
-    if (piBase) {
-      postJson(piBase + '/api/fence', { vertices: verts })
-        .then((st) => {
-          log('WARN', 'Pi fence upload: ' + st.count + ' verts, FC uploaded=' + st.fc_uploaded + (st.fc_error ? ' err:'+st.fc_error : '') + ' — MP Fence tab should show instantly');
-          // Also push to bridge for MP instant viz
-          return postJson('/api/mp/fence', { vertices: verts, mission_type: 'fence', fence_action: null }).catch(()=>st);
-        })
-        .then((st) => { renderFence(st); })
-        .catch((e) => log('ERROR', 'Pi fence upload failed: ' + e.message));
-    } else {
-      postJson('/api/mp/fence', { vertices: verts, mission_type: 'fence', fence_action: null })
-        .then((st) => { renderFence(st); log('WARN', 'fence upload done via bridge: ' + st.vertex_count + ' verts, ' + (st.confirmed ? 'readback MATCH' : 'READBACK MISMATCH')); })
-        .catch((e) => log('ERROR', 'fence upload failed: ' + e.message));
-    }
+    if (!window.confirm('Upload this fence to the FC? Vehicle must be disarmed.')) return;
+    return runFenceAction('upload', verts);
   });
 
   const btnFenceClear = $('btnFenceClear');
   if (btnFenceClear) btnFenceClear.addEventListener('click', () => {
-    if (!window.confirm('Clear the fence on the FC via Pi?')) return;
-    const piBase = (S.piUrl || '').replace(/\/$/, '');
-    const p1 = piBase ? postJson(piBase + '/api/fence', { clear: true }).catch(()=>{}) : Promise.resolve();
-    const p2 = fetch('/api/mp/fence', { method: 'DELETE' }).then((r) => {
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      return r.json();
-    }).catch(()=>{});
-    Promise.all([p1,p2]).then(() => {
-      renderFence({ loaded: false, vertex_count: 0, vertices_latlon: [] });
-      log('WARN', 'fence cleared on FC via Pi+bridge — MP Fence tab should clear instantly');
-    }).catch((e) => log('ERROR', 'fence clear failed: ' + e.message));
+    if (!window.confirm('Clear the FC fence? Vehicle must be disarmed.')) return;
+    return runFenceAction('clear');
   });
 
   const btnFenceRefresh = $('btnFenceRefresh');
-  if (btnFenceRefresh) btnFenceRefresh.addEventListener('click', () => {
-    const piBase = (S.piUrl || '').replace(/\/$/, '');
-    if (piBase) {
-      fetch(piBase + '/api/fence').then((r) => r.ok ? r.json() : Promise.reject()).then((d) => {
-        if (d.fence && d.fence.length) {
-          log('INFO', 'Pi fence: ' + d.count + ' verts, FC: ' + d.fc_count + ' verts');
-          if (map) map.setFence(d.fence.map((v) => [v[0], v[1]]));
-        }
-      }).catch(()=>{});
-    }
-    fetch('/api/mp/fence').then((r) => {
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      return r.json();
-    }).then((st) => {
-      renderFence(st);
-      log(st.loaded ? 'WARN' : 'INFO', st.loaded
-        ? ('fence refreshed from FC: ' + st.vertex_count + ' verts')
-        : 'no fence stored on FC');
-    }).catch((e) => log('ERROR', 'fence refresh failed: ' + e.message));
-  });
+  if (btnFenceRefresh) btnFenceRefresh.addEventListener('click', () => runFenceAction('refresh'));
 
   const btnExportLap = $('btnExportLap');
   if (btnExportLap) btnExportLap.addEventListener('click', () => {
@@ -1020,7 +999,7 @@ function boot() {
     onBridgeStatus: (ok) => { S.bridgeOk = ok; setLamp('lampBridge', ok); },
     onBridgeState: renderBridgeState,
     onMavState: renderMav,
-    onFence: renderFence,
+    onFence: (d) => { if (!S.piUrl || S.piUrl === window.location.origin) renderFence(d); },
     onPlan: renderPlan,
     onTelemetry: (d) => { renderTelemetry(d); },
     onMpLine: (m) => log('MP', '[' + (m.source || 'mp-log') + '] ' + m.line),
@@ -1044,11 +1023,13 @@ function boot() {
 
   const tabCam1 = $('tabCam1'), tabCam2 = $('tabCam2');
   if (tabCam1) tabCam1.addEventListener('click', () => {
+    S.camActive = 'cam1';
     tabCam1.classList.add('on'); const t2 = $('tabCam2'); if (t2) t2.classList.remove('on');
     const c1 = $('camCtls1'); if (c1) c1.classList.remove('hidden');
     const c2 = $('camCtls2'); if (c2) c2.classList.add('hidden');
   });
   if (tabCam2) tabCam2.addEventListener('click', () => {
+    S.camActive = 'cam2';
     tabCam2.classList.add('on'); if (tabCam1) tabCam1.classList.remove('on');
     const c2 = $('camCtls2'); if (c2) c2.classList.remove('hidden');
     const c1 = $('camCtls1'); if (c1) c1.classList.add('hidden');

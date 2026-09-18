@@ -89,6 +89,8 @@ class Mission:
         self._advancing = False  # latched by _wait_trigger when CURRENT moves
         d = cfg.get("detector", {})
         self.tile_bottom = bool(d.get("tile_bottom", True))
+        self.tile_front = bool(d.get("tile_front", False))
+        self.tile_overlap = float(d.get("tile_overlap", 0.25))
         tg = d.get("tile_grid", [3, 3])
         self.tile_rows, self.tile_cols = int(tg[0]), int(tg[1])
         self.full_decode_every = int(d.get("full_decode_every_n", 5))
@@ -254,8 +256,6 @@ class Mission:
     def _worker(self, cam):
         from decoder import decode_frame
         from detector import detect_tiles
-        tiled = (self.tile_bottom and cam.facing == "bottom"
-                 and self.detector.name != "classical")
         n = 0
         last_count = -1
         while not self._stop.is_set():
@@ -266,9 +266,12 @@ class Mission:
             last_count = count
             n += 1
             try:
+                tiled = ((self.tile_bottom if cam.facing == "bottom" else self.tile_front)
+                         and self.detector.name != "classical")
                 if tiled:
                     boxes = detect_tiles(self.detector, frame,
-                                         rows=self.tile_rows, cols=self.tile_cols)
+                                         rows=self.tile_rows, cols=self.tile_cols,
+                                         overlap=self.tile_overlap)
                 else:
                     boxes = self.detector.detect(frame)
             except Exception as e:

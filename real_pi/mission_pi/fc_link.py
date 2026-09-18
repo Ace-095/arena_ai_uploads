@@ -193,6 +193,7 @@ class FCLink:
         self._subs = {}
         self._subs_lock = threading.Lock()
         self._send_lock = threading.Lock()
+        self._mission_lock = threading.RLock()  # serialize mission/fence transactions
         self._conn_lock = threading.RLock()
         self._stop = threading.Event()
         self._reader = None
@@ -599,34 +600,42 @@ class FCLink:
         return {"pct": int(m.battery_remaining) if m.battery_remaining >= 0 else None,
                 "v": (m.voltages[0] / 1000.0) if m.voltages and m.voltages[0] > 0 else None}
 
+    def _mission_reply(self, q, mtype, deadline, predicate=lambda m: True):
+        # The subscription MUST exist before sending. Fast USB/SITL replies
+        # can arrive inside _send; a later wait_for() loses them.
+        while time.monotonic() < deadline:
+            try:
+                m = q.get(timeout=max(0.001, deadline-time.monotonic()))
+            except queue.Empty:
+                break
+            if (getattr(m, "mission_type", 0) != mtype or
+                    m.get_srcSystem() != self.target_system or
+                    m.get_srcComponent() != self.target_component):
+                continue
+            if predicate(m):
+                return m
+        raise FCError("mission transaction timed out (type %d)" % mtype)
+
     def _download_mission_type(self, mtype, timeout=8.0):
         ts, tc = self.target_system, self.target_component
-        deadline = time.time() + timeout
-        q = self.subscribe(["MISSION_COUNT", "MISSION_ITEM_INT", "MISSION_ACK"])
-        try:
-            self._send(self.conn.mav.mission_request_list_send, ts, tc, mtype)
-            cnt = self.wait_for(["MISSION_COUNT"],
-                                lambda m, mt=mtype: m.mission_type == mt, 4.0)
-            if cnt is None:
-                raise FCError("no MISSION_COUNT (type %d)" % mtype)
-            items = []
-            for seq in range(cnt.count):
-                self._send(self.conn.mav.mission_request_int_send, ts, tc, seq, mtype)
-                it = self.wait_for(
-                    ["MISSION_ITEM_INT"],
-                    lambda m, s=seq, mt=mtype: m.mission_type == mt and m.seq == s,
-                    max(0.5, deadline - time.time()))
-                if it is None:
-                    raise FCError("timeout on item %d (type %d)" % (seq, mtype))
-                items.append(it)
+        deadline = time.monotonic() + timeout
+        with self._mission_lock:
+            q = self.subscribe(["MISSION_COUNT", "MISSION_ITEM_INT", "MISSION_ACK"])
             try:
+                self._send(self.conn.mav.mission_request_list_send, ts, tc, mtype)
+                cnt = self._mission_reply(q, mtype, deadline,
+                                          lambda m: m.get_type() == "MISSION_COUNT")
+                items = []
+                for seq in range(cnt.count):
+                    self._send(self.conn.mav.mission_request_int_send, ts, tc, seq, mtype)
+                    it = self._mission_reply(q, mtype, deadline,
+                        lambda m, s=seq: m.get_type() == "MISSION_ITEM_INT" and m.seq == s)
+                    items.append(it)
                 self._send(self.conn.mav.mission_ack_send, ts, tc,
                            mavutil.mavlink.MAV_MISSION_ACCEPTED, mtype)
-            except Exception:
-                pass
-            return items
-        finally:
-            self.unsubscribe(q)
+                return items
+            finally:
+                self.unsubscribe(q)
 
     def read_plan(self, timeout=8.0):
         items = self._download_mission_type(
@@ -638,84 +647,74 @@ class FCLink:
     def read_fence(self, timeout=8.0):
         items = self._download_mission_type(
             mavutil.mavlink.MAV_MISSION_TYPE_FENCE, timeout)
-        return [(m.x / 1e7, m.y / 1e7) for m in items]
+        if not items:
+            return []
+        # Do not silently flatten circles, exclusions or multiple polygons
+        # into an unrelated search boundary.
+        if any(m.command != 5001 or int(m.param1) != len(items) for m in items):
+            raise FCError("UI supports one inclusion polygon; FC has a different fence layout")
+        from fence import normalize
+        return normalize([(m.x / 1e7, m.y / 1e7) for m in items])
 
     def upload_fence(self, vertices_latlon, timeout=12.0):
-        """Upload fence inclusion polygon to FC — UI now drives fence via Pi, MP sees instantly.
+        """MAVLink 2 single inclusion polygon. ACK is necessary, not readback proof.
 
-        vertices_latlon: [(lat,lon), ...] at least 3, closed or open.
-        Uses MAV_MISSION_TYPE_FENCE, MISSION_ITEM_INT with MAV_CMD 5001 (inclusion).
-        After upload, MP Fence tab shows it instantly because FC broadcasts fence.
-        Returns vertex count. Raises FCError on failure.
+        No duplicate closing vertex; EVERY param1 is the polygon size.
+        Use GLOBAL_INT for frame and FENCE for the *extension* mission_type.
+        Retransmitted requests must be answered even for previously sent items.
         """
         _require_pymavlink()
-        if len(vertices_latlon) < 3:
-            raise FCError("fence needs >=3 vertices")
-        # Close polygon if not closed
-        verts = list(vertices_latlon)
-        if verts[0] != verts[-1]:
-            verts.append(verts[0])
+        from fence import normalize
+        verts = normalize(vertices_latlon)
         ts, tc = self.target_system, self.target_component
         mtype = mavutil.mavlink.MAV_MISSION_TYPE_FENCE
-        # Prepare mission items: first is return point? For fence, items are polygon
-        # Use MAV_CMD_NAV_FENCE_POLYGON_VERTEX_INCLUSION = 5001
-        items = []
-        for i, (lat, lon) in enumerate(verts):
-            # param1 = vertex count for first item, 0 otherwise
-            p1 = len(verts) if i == 0 else 0
-            items.append((i, 5001, p1, lat, lon))
-        q = self.subscribe(["MISSION_REQUEST", "MISSION_REQUEST_INT", "MISSION_ACK"])
-        try:
-            # Send count
-            self._send(self.conn.mav.mission_count_send, ts, tc, len(items), mtype)
-            # Wait for requests and send items
-            deadline = time.time() + timeout
-            sent = set()
-            while len(sent) < len(items) and time.time() < deadline:
-                try:
-                    m = q.get(timeout=1.0)
-                except queue.Empty:
-                    continue
-                if m.get_type() not in ("MISSION_REQUEST", "MISSION_REQUEST_INT"):
-                    continue
-                if m.mission_type != mtype:
-                    continue
-                seq = int(m.seq)
-                if seq in sent or seq >= len(items):
-                    continue
-                idx, cmd, p1, lat, lon = items[seq]
-                # Send MISSION_ITEM_INT
-                self._send(self.conn.mav.mission_item_int_send,
-                           ts, tc, seq, mtype,
-                           cmd, 0, 0,  # current, autocontinue
-                           float(p1), 0, 0, 0,  # param1-4
-                           int(lat * 1e7), int(lon * 1e7), 0)  # x,y,z
-                sent.add(seq)
-            # Wait for ack
-            ack = self.wait_for(["MISSION_ACK"], lambda m: m.mission_type == mtype, 4.0)
-            if ack is None:
-                raise FCError("no MISSION_ACK after fence upload")
-            if ack.type != mavutil.mavlink.MAV_MISSION_ACCEPTED:
-                raise FCError("fence upload rejected: ack type %d" % ack.type)
-            log.info("fence uploaded: %d verts via Pi", len(verts))
-            return len(verts)
-        finally:
-            self.unsubscribe(q)
+        with self._mission_lock:
+            q = self.subscribe(["MISSION_REQUEST", "MISSION_REQUEST_INT", "MISSION_ACK"])
+            try:
+                self._send(self.conn.mav.mission_count_send, ts, tc, len(verts), mtype)
+                deadline = time.monotonic() + timeout
+                sent = set()
+                while True:
+                    m = self._mission_reply(q, mtype, deadline)
+                    if m.get_type() == "MISSION_ACK":
+                        if m.type != mavutil.mavlink.MAV_MISSION_ACCEPTED:
+                            raise FCError("fence upload rejected: ack type %d" % m.type)
+                        if len(sent) != len(verts):
+                            raise FCError("fence ACK before all vertices requested")
+                        return len(verts)
+                    seq = int(m.seq)
+                    if not 0 <= seq < len(verts):
+                        raise FCError("invalid fence request sequence %d" % seq)
+                    lat, lon = verts[seq]
+                    # Legacy MISSION_REQUEST asks for float coordinates.
+                    is_int = m.get_type() == "MISSION_REQUEST_INT"
+                    send = (self.conn.mav.mission_item_int_send if is_int
+                            else self.conn.mav.mission_item_send)
+                    frame = (mavutil.mavlink.MAV_FRAME_GLOBAL_INT if is_int
+                             else mavutil.mavlink.MAV_FRAME_GLOBAL)
+                    self._send(send, ts, tc, seq, frame, 5001, 0, 0,
+                               float(len(verts)), 0, 0, 0,
+                               int(round(lat*1e7)) if is_int else lat,
+                               int(round(lon*1e7)) if is_int else lon, 0, mtype)
+                    sent.add(seq)
+            finally:
+                self.unsubscribe(q)
 
     def clear_fence(self, timeout=6.0):
-        """Clear fence on FC — UI clear fence button."""
+        """Clear only FENCE (never flight waypoints), fail on missing/rejected ACK."""
         _require_pymavlink()
-        ts, tc = self.target_system, self.target_component
         mtype = mavutil.mavlink.MAV_MISSION_TYPE_FENCE
-        try:
-            self._send(self.conn.mav.mission_clear_all_send, ts, tc, mtype)
-            ack = self.wait_for(["MISSION_ACK"], lambda m: m.mission_type == mtype, timeout)
-            if ack and ack.type == mavutil.mavlink.MAV_MISSION_ACCEPTED:
-                log.info("fence cleared via Pi")
+        with self._mission_lock:
+            q = self.subscribe(["MISSION_ACK"])
+            try:
+                self._send(self.conn.mav.mission_clear_all_send,
+                           self.target_system, self.target_component, mtype)
+                ack = self._mission_reply(q, mtype, time.monotonic()+timeout)
+                if ack.type != mavutil.mavlink.MAV_MISSION_ACCEPTED:
+                    raise FCError("fence clear rejected: ack type %d" % ack.type)
                 return True
-            return False
-        except Exception as e:
-            raise FCError("clear_fence failed: %r" % e)
+            finally:
+                self.unsubscribe(q)
 
     def find_sprayer_seqs(self, plan, cmds=(216, 222, 223, 42600)):
         """All mission seqs whose command is a sprayer/trigger command.
@@ -773,18 +772,31 @@ class FCLink:
         except Exception:
             return ""
 
+    def _param_response(self, q, want, timeout):
+        deadline = time.monotonic()+timeout
+        while time.monotonic() < deadline:
+            try:
+                m = q.get(timeout=max(.001, deadline-time.monotonic()))
+            except queue.Empty:
+                break
+            if (self._param_id(m) == want and
+                    m.get_srcSystem() == self.target_system and
+                    m.get_srcComponent() == self.target_component):
+                return m
+        raise FCError("parameter %s not echoed" % want)
+
     def _request_param(self, name, timeout=4.0):
-        """PARAM_REQUEST_READ -> (value, mav_param_type). Raises FCError."""
+        """Subscribe before requesting: immediate parameter echoes are valid."""
         _require_pymavlink()
         want = str(name).upper()[:16]
-        self._send(self.conn.mav.param_request_read_send,
-                   self.target_system, self.target_component,
-                   want.encode("utf-8"), -1)
-        m = self.wait_for(["PARAM_VALUE"],
-                          lambda m, w=want: self._param_id(m) == w, timeout)
-        if m is None:
-            raise FCError("get_param(%s) timeout" % want)
-        return float(m.param_value), int(m.param_type)
+        q = self.subscribe(["PARAM_VALUE"])
+        try:
+            self._send(self.conn.mav.param_request_read_send,
+                       self.target_system, self.target_component, want.encode("utf-8"), -1)
+            m = self._param_response(q, want, timeout)
+            return float(m.param_value), int(m.param_type)
+        finally:
+            self.unsubscribe(q)
 
     def get_param(self, name, timeout=4.0):
         """PARAM_REQUEST_READ + wait for the PARAM_VALUE echo (float)."""
@@ -807,14 +819,15 @@ class FCLink:
         except FCError as e:
             log.warning("set_param(%s): type-learn failed (%s) — trying REAL32", want, e)
             ptype = mavutil.mavlink.MAV_PARAM_TYPE_REAL32
-        self._send(self.conn.mav.param_set_send,
-                   self.target_system, self.target_component,
-                   want.encode("utf-8"), float(value), ptype)
-        m = self.wait_for(["PARAM_VALUE"],
-                          lambda m, w=want: self._param_id(m) == w, timeout)
-        if m is None:
-            raise FCError("set_param(%s) not echoed (tried type %d)" % (want, ptype))
-        return float(m.param_value)
+        q = self.subscribe(["PARAM_VALUE"])
+        try:
+            self._send(self.conn.mav.param_set_send,
+                       self.target_system, self.target_component,
+                       want.encode("utf-8"), float(value), ptype)
+            m = self._param_response(q, want, timeout)
+            return float(m.param_value)
+        finally:
+            self.unsubscribe(q)
 
     def set_mode(self, mode, timeout=5.0):
         """DO_SET_MODE with canonical encoding: param1=1 (custom enabled),

@@ -241,7 +241,7 @@ def apply_preset(mission, name, cfg=None):
     # must not break a preset switch).
     try:
         rig = getattr(mission, "rig", None)
-        if rig is not None and p.get("boost") and p["boost"] != "normal":
+        if rig is not None and p.get("boost"):
             cam = None
             for c in (rig.cams or {}).values():
                 if getattr(c, "facing", None) == "bottom":
