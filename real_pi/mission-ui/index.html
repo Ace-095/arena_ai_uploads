@@ -258,6 +258,27 @@
       <p class="hint">Kabaddi setting: QR is on ground, so ground is noise. ISP: contrast HIGH (1.8-2.0) → QR B/W contrast vs ground, saturation LOW (0.5-0.7) → green/brown grass desaturated to gray, QR B/W stays, sharpness HIGH (2.0) → finder patterns crisp at 10/15 m, brightness -10 → white ground not blown, exposure manual 5 ms → less motion blur. Software: CLAHE on L channel + unsharp mask + HSV green/brown mask desat 40% + V boost. See docs/arena_test1/00_DETECTION... for pixel budget.</p>
     </div>
 
+    <div class="card" id="cardQrPreset" style="border-left: 3px solid #22c55e;">
+      <h2>QR PRESET <span class="hint-inline">(environment · kills window-grill fakes)</span></h2>
+      <div class="kv"><span>purpose</span><b>One switch = detector conf + tile grid + decode cadence + cue strictness + ISP boost. A filter (conf ≥ 0.35, ≥ 15 px, square aspect 0.4-2.5) drops grill/fake boxes before they draw or steer.</b></div>
+      <div class="row wrap">
+        <label class="inline">preset
+          <select id="qrPreset">
+            <option value="day" selected>1. day — daylight 15 m search (default)</option>
+            <option value="far">2. far — max range, more recall</option>
+            <option value="dark">3. dark — night ground (dark_qr_boost), only decodes count</option>
+            <option value="kabaddi">4. kabaddi — ground level, only real QRs trigger</option>
+            <option value="low">5. low — indoor low light</option>
+            <option value="aggressive">6. aggressive — bright high-contrast day</option>
+            <option value="bench">7. bench — SITL/bench, full frame</option>
+          </select>
+        </label>
+        <button id="btnQrPresetApply" class="btn small" style="background:#22c55e;color:#111;">apply preset live</button>
+      </div>
+      <div class="kv"><span>active</span><b id="qrPresetInfo" style="font-size:11px; line-height:1.3;">loading from Pi…</b></div>
+      <p class="hint">Ground rule: use <b>dark</b> (night + --tiled) or <b>kabaddi</b> (ground level) — require-decode presets raise a flight cue ONLY from a box that decoded a real payload, so a window grill can never steer the drone. Flight 15 m search: <b>day</b> (bbox cues still steer at range). Same table as tools/test_yolo_webcam_qr.py and config.yaml qr_presets. REST: POST /api/qr/preset {"preset":"dark"}.</p>
+    </div>
+
     <div class="card" id="cardQr">
       <h2>QR / RESULT</h2>
       <div class="kv"><span>streak</span><b id="qrStreak">—</b></div>

@@ -162,12 +162,15 @@ mission pipeline, REST, and the webcam bench tool can never drift apart:
 | 6 | `aggressive` | bright high-contrast day |
 | 7 | `bench` | SITL/bench — full frame, fastest |
 
-Switch at runtime (no restart):
+Switch at runtime (no restart) — three surfaces, same table:
+* **UI**: the green **QR PRESET** card — pick a preset, hit "apply preset
+  live" (the dropdown always mirrors `config.yaml qr_presets`);
+* **REST**:
 ```bash
 curl -X POST http://<pi>:8000/api/qr/preset -d '{"preset":"dark"}'   # switch
 curl http://<pi>:8000/api/qr/presets                                  # list
 ```
-or live in the webcam bench tool: keys `p` / `1-7`, plus `f` (hide fakes),
+* **webcam bench tool**: keys `p` / `1-7`, plus `f` (hide fakes),
 `v` (toggle require-decode), `k/l` (conf ±0.05), `t` (tile on/off).
 
 **Ground rule (field report): use a require-decode preset for ground runs**

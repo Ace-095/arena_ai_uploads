@@ -556,6 +556,8 @@ def create_app(rig, mission, fc, streams=None, bringup=None, pulse_s=2.0,
         webcam bench tool uses, from config.yaml `qr_presets:`)."""
         try:
             from qr_filter import load_presets, preset_names
+            cfg = mission.cfg if mission is not None and isinstance(
+                getattr(mission, "cfg", None), dict) else {}
             return {"active": getattr(mission, "preset_name", "day"),
                     "names": preset_names(cfg),
                     "presets": load_presets(cfg),
@@ -588,6 +590,8 @@ def create_app(rig, mission, fc, streams=None, bringup=None, pulse_s=2.0,
             return JSONResponse({"detail": "preset switch failed: %r" % e}, 500)
         if applied is None:
             from qr_filter import preset_names as _pn
+            cfg = mission.cfg if mission is not None and isinstance(
+                getattr(mission, "cfg", None), dict) else {}
             return JSONResponse(
                 {"detail": "unknown preset %r (have %s)" % (name, _pn(cfg))}, 404)
         return {"ok": True, "preset": name, "applied": applied,

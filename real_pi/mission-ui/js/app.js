@@ -700,6 +700,64 @@ function boot() {
     const btnQrBoostFront = $('btnQrBoostFront');
     if (btnQrBoostFront) btnQrBoostFront.addEventListener('click', () => { if (qrBoostProfile) qrBoostProfile.value = 'front_qr_boost'; applyQrBoostProfile('front_qr_boost'); });
 
+    // ---- QR environment presets (fake-QR filter: window-grill fix) ----
+    // The dropdown is populated from the Pi (GET /api/qr/presets) so it
+    // always matches config.yaml qr_presets; the static <option>s above
+    // are the fallback before the first Pi link.
+    const qrPreset = $('qrPreset');
+    const qrPresetInfo = $('qrPresetInfo');
+
+    function refreshQrPresets() {
+      if (!S.piUrl || !qrPreset) return;
+      fetch(S.piUrl + '/api/qr/presets', { cache: 'no-store' }).then((r) => r.json()).then((d) => {
+        if (!d || !d.presets) return;
+        const names = (d.names && d.names.length) ? d.names : Object.keys(d.presets);
+        qrPreset.innerHTML = '';
+        names.forEach((n, i) => {
+          const p = d.presets[n] || {};
+          const o = document.createElement('option');
+          o.value = n;
+          o.textContent = (i + 1) + '. ' + n + ' — ' + (p.desc || '') +
+            ' (conf ' + p.conf_thr + ', tile ' + (p.tile_grid || [1, 1]).join('x') +
+            (p.require_decode_for_cue ? ', only-decodes' : '') + ')';
+          if (n === d.active) o.selected = true;
+          qrPreset.appendChild(o);
+        });
+        if (qrPresetInfo) {
+          const a = d.presets[d.active] || {};
+          const f = d.filter || {};
+          qrPresetInfo.textContent = 'active: ' + (d.active || '?') +
+            ' | conf ' + (a.conf_thr != null ? a.conf_thr : '?') +
+            ' tile ' + (a.tile_grid ? a.tile_grid.join('x') : '?') +
+            (a.require_decode_for_cue ? ' | REQUIRE-DECODE (only real QRs count)' : '') +
+            ' | boost ' + (a.boost || '?') +
+            ' | filter conf>=' + (f.min_conf != null ? f.min_conf : '?') +
+            ' side>=' + (f.min_side_px != null ? f.min_side_px : '?') + 'px' +
+            ' aspect ' + (f.aspect_min != null ? f.aspect_min + '-' + f.aspect_max : '?');
+        }
+      }).catch(() => {});
+    }
+    refreshQrPresets();
+    // light 10 s resync — picks up the Pi link appearing after page load
+    // and preset switches made from curl / the webcam tool
+    setInterval(refreshQrPresets, 10000);
+
+    const btnQrPresetApply = $('btnQrPresetApply');
+    if (btnQrPresetApply) btnQrPresetApply.addEventListener('click', () => {
+      const name = qrPreset ? qrPreset.value : 'day';
+      if (!S.piUrl) { if (qrPresetInfo) qrPresetInfo.textContent = 'no Pi link yet — set the Pi link first'; return; }
+      postJson(S.piUrl + '/api/qr/preset', { preset: name }).then((d) => {
+        const a = d.applied || {};
+        log('WARN', 'QR preset -> ' + name + ' (conf ' + a.conf_thr + ', tile ' +
+          (a.tile_grid || []).join('x') + ', require-decode ' + a.require_decode_for_cue +
+          ', boost ' + (a.boost || '?') + ') — applied live, no restart');
+        refreshQrPresets();
+      }).catch((e) => {
+        log('ERROR', 'QR preset switch failed: ' + e.message);
+        if (qrPresetInfo) qrPresetInfo.textContent = 'switch failed: ' + e.message;
+      });
+    });
+
     // ---- legacy fence tools (still supported) ----
     const btnDraw = $('btnDraw');
     if (btnDraw) btnDraw.addEventListener('click', () => {
