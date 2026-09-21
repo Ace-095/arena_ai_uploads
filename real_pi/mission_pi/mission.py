@@ -94,7 +94,7 @@ class Mission:
         tg = d.get("tile_grid", [3, 3])
         self.tile_rows, self.tile_cols = int(tg[0]), int(tg[1])
         self.full_decode_every = int(d.get("full_decode_every_n", 5))
-        self.cue_frames = int(d.get("cue_frames", 2))
+        self.cue_frames = max(1, int(d.get("cue_frames", 2)))
         # ---- real_pi fake-QR filter + environment presets ---------------
         # The window-grill fix: every detector box must pass conf/size/
         # aspect gates before it can drive a cue or an overlay (see
@@ -121,6 +121,8 @@ class Mission:
         self.payload = None
         self._cue = None          # (cam, x, y, w, h, ts)
         self._cue_hits = 0
+        self._cue_pending = {}    # cam -> (qualifying frame streak, last timestamp)
+        self._cue_epoch = 0       # discard detections in flight across preset/reset
         self._consensus = ConsensusBuffer(
             required_consecutive=int(cfg.get("decode", {}).get("required_streak", 3)),
             miss_tolerance=int(cfg.get("decode", {}).get("miss_tolerance", 1)))
@@ -221,6 +223,11 @@ class Mission:
         applied preset dict, or None for an unknown name."""
         p = apply_preset(self, name, cfg=self.cfg)
         if p is not None:
+            with self._lock:
+                self._cue = None
+                self._cue_hits = 0
+                self._cue_pending.clear()
+                self._cue_epoch += 1
             try:
                 self.hub.push("event", {"type": "qr_preset", "preset": name,
                                         "preset_cfg": p})
@@ -265,6 +272,7 @@ class Mission:
                 continue
             last_count = count
             n += 1
+            cue_epoch = self._cue_epoch
             try:
                 tiled = ((self.tile_bottom if cam.facing == "bottom" else self.tile_front)
                          and self.detector.name != "classical")
@@ -316,35 +324,46 @@ class Mission:
             # the drone. Default presets keep the fast bbox cue (survivors
             # are geometry-filtered, and the flight path still needs cues
             # at 15 m where the QR cannot decode yet).
-            if self.qf.require_decode_for_cue:
-                if boxes and payload_box is not None:
-                    self._on_cue(cam, payload_box)
-                elif not boxes:
-                    self._clear_stale_cue(cam)
+            if payload_box is not None:
+                self._on_cue(cam, payload_box, cue_epoch)
+            elif not self.qf.require_decode_for_cue and boxes and payload is None:
+                self._on_cue(cam, max(boxes, key=lambda b: b.conf), cue_epoch)
             else:
-                if boxes and payload is None:
-                    b = max(boxes, key=lambda b: b.conf)
-                    self._on_cue(cam, b)
-                elif not boxes:
-                    self._clear_stale_cue(cam)
+                # A miss includes a rejected box or an undecoded strict-mode
+                # box. It breaks this camera's pending confirmation streak.
+                self._clear_stale_cue(cam, cue_epoch)
 
-    def _clear_stale_cue(self, cam):
-        """Drop this camera's cue once it has been box-less for > 2 s."""
+    def _clear_stale_cue(self, cam, epoch=None):
+        """Break pending streak on a miss; tolerate a brief accepted-cue occlusion."""
         with self._lock:
-            if self._cue and self._cue[0] == cam.name and \
-                    time.time() - self._cue[5] > 2.0:
-                self._cue = None
+            if epoch is not None and epoch != self._cue_epoch:
+                return
+            self._cue_pending.pop(cam.name, None)
+            if self._cue and self._cue[0] == cam.name:
                 self._cue_hits = 0
+                if time.time() - self._cue[5] > 2.0:
+                    self._cue = None
 
-    def _on_cue(self, cam, box):
+    def _on_cue(self, cam, box, epoch=None):
+        # Gate STEERING, not just the log message. Cameras must not combine
+        # unrelated single hits to satisfy detector.cue_frames.
+        now = time.time()
         with self._lock:
-            self._cue = (cam.name, box.x, box.y, box.w, box.h, time.time())
-            self._cue_hits += 1
-            hits = self._cue_hits
+            if epoch is not None and epoch != self._cue_epoch:
+                return
+            hits, last = self._cue_pending.get(cam.name, (0, now))
+            hits = hits + 1 if now - last <= 2.0 else 1
+            self._cue_pending[cam.name] = (hits, now)
+            self._cue_hits = hits
+            if hits < self.cue_frames:
+                return
+            self._cue = (cam.name, float(box.x), float(box.y),
+                         float(box.w), float(box.h), now)
         if hits == self.cue_frames:
             self.stats["cues"] += 1
             self.hub.push("event", {"type": "qr_cue", "cam": cam.name,
-                                    "box": [box.x, box.y, box.w, box.h]})
+                                    "box": [float(box.x), float(box.y),
+                                            float(box.w), float(box.h)]})
             self._log("WARN", "QR cue on %s (%s)" % (cam.name, cam.facing))
 
     def _announce_qr(self, payload):
@@ -452,6 +471,8 @@ class Mission:
             self.payload = None
             self._cue = None
             self._cue_hits = 0
+            self._cue_pending.clear()
+            self._cue_epoch += 1
             self._advancing = False
             self._target_last = None
             self._workers = []
@@ -482,10 +503,9 @@ class Mission:
         with self._lock:
             if not self._cue or time.time() - self._cue[5] > max_age:
                 return None
-            if facing:
-                cam = self.rig.get(self._cue[0])
-                if not cam or cam.facing != facing:
-                    return None
+            cam = self.rig.get(self._cue[0])
+            if cam is None or (facing and cam.facing != facing):
+                return None
             return self._cue
 
     # -- guided helpers ---------------------------------------------------
@@ -1195,6 +1215,8 @@ class Mission:
                 return self._aborted()
             if not self._battery_ok():
                 return self._aborted()
+            if not self._guided_ok():
+                return self._mode_tripped()
             if self.payload:
                 return self._transmit_and_finish()
             cue = self._fresh_cue(max_age=2.5)
@@ -1256,6 +1278,7 @@ class Mission:
         return self._sweep_grid()
 
     def _transmit_and_finish(self):
+        rcfg = self.cfg.get("relay", {})
         # real_pi: by the time the approach finishes, the QR:<payload>
         # relay has usually ALREADY been running since confirm (stage 2) —
         # don't double-fire it. If relay.on_confirm is disabled in config,
@@ -1267,7 +1290,6 @@ class Mission:
         else:
             self._set_phase("TRANSMIT", "relaying %r" % (self.payload,))
             from qr_relay import relay_qr
-            rcfg = self.cfg.get("relay", {})
             try:
                 _p = self.fc.get_position(timeout=2.0)
                 _gps = (_p["lat"], _p["lon"], _p.get("alt_rel"))

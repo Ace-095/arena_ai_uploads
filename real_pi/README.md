@@ -18,6 +18,10 @@ QR→Mission Planner relay, the altitude/sweep settings — lives in
 
 ---
 
+## Detection → flight behavior
+
+See [what happens after a YOLO detection](docs/detection-to-flight-behavior.md): active-search interruption, per-camera cue confirmation, strict presets, front/bottom steering, polling delays, and 23 model-output-to-command regression tests.
+
 ## Latest verification: fence commands and QR resolution
 
 See [QR resolution, command fixes, measured tests and hardware limits](docs/qr-resolution-and-command-tests.md). This documents the verified fence upload/readback path, camera/UI fixes, synthetic classical-vs-YOLO results, and the required disarmed hardware checks. Software-bench results are not flight-safety or zero-latency guarantees.
