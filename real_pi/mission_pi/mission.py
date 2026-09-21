@@ -1260,7 +1260,12 @@ class Mission:
                 brg = geo.front_pixel_bearing_deg(x + w / 2.0, cam.size[0],
                                                   cam.hfov_deg, yaw)
                 try:
-                    self.fc.condition_yaw(brg, speed_deg_s=25.0, relative=False)
+                    # Absolute bearing alone does not select turn direction:
+                    # the old default forced clockwise even for a target left
+                    # of the nose. Use the shortest signed heading difference.
+                    turn = (brg - yaw + 180.0) % 360.0 - 180.0
+                    self.fc.condition_yaw(brg, speed_deg_s=25.0, relative=False,
+                                          direction=-1 if turn < 0 else 1)
                 except Exception:
                     pass
                 step_m = 3.0

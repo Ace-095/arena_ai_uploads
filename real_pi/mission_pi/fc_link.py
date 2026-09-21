@@ -41,7 +41,7 @@ COPTER_MODES = {"STABILIZE": 0, "ACRO": 1, "ALT_HOLD": 2, "AUTO": 3,
                 "AUTO_RTL": 27, "TURTLE": 28}
 
 DO_SPRAYER = 216
-MASK_POS_ONLY = 0b0000111111111000  # SET_POSITION_TARGET_*: position only
+MASK_POS_ONLY = 0x0DF8  # position only (3576); ignore velocity/accel/yaw, FORCE_SET clear
 
 
 def _require_pymavlink():
@@ -551,15 +551,37 @@ class FCLink:
 
     # -- ops ------------------------------------------------------------
     def _cmd_long(self, cmd, p1=0, p2=0, p3=0, p4=0, p5=0, p6=0, p7=0, ack_timeout=4.0):
-        self._send(self.conn.mav.command_long_send, self.target_system,
-                   self.target_component, cmd, 0, p1, p2, p3, p4, p5, p6, p7)
-        if ack_timeout:
-            ack = self.wait_for(["COMMAND_ACK"],
-                                lambda m: m.command == cmd, ack_timeout)
-            if ack is None:
-                raise FCError("no COMMAND_ACK for cmd %d" % cmd)
-            return int(ack.result)
-        return None
+        # Subscribe BEFORE send: a USB/loopback ACK may arrive before _send
+        # returns. Match the FC and recipient as well as command, so another
+        # vehicle/GCS's ACK cannot make our mode request appear successful.
+        q = self.subscribe(["COMMAND_ACK"]) if ack_timeout else None
+        try:
+            self._send(self.conn.mav.command_long_send, self.target_system,
+                       self.target_component, cmd, 0, p1, p2, p3, p4, p5, p6, p7)
+            if q is None:
+                return None  # deliberate fire-and-forget (e.g. tracking yaw)
+            deadline = time.monotonic() + ack_timeout
+            while time.monotonic() < deadline:
+                try:
+                    ack = q.get(timeout=max(.001, deadline-time.monotonic()))
+                except queue.Empty:
+                    break
+                if (ack.command != cmd or
+                        ack.get_srcSystem() != self.target_system or
+                        ack.get_srcComponent() != self.target_component):
+                    continue
+                if (getattr(ack, "target_system", 0) not in
+                        (0, getattr(self.conn, "source_system", 51)) or
+                        getattr(ack, "target_component", 0) not in
+                        (0, getattr(self.conn, "source_component", 191))):
+                    continue
+                if ack.result == mavutil.mavlink.MAV_RESULT_IN_PROGRESS:
+                    continue  # wait for a final result within the same deadline
+                return int(ack.result)
+            raise FCError("no final COMMAND_ACK for cmd %d" % cmd)
+        finally:
+            if q is not None:
+                self.unsubscribe(q)
 
     def request_message(self, msgid, ack_timeout=2.0):
         """Returns the COMMAND_ACK result, or None if unacked/failed."""

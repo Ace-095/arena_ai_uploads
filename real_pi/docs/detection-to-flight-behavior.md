@@ -108,6 +108,10 @@ Required packages include the production vision dependencies plus `qrcode` and
 `pillow` for the synthetic test image. The test does not need an FC or issue any
 network flight commands.
 
+## Additional wire-level verification
+
+The follow-up [movement wire tests](movement-wire-verification.md) exercise the real FCLink sender and receive actual MAVLink2 packets over UDP, rather than recording method calls. They also correct the front-camera yaw-direction flag and command-ACK race. Neither suite establishes physical vehicle displacement.
+
 ## Hardware verification still required
 
 Before trusting autonomous pursuit, verify camera role/orientation/FOV, heading,

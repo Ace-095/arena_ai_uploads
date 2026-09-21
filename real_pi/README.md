@@ -18,6 +18,10 @@ QR→Mission Planner relay, the altitude/sweep settings — lives in
 
 ---
 
+## Movement packets: wire-level verification
+
+See [real MAVLink movement-packet tests](docs/movement-wire-verification.md): forward/back/left/right at four headings, yaw direction, position mask and fast ACK handling. Real UDP transmission is verified; physical FC acceptance/movement is not.
+
 ## Detection → flight behavior
 
 See [what happens after a YOLO detection](docs/detection-to-flight-behavior.md): active-search interruption, per-camera cue confirmation, strict presets, front/bottom steering, polling delays, and 23 model-output-to-command regression tests.
