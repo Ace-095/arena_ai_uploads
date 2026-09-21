@@ -319,7 +319,11 @@ def bring_up_thread(cfg, args, fc, rig, det_box, streams, mission, hub, bu):
     # Old config only tried 5762, failed when MP not yet connected or SITL only on 5760
     # New: build list of candidates: configured device + fallbacks 5760,5762,14550
     candidates = []
-    if device:
+    # Physical-flight default: try USB serial auto-detection FIRST. Empty
+    # fc.conn must not jump straight to the SITL fallback addresses.
+    if device is None:
+        candidates.append(None)
+    else:
         candidates.append(device)
     # Add fallbacks if not already
     for fb in ("tcp:127.0.0.1:5762", "tcp:127.0.0.1:5760", "tcp:127.0.0.1:5760", "udp:127.0.0.1:14550"):
