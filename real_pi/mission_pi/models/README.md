@@ -4,7 +4,7 @@ Active files (referenced by `config.yaml` → `detector.hef_path` / `model_path`
 
 | file | what | size | where used |
 |---|---|---|---|
-| `qr_yolov8n.hef` | fine-tuned 1-class QR YOLOv8n for the Hailo HAT (from `training/`) | ~? MB | Pi5 + Hailo HAT, `kind: auto` / `hailo` |
+| `qr_yolov8n.hef` | fine-tuned 1-class QR YOLOv8n for the Hailo HAT (compiled from the `.onnx` above per `training/compile_hef.md`) | ~2-4 MB | Pi5 + Hailo HAT, `kind: auto` / `hailo` |
 | `qr_yolov8n.pt` | YOLOv8n QR trained on synthetic A3, 500 imgs, 50 epochs, CPU — works on laptop without Hailo | 24 MB | Laptop Pop!_OS + SITL+Gazebo, `kind: yolo` or `custom` + `detectors.yolo_ultralytics` |
 | `qr_yolov8n.onnx` | Same as .pt, exported ONNX opset 13, lighter, no torch needed | 12 MB | Laptop Pop!_OS, `kind: yolo` or `custom` + `detectors.yolo_onnx` (needs onnxruntime) |
 

@@ -85,6 +85,44 @@ def pick_best(samples):
     return best if best else (None, None)
 
 
+def focus_gate(af_algorithm, force=False):
+    """May this sweep produce a meaningful curve? -> (proceed, lines).
+
+    LensPosition is gated by the SAME `rpi.af` algorithm as autofocus —
+    field-proven on the UC-517 (2026-10-11): libcamera logged
+    "Could not set LENS_POSITION - no AF algorithm" for every position and
+    all 17 scored the same, which reads like a broken lens when it is really a
+    missing tuning file. Pure, so the decision is testable without hardware.
+    """
+    if af_algorithm is True or force:
+        return True, []
+    return False, [
+        "[focus] REFUSING to sweep: the tuning in use has no rpi.af AF "
+        "algorithm, so LensPosition cannot move the lens — every position "
+        "would score the same and the result would be meaningless.",
+        "        This is a TUNING problem, not necessarily a hardware one: "
+        "install Arducam's imx477_af.json (next to config.yaml, in models/, "
+        "or in /usr/share/libcamera/ipa/rpi/pisp/) and re-run.",
+        "        --force sweeps anyway; it will only prove the lens does not "
+        "move."]
+
+
+def curve_verdict(scores):
+    """(spread, relative, flat?) for a list of sharpness scores.
+
+    A flat curve means either a lens that cannot move or a scene with nothing
+    to focus on; a tiny absolute peak means the frame is nearly uniform (blank
+    wall / covered lens). Both must be said out loud.
+    """
+    vals = [s for s in scores if s is not None]
+    if not vals:
+        return 0.0, 0.0, True
+    spread = max(vals) - min(vals)
+    peak = max(vals)
+    rel = spread / peak if peak > 0 else 0.0
+    return spread, rel, bool(rel < 0.05 or peak < 3.0)
+
+
 def config_snippet(role, pos, score=None, model=""):
     """The exact lines to paste into config.yaml."""
     head = ("cameras.%s:" % role) if role else "cameras.<role>:"
@@ -117,14 +155,20 @@ def main():
     ap.add_argument("--positions", default="0:2:0.125",
                     help="start:stop:step (dioptres) or a comma list "
                          "(0 = infinity, 0.067 = 15 m). Default 0:2:0.125")
-    ap.add_argument("--config", default=os.path.join(os.pardir, "config.yaml"),
-                    help="config.yaml the camera settings come from")
+    ap.add_argument("--config",
+                    default=os.path.join(HERE, os.pardir, "config.yaml"),
+                    help="config.yaml the camera settings come from "
+                         "(default: mission_pi/config.yaml)")
     ap.add_argument("--settle", type=float, default=0.7,
                     help="seconds to wait after moving the lens (default 0.7)")
     ap.add_argument("--snap-dir", default="snaps",
                     help="where to write focus_<pos>.jpg and focus_best.jpg")
     ap.add_argument("--centre", type=float, default=0.5,
                     help="fraction of the frame scored, centred (default 0.5)")
+    ap.add_argument("--force", action="store_true",
+                    help="sweep even when the tuning has no rpi.af algorithm "
+                         "(the numbers will be flat — this proves the lens "
+                         "does not move)")
     args = ap.parse_args()
 
     try:
@@ -196,18 +240,33 @@ def main():
     except Exception as e:
         print("libcamera controls unavailable: %r" % e)
         return 2
+    # Does the tuning carry the AF algorithm? Without it, LensPosition is a
+    # NO-OP — libcamera logs "Could not set LENS_POSITION - no AF algorithm"
+    # and every position returns the same image, which looks like a lens that
+    # cannot focus instead of a tuning file that cannot focus it.
+    if isinstance(cam, PiCamera):
+        try:
+            cam._resolve_af_algorithm(tuning)
+        except Exception:
+            pass
+    proceed, why = focus_gate(getattr(cam, "af_algorithm", None), args.force)
+    if not proceed:
+        for ln in why:
+            print(ln)
+        picam.close()
+        return 3
     try:
         picam.set_controls({"AfMode": LC.AfModeEnum.Manual})
     except Exception as e:
-        print("this camera has NO focus control (AfMode rejected: %r)." % e)
-        print("The VCM/lens was not picked up: check the overlay "
-              "(`dtoverlay -h imx477` must list vcm) and the VCM i2c device.")
+        print("this camera rejected the manual-focus control (AfMode: %r)."
+              % e)
         return 3
 
     os.makedirs(args.snap_dir, exist_ok=True)
     print("[sweep] %d positions, settle %.2fs, scoring the central %.0f%%"
           % (len(positions), args.settle, args.centre * 100))
-    print("%-10s %-10s %s" % ("position", "distance", "sharpness"))
+    print("%-10s %-10s %-10s %s"
+          % ("position", "distance", "sharpness", "frame"))
     samples = []
     for pos in positions:
         try:
@@ -224,8 +283,10 @@ def main():
         frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         score = sharpness(frame, cv2, args.centre)
         samples.append((pos, score))
+        mean = float(frame.mean())
         cv2.imwrite(os.path.join(args.snap_dir, "focus_%g.jpg" % pos), frame)
-        print("%-10g %-10s %.1f" % (pos, describe_distance(pos), score))
+        print("%-10g %-10s %-10.1f brightness %.0f"
+              % (pos, describe_distance(pos), score, mean))
 
     best_pos, best_score = pick_best(samples)
     print("-" * 46)
@@ -233,8 +294,22 @@ def main():
         print("no usable frames — is something covering the lens?")
         picam.close()
         return 1
+    scores = [s for _, s in samples if s is not None]
+    spread, rel, flat = curve_verdict(scores)
     print("BEST: position %g (%s), sharpness %.1f"
           % (best_pos, describe_distance(best_pos), best_score))
+    if flat:
+        print("")
+        print("READ THIS BEFORE TRUSTING THOSE NUMBERS: the curve is FLAT "
+              "(spread %.1f%%, peak %.1f). That happens for one of two "
+              "reasons:" % (rel * 100, max(scores)))
+        print("  * the lens did not move at all — the tuning has no rpi.af "
+              "algorithm (libcamera warns 'Could not set LENS_POSITION - no AF "
+              "algorithm'), or there is no VCM on the module; or")
+        print("  * there was nothing to focus on — point the camera at the "
+              "printed QR panel / high-contrast target at 1-2 m first.")
+        print("Peak sharpness under ~3.0 means the frame is nearly uniform: a "
+              "blank wall or a covered lens scores exactly like this.")
     best_file = os.path.join(args.snap_dir, "focus_%g.jpg" % best_pos)
     if os.path.isfile(best_file):
         print("best frame: %s  (compare it by eye too)" % best_file)

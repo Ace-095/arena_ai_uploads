@@ -320,8 +320,14 @@ Details + the executed test matrix + the bench procedure:
   probes with the mission's real size/tuning/focus, `--defaults` ignores it)
 * `tools/focus_sweep.py` — sweep the VCM lens through positions (dioptres,
   printed as distances) and score sharpness, then print the exact
-  `autofocus: false` + `lens_position:` lines for `config.yaml`. Refuses with
-  a clear message when the camera has no focus control
+  `autofocus: false` + `lens_position:` lines for `config.yaml`. REFUSES to
+  sweep when the tuning has no `rpi.af` algorithm (LensPosition is a no-op
+  then — proven in the field), and flags a flat curve as "the lens did not
+  move / there is nothing to focus on" instead of reporting a winner
+* `tools/make_calib_set.py` — build the Hailo DFC calibration set from our
+  own frames (camera/video/dir), dropping dark, flat and near-duplicate
+  frames and letterboxing to 640×640 exactly like the runtime; prints the
+  `hailo optimize` command. See `training/compile_hef.md`
 * `tools/qr_bench.py` — detector+decoder over images, boxes/payload/ms
   (`--detector onnx|pt|yolo|hailo|classical|auto`; `onnx` runs the mission's
   own ONNX rung, so the ms you see is the ms the mission gets)

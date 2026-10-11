@@ -132,6 +132,23 @@ def build_detector(args, conf_thr, prefer, kind="yolo"):
         return ClassicalDetector()
 
 
+def frame_stats(frame):
+    """(mean, std) brightness/contrast of a BGR frame — pure, numpy only.
+
+    Added after the field run where raw=0 for 15 frames and nothing in the
+    output said whether the camera was looking at a wall, sitting in the dark,
+    or simply not in front of the QR. Numbers settle that in one line.
+    """
+    try:
+        import numpy as np
+        a = np.asarray(frame)
+        if a.ndim == 3:
+            a = a.mean(axis=2)
+        return float(a.mean()), float(a.std())
+    except Exception:
+        return -1.0, -1.0
+
+
 class CSISource:
     """The Pi's OWN CSI camera, behind the tiny cv2.VideoCapture interface.
 
@@ -367,6 +384,7 @@ def main():
     n_line_prev = 0
     t_line_prev = t_run_start
     hinted_empty = False
+    hinted_vision = False
     t_true_start = time.time()
     hint = ("[hint] no detector boxes at all after %d frames (%.0fs). Check, in "
             "this order: (1) a QR is actually IN VIEW and big enough (>= ~25px "
@@ -479,10 +497,25 @@ def main():
                 win_dt = max(1e-3, now - t_line_prev)
                 win_fps = (n_frames - n_line_prev) / win_dt
                 n_line_prev, t_line_prev = n_frames, now
-                print("[bench] frame=%d raw=%d filt=%d maxconf=%.2f payload=%r "
-                      "fps=%.1f (%.0f ms/frame)"
+                fmean, fstd = frame_stats(frame)
+                print("[bench] frame=%d raw=%d filt=%d maxconf=%.2f "
+                      "payload=%r frame_mean=%.0f frame_std=%.0f fps=%.1f "
+                      "(%.0f ms/frame)"
                       % (n_frames, n_raw, n_filt, maxconf, payload_any,
-                         win_fps, 1000.0 / max(1e-3, win_fps)))
+                         fmean, fstd, win_fps, 1000.0 / max(1e-3, win_fps)))
+                if fmean >= 0 and not hinted_vision:
+                    if fmean < 12:
+                        hinted_vision = True
+                        print("[hint] the frame is nearly BLACK (mean %.0f) — "
+                              "lens cap on, no light, or exposure/gain wrong. "
+                              "Nothing can be detected in a black frame."
+                              % fmean)
+                    elif fstd < 8:
+                        hinted_vision = True
+                        print("[hint] the frame has almost no CONTRAST "
+                              "(std %.0f) — it is a blank surface (wall, "
+                              "ceiling, out-of-focus distance). Point the "
+                              "camera at the printed QR panel." % fstd)
                 if (not hinted_empty and n_raw == 0 and n_frames >= 10
                         and (now - t_true_start) >= 10.0):
                     hinted_empty = True
