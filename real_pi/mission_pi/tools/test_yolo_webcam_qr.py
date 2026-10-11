@@ -98,6 +98,20 @@ def apply_preset_boost(cap, preset):
     return "[boost] %s -> %s" % (name, ", ".join(shown) or "no change reported")
 
 
+def _view(frame, max_w):
+    """A window-sized copy of the frame. The Pi's CSI frame is 2028x1520; pushing
+    that full size through the VNC window is what made the preview stutter."""
+    try:
+        h, w = frame.shape[:2]
+        if max_w and w > max_w:
+            import cv2
+            return cv2.resize(frame, (int(max_w), int(h * max_w / float(w))),
+                              interpolation=cv2.INTER_LINEAR)
+    except Exception:
+        pass
+    return frame
+
+
 def preset_index(key, n_presets):
     """Which preset does this keypress select? -> index or None.
 
@@ -397,18 +411,22 @@ class CSISource:
         return False                      # size/fps come from config.yaml
 
     def read(self):
-        """(ok, BGR frame) — waits up to ~2 s for the camera thread."""
+        """(ok, BGR frame) — a NEW frame, waiting up to ~2 s for one.
+
+        The camera thread keeps the latest frame. Returning it again when no
+        new one has arrived made the bench detect (and draw) the same picture
+        several times per camera frame — wasted CPU that showed up as lag."""
         deadline = time.time() + 2.0
+        last = getattr(self, "_last_n", -1)
         while time.time() < deadline:
             try:
-                # detect=True so the bench shows exactly what the DETECTOR
-                # gets (config.yaml qr_boost.detect_raw: raw vs CLAHE-boosted)
-                frame, _ts, _n = self.cam.latest(detect=True)
+                frame, _ts, n = self.cam.latest(detect=True)
             except Exception:
-                frame = None
-            if frame is not None:
+                frame, n = None, None
+            if frame is not None and n != last:
+                self._last_n = n
                 return True, frame
-            time.sleep(0.02)
+            time.sleep(0.01)
         return False, None
 
     def release(self):
@@ -465,6 +483,10 @@ def main():
     ap.add_argument("--show", action="store_true",
                     help="force the window even without DISPLAY "
                          "(default: window only when a display exists)")
+    ap.add_argument("--view-width", type=int, default=1024,
+                    help="window width in px (the frame is shrunk for the "
+                         "window only; detection always sees full resolution). "
+                         "0 = full size. Smaller = smoother over VNC.")
     ap.add_argument("--save-frames", default="",
                     help="dir to write annotated frames into (default off) — "
                          "the way to SEE a headless run; one JPEG/second")
@@ -590,6 +612,7 @@ def main():
     t_prev = time.time()
     fps = 0.0
     t_last_line = 0.0
+    last_focus = [-1.0]    # sharpness, refreshed once a second (see below)
     t_run_start = time.time()
     n_line_prev = 0
     t_line_prev = t_run_start
@@ -697,7 +720,7 @@ def main():
                 cv2.putText(frame, "qr %.2f" % b.conf, (x, max(12, y - 4)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1,
                             cv2.LINE_AA)
-        fsharp = focus_score(frame)
+        fsharp = last_focus[0]      # refreshed once a second, not per frame
         hud(frame, len(raw), len(kept), payload_any, fsharp)
 
         maxconf = max([b.conf for b in raw], default=0.0)
@@ -715,11 +738,15 @@ def main():
             win_fps = (n_frames - n_line_prev) / win_dt
             n_line_prev, t_line_prev = n_frames, now
             fmean, fstd = frame_stats(frame)
+            last_focus[0] = focus_score(frame)
+            fsharp = last_focus[0]
             st = getattr(det, "last_stats", None) or {}
             peak = st.get("max_score", -1.0)
-            extra = ("nms_max=%.2f filled=%d "
-                     % (peak, st.get("filled", 0))
-                     if isinstance(peak, (int, float)) and peak >= 0 else "")
+            using = getattr(det, "using", det.name)
+            extra = "det=%s " % using + (
+                "nms_max=%.2f filled=%d "
+                % (peak, st.get("filled", 0))
+                if isinstance(peak, (int, float)) and peak >= 0 else "nms=n/a ")
             print("[bench] frame=%d raw=%d filt=%d maxconf=%.2f %s"
                   "payload=%r frame_mean=%.0f frame_std=%.0f focus=%.0f "
                   "fps=%.1f (%.0f ms/frame)"
@@ -742,7 +769,7 @@ def main():
                     print("[bench] wrote %s" % path)
 
         if _show:
-            cv2.imshow("QR bench (f/v/k/l/t/p/1-8/q)", frame)
+            cv2.imshow("QR bench (f/v/k/l/t/p/1-8/q)", _view(frame, args.view_width))
             k = cv2.waitKey(1) & 0xFF
             if k in (ord("q"), 27):
                 break

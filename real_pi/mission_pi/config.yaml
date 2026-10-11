@@ -147,14 +147,15 @@ qr_boost:
   # Which frame the DETECTOR eats (the window always shows this same frame):
   #   false — the software-boosted one (CLAHE + unsharp + green suppress):
   #           contrast helps the EYE, but it amplifies night noise and the
-  #           model was trained on ordinary frames.
-  #   true  — the raw / gamma-corrected frame, exactly what the model saw in
-  #           training; CLAHE stays visible in the saved JPEGs via the boost.
+  #           model was trained on ordinary frames. Computed on demand, only
+  #           when a caller asks for the boosted frame.
+  #   true (DEFAULT) — the raw / gamma-corrected frame, exactly what the model
+  #           saw in training. No software boost cost on the detector path.
   # FIELD A/B (30 s, no code change): point the camera at the QR, run the
   # bench, note `nms_max=` in the stats line, flip this to true, run again and
   # compare. Higher nms_max + more boxes wins. Startup prints which one is live:
   #   [detector-input] RAW / gamma-corrected   (or: software-boosted)
-  detect_raw: false
+  detect_raw: true
 
 # ----------------------------------------------------------------------------
 # Pixhawk — AUTO-CONNECT over USB (cable straight into a Pi 5 USB port)

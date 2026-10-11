@@ -201,7 +201,8 @@ class _BaseCamera:
 
     #: QR boost defaults — makes QR pop more than ground
     QR_BOOST_DEFAULTS = {"qr_boost_enabled": False, "qr_boost_mode": "qr_boost_day",
-                         "qr_software_enhance": True, "qr_enhance_mode": "qr_boost"}
+                         "qr_software_enhance": True, "qr_enhance_mode": "qr_boost",
+                         "detect_raw": True}
 
     def __init__(self, name, index, size, hfov_deg, facing,
                  rotation_deg=0, jpeg_quality=80):
@@ -220,6 +221,7 @@ class _BaseCamera:
         self._lock = threading.Lock()
         self._frame = None
         self._frame_raw = None      # raw frame before software enhance
+        self._enh_cache = None      # (frame_count, boosted) — see _enhanced_for
         self._frame_ts = 0.0
         self._frames = 0
         self._overlay = []          # [(x,y,w,h,label), ...] drawn on stream
@@ -287,13 +289,7 @@ class _BaseCamera:
         return img
 
     def _loop(self):
-        # Optional QR boost software enhance — imported lazily so bench without cv2 still works
-        try:
-            from qr_camera_boost import enhance_qr_frame
-            _has_qr_boost = True
-        except Exception:
-            enhance_qr_frame = None
-            _has_qr_boost = False
+        # The software QR boost is computed on demand (see latest), not here.
 
         while not self._stop.is_set():
             try:
@@ -337,21 +333,13 @@ class _BaseCamera:
             except Exception:
                 pass
 
-            # Keep raw for debug, then optionally enhance for detection so QR pops vs ground
+            # Only the RAW frame is stored here. The software QR boost (CLAHE +
+            # unsharp: 100+ ms per 2028x1520 frame on a Pi 5) is computed on
+            # demand in latest(), so a consumer that does not want it (the
+            # detector with detect_raw, a bench with no window) costs nothing.
             raw = arr
-            enhanced = arr
-            try:
-                if _has_qr_boost and self.qr_boost.get("qr_software_enhance"):
-                    mode = self.qr_boost.get("qr_enhance_mode", "qr_boost")
-                    if mode and mode != "none":
-                        enhanced = enhance_qr_frame(arr, mode=mode)
-            except Exception as e:
-                log.debug("%s qr enhance failed: %r", self.name, e)
-                enhanced = arr
-
             with self._lock:
                 self._frame_raw = raw
-                self._frame = enhanced
                 self._frame_ts = time.time()
                 self._frames += 1
 
@@ -372,16 +360,35 @@ class _BaseCamera:
         consumers must not modify it in place.
         raw=True    -> the frame before the software QR boost (debug/stream).
         detect=True -> whichever frame the DETECTOR should see: config
-                       `qr_boost.detect_raw` decides between the raw
-                       (gamma-corrected) frame and the boosted one. The
-                       software boost is CLAHE + unsharp tuned for the EYE
-                       (and it amplifies night noise), so a model trained on
-                       ordinary frames can prefer the raw one — flip
-                       detect_raw in config.yaml and compare `nms_max=`."""
+                       `qr_boost.detect_raw` decides between the raw frame
+                       (what the HEF was calibrated and trained on — the
+                       default) and the boosted one.
+        The boost is computed once per frame, on the first caller that asks
+        for it, outside the lock — never on the capture thread."""
         with self._lock:
-            if raw or (detect and bool(self.qr_boost.get("detect_raw"))):
-                return self._frame_raw, self._frame_ts, self._frames
-            return self._frame, self._frame_ts, self._frames
+            raw_f, ts, n = self._frame_raw, self._frame_ts, self._frames
+        if raw or raw_f is None or (detect and self.qr_boost.get("detect_raw")):
+            return raw_f, ts, n
+        return self._enhanced_for(raw_f, n), ts, n
+
+    def _enhanced_for(self, raw_f, n):
+        with self._lock:
+            cache = self._enh_cache
+        if cache is not None and cache[0] == n:
+            return cache[1]
+        enh = raw_f
+        try:
+            if self.qr_boost.get("qr_software_enhance"):
+                mode = self.qr_boost.get("qr_enhance_mode", "qr_boost")
+                if mode and mode != "none":
+                    from qr_camera_boost import enhance_qr_frame
+                    enh = enhance_qr_frame(raw_f, mode=mode)
+        except Exception as e:
+            log.debug("%s qr enhance failed: %r", self.name, e)
+            enh = raw_f
+        with self._lock:
+            self._enh_cache = (n, enh)
+        return enh
 
     def set_overlay(self, boxes):
         """boxes: [(x,y,w,h,label), ...] drawn onto the streamed JPEG."""

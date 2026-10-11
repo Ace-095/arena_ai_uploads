@@ -274,9 +274,58 @@ def tensor_peek(a, style):
         if sc.size:
             out["max_score"] = float(sc.max())
             out["filled"] = int((sc > 0).sum())
+        else:
+            # a recognised tensor with no rows: "the model reports nothing"
+            out["max_score"] = 0.0
     except Exception:
         pass
     return out
+
+
+def _flatten_result(o, ci=0, depth=0):
+    """Any nesting HailoRT may return -> [(ndarray, class_index)], in order.
+
+    The NMS result comes back as batch/class lists. The 2026-10-13 run produced
+    zero boxes for 1,378 frames with the decoder silent: this module called
+    np.asarray() on the WHOLE nested list, and a list of per-class arrays with
+    different detection counts (ragged) cannot be made into one array at all.
+    Now every array is taken on its own, at whatever depth it sits, and an
+    EMPTY array is kept — "zero detections" is an answer, not a parse error.
+    """
+    if depth > 6:
+        return []
+    if isinstance(o, (list, tuple)):
+        out = []
+        for i, e in enumerate(o):
+            out += _flatten_result(e, i, depth + 1)
+        return out
+    try:
+        arr = np.asarray(o)
+    except Exception:
+        return []
+    if arr.dtype == object or arr.ndim == 0:
+        return []
+    return [(arr, ci)]
+
+
+def describe_result(o, depth=0):
+    """A short structural description for the log, e.g.
+    'list[1]<list[1]<ndarray(0, 5) float32' — enough to fix a parser from one
+    line of field log."""
+    if depth > 5:
+        return "..."
+    if isinstance(o, (list, tuple)):
+        kind = "list" if isinstance(o, list) else "tuple"
+        if not o:
+            return "%s[0]" % kind
+        more = "" if len(o) == 1 else ", ..."
+        return "%s[%d]<%s%s" % (kind, len(o), describe_result(o[0], depth + 1),
+                                more)
+    if isinstance(o, dict):
+        return "dict{%s}" % ",".join(str(k) for k in list(o)[:4])
+    if hasattr(o, "shape"):
+        return "ndarray%s %s" % (tuple(o.shape), getattr(o, "dtype", ""))
+    return type(o).__name__
 
 
 def decode_hailo_outputs(outs, input_size=640, conf_thr=0.35, nms_fn=None,
@@ -312,15 +361,7 @@ def decode_hailo_outputs(outs, input_size=640, conf_thr=0.35, nms_fn=None,
         arg["order"] = str(xy_order).lower()
     flat = []
     for o in outs or []:
-        if isinstance(o, (list, tuple)):
-            for ci, e in enumerate(o):
-                arr = np.asarray(e)
-                if arr.size:
-                    flat.append((arr, ci))
-        else:
-            arr = np.asarray(o)
-            if arr.size:
-                flat.append((arr, 0))
+        flat += _flatten_result(o)
 
     def _finish(style, boxes):
         if note:

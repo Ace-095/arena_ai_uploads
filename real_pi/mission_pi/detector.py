@@ -162,6 +162,16 @@ def _host_nms(boxes, iou_thr=0.5):
     return keep
 
 
+try:
+    from .hailo_decode import describe_result as _describe_result
+except Exception:
+    try:
+        from hailo_decode import describe_result as _describe_result
+    except Exception:
+        def _describe_result(o):
+            return type(o).__name__
+
+
 class HailoYolo8Detector(Detector):
     """YOLOv8n (1 class: qr) on the Hailo AI HAT.
 
@@ -198,6 +208,11 @@ class HailoYolo8Detector(Detector):
         self._out_style = None
         self._fails = 0        # consecutive infer failures (see detect)
         self.last_stats = {}   # what the HEF's tensor held (see _parse)
+        self._seen_struct = False      # log the runtime result shape once
+        #: Called (no args) when the HAT gives up; returns a CPU detector.
+        self.fallback_factory = None
+        self._fallback = None
+        self._fallback_tried = False
         self._stack = contextlib.ExitStack()
         try:
             hef = HEF(hef_path)
@@ -259,7 +274,7 @@ class HailoYolo8Detector(Detector):
 
     def detect(self, frame_bgr):
         if self._fails >= self.DEGRADE_AFTER:
-            return []
+            return self._fallback_detect(frame_bgr)
         try:
             with self._lock:
                 boxes = self._detect_locked(frame_bgr)
@@ -270,14 +285,42 @@ class HailoYolo8Detector(Detector):
             self._report_failure(e)
             return []
 
+    def _fallback_detect(self, frame_bgr):
+        """The HAT gave up; the CPU ladder takes over instead of going blind.
+
+        Field rule: no silent blindness. The same model runs on the CPU (ONNX /
+        .pt) — slow, but the operator sees boxes, and the switch is logged once.
+        """
+        if (self._fallback is None and not self._fallback_tried
+                and self.fallback_factory is not None):
+            self._fallback_tried = True
+            try:
+                self._fallback = self.fallback_factory()
+                log.warning("hailo: giving up on the HAT for this run — CPU "
+                            "fallback %s takes over (slow; restart to retry "
+                            "the HAT)", getattr(self._fallback, "name", "?"))
+            except Exception as e:
+                log.warning("hailo: giving up and no CPU fallback available "
+                            "(%r) — NO detections until restart", e)
+        if self._fallback is None:
+            return []
+        return self._fallback.detect(frame_bgr)
+
+    @property
+    def using(self):
+        """Which engine answered the last frame: 'hailo' or 'fallback:<name>'."""
+        if self._fails >= self.DEGRADE_AFTER and self._fallback is not None:
+            return "fallback:%s" % getattr(self._fallback, "name", "?")
+        return "hailo"
+
     def _report_failure(self, e):
         """Say what broke, in the log, at most a few times."""
         n = self._fails
         if n <= 3 or n in (10, self.DEGRADE_AFTER):
             log.warning("hailo infer failed %d time(s): %r%s", n, e,
                         "" if n < self.DEGRADE_AFTER else
-                        " — giving up on the HAT for this run; boxes will be "
-                        "missing (restart to retry). If the message mentions "
+                        " — giving up on the HAT for this run; the CPU "
+                        "fallback takes over (restart to retry the HAT). If the message mentions "
                         "HAILO_NETWORK_GROUP_NOT_ACTIVATED the network group "
                         "was not activated; if it mentions vstream, the HEF's "
                         "input name/shape does not match what we feed it.")
@@ -295,6 +338,11 @@ class HailoYolo8Detector(Detector):
 
     def _parse(self, outs, scale, px, py, iw, ih):
         """All HEF layouts -> frame boxes; logs the layout once per change."""
+        if not self._seen_struct:
+            # One line, once: what the HAT actually handed back. If a layout is
+            # ever not recognised, this is the line that tells us why.
+            self._seen_struct = True
+            log.info("hailo runtime result: %s", _describe_result(outs))
         style = []
 
         def _note(s):
@@ -316,10 +364,10 @@ class HailoYolo8Detector(Detector):
             if chosen:
                 log.info("hailo output layout: %s", chosen)
             else:
-                log.warning("hailo: unrecognized output shapes %s — no boxes "
-                            "can come from this HEF until the parser learns "
-                            "them (see tools/hef_info.py)",
-                            [list(getattr(o, "shape", []) or []) for o in outs])
+                log.warning("hailo: runtime output NOT recognised: %s — no "
+                            "boxes until the parser learns this layout (paste "
+                            "this line; see tools/hef_info.py)",
+                            _describe_result(outs))
         if not boxes and chosen:
             # The layout is fine; report the tensor's own best score so the
             # operator knows whether to lower conf_thr or to look at the lens.
@@ -491,6 +539,7 @@ def get_detector(cfg):
                                        cfg.get("conf_thr", 0.35),
                                        cfg.get("iou_thr", 0.5),
                                        cfg.get("nms_order", "yxyx"))
+                d.fallback_factory = lambda: _try_yolo_laptop(cfg)
                 log.info("detector auto: HAILO %s", d.name)
                 return d
             except Exception as e:
@@ -511,10 +560,12 @@ def get_detector(cfg):
         if not hef:
             raise RuntimeError("HEF not found: %r (put it in models/ — see "
                                "training/compile_hef.md)" % cfg.get("hef_path"))
-        return HailoYolo8Detector(hef, cfg.get("input_size", 640),
-                                  cfg.get("conf_thr", 0.35),
-                                  cfg.get("iou_thr", 0.5),
-                                  cfg.get("nms_order", "yxyx"))
+        d = HailoYolo8Detector(hef, cfg.get("input_size", 640),
+                               cfg.get("conf_thr", 0.35),
+                               cfg.get("iou_thr", 0.5),
+                               cfg.get("nms_order", "yxyx"))
+        d.fallback_factory = lambda: _try_yolo_laptop(cfg)
+        return d
     if kind in YOLO_KINDS:
         # An explicit format name pins the order, so `--detector onnx` on a
         # machine that also has a .pt cannot silently load torch instead —

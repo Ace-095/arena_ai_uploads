@@ -216,37 +216,42 @@ def test_camera_rescues_itself_and_comes_back(stub_libcamera=True):
 
 
 def test_detector_input_is_configurable():
-    """`qr_boost.detect_raw` picks which frame the DETECTOR gets — the boosted
-    (CLAHE, tuned for the eye and noisy at night) or the raw/gamma frame the
-    model was trained on. The stream and the bench follow the same switch."""
-    class FakeCam(object):
-        pass
+    """`qr_boost.detect_raw` picks which frame the DETECTOR gets — the raw/gamma
+    frame the model was trained on (the default) or the software-boosted one
+    (CLAHE, tuned for the eye). The boost is computed lazily on demand, so it
+    only runs when a caller actually asks for the boosted frame."""
+    import threading
+    real = QB.enhance_qr_frame
+    QB.enhance_qr_frame = lambda f, mode=None: "CLAHE(%s)" % f
 
     class Probe(C.Camera):
         def __init__(self, detect_raw):
-            FakeCam.__init__(self)
             self.name = "cam2"
-            self.qr_boost = {"detect_raw": detect_raw}
+            self.qr_boost = {"detect_raw": detect_raw,
+                             "qr_software_enhance": True,
+                             "qr_enhance_mode": "qr_boost"}
+            self._lock = threading.Lock()
             self._frame_raw = "RAW"
-            self._frame = "CLAHE"
             self._frame_ts = 1.0
             self._frames = 7
-            import threading
-            self._lock = threading.Lock()
+            self._enh_cache = None
 
-    boosted = Probe(False)
-    raw = Probe(True)
-    check("default keeps the boosted frame (status quo, A/B first)",
-          boosted.latest(detect=True)[0] == "CLAHE")
-    check("detect_raw: true hands the detector the raw frame",
-          raw.latest(detect=True)[0] == "RAW")
-    check("raw=True still means raw, whatever detect_raw says",
-          raw.latest(raw=True)[0] == "RAW"
-          and boosted.latest(raw=True)[0] == "RAW")
-    check("plain latest() (streaming) is untouched by the switch",
-          boosted.latest()[0] == "CLAHE" and raw.latest()[0] == "CLAHE")
-    check("ts + frame count ride along",
-          boosted.latest(detect=True)[1:] == (1.0, 7))
+    try:
+        boosted = Probe(False)
+        raw = Probe(True)
+        check("detect_raw false hands the detector the boosted frame",
+              boosted.latest(detect=True)[0] == "CLAHE(RAW)")
+        check("detect_raw true hands the detector the raw frame",
+              raw.latest(detect=True)[0] == "RAW")
+        check("raw=True still means raw, whatever detect_raw says",
+              raw.latest(raw=True)[0] == "RAW"
+              and boosted.latest(raw=True)[0] == "RAW")
+        check("plain latest() (streaming) is the boosted frame",
+              boosted.latest()[0] == "CLAHE(RAW)" and raw.latest()[0] == "CLAHE(RAW)")
+        check("ts + frame count ride along",
+              boosted.latest(detect=True)[1:] == (1.0, 7))
+    finally:
+        QB.enhance_qr_frame = real
 
 
 if __name__ == "__main__":

@@ -284,7 +284,7 @@ def bring_up_thread(cfg, args, fc, rig, det_box, streams, mission, hub, bu):
                         # raw/gamma frame the model was trained on.
                         cam.qr_boost["detect_raw"] = bool(
                             per_cam_qr.get("detect_raw",
-                                           qr_boost_cfg.get("detect_raw", False)))
+                                           qr_boost_cfg.get("detect_raw", True)))
                         log.info("%s detector input: %s", cam_name,
                                  "RAW (no CLAHE)" if cam.qr_boost["detect_raw"]
                                  else "software-boosted frame")
