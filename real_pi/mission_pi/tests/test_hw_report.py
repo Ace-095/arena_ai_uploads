@@ -176,8 +176,45 @@ def test_report_prints_the_two_files_that_decide_success():
     check("its state is stated, not implied",
           ("OK" in out or "MISSING" in out), out)
     hef = os.path.join(PI, "models", "qr_yolov8n.hef")
+    hef_line = [ln for ln in out.splitlines() if "qr_yolov8n.hef" in ln]
     check("the reported state matches the filesystem",
-          ("OK" in out) == os.path.isfile(hef), out)
+          len(hef_line) == 1 and
+          (("OK" in hef_line[0]) == os.path.isfile(hef)), out)
+
+
+def test_file_checks_report_the_af_algorithm_not_just_the_filename():
+    """The decisive autofocus question is whether the tuning libcamera will
+    load carries `rpi.af` — the camera advertises AfMode/LensPosition either
+    way, so a filename check alone let a dead autofocus look healthy."""
+    import json
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        pisp = os.path.join(td, "pisp")
+        vc4 = os.path.join(td, "vc4")
+        os.makedirs(pisp)
+        os.makedirs(vc4)
+        with open("/tmp/imx477.json", "w") as f:   # stock: no rpi.af
+            json.dump({"algorithms": [{"rpi.black_level": {}},
+                                      {"rpi.agc": {}}]}, f)
+        with open(os.path.join(pisp, "imx477.json"), "w") as f:
+            json.dump({"algorithms": [{"rpi.black_level": {}},
+                                      {"rpi.af": {"lens": {}}}]}, f)
+        os.unlink("/tmp/imx477.json")
+        real = list_cams.IPA_TUNING_DIRS
+        list_cams.IPA_TUNING_DIRS = (pisp, vc4)
+        try:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                list_cams.print_file_checks()
+            out = buf.getvalue()
+        finally:
+            list_cams.IPA_TUNING_DIRS = real
+        check("an installed AF tuning is reported as autofocus AVAILABLE",
+              "imx477.json contains rpi.af" in out, out)
+        check("the missing vendor json is still called out",
+              "MISSING" in out, out)
+        check("an absent sensor tuning is simply not mentioned",
+              "vc4/imx477.json" not in out, out)
 
 
 def _vcm_dtbo(tmpdir, with_vcm=True):
@@ -377,6 +414,7 @@ if __name__ == "__main__":
     test_verdict_uses_dtoverlay_h_when_available()
     test_verdict_detects_the_stock_overlay_without_vcm()
     test_verdict_when_dtoverlay_h_and_the_file_disagree()
+    test_file_checks_report_the_af_algorithm_not_just_the_filename()
     test_verdict_handles_missing_dtbo_and_other_cameras()
     test_vcm_scan_is_honest_about_unreadable_files()
     test_boot_report_returns_a_dict_without_a_pi()

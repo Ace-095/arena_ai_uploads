@@ -59,30 +59,41 @@ def main():
         files += sorted(glob.glob(os.path.join(p, "*"))) if os.path.isdir(p) else [p]
     files = [f for f in files if f.lower().endswith((".jpg", ".jpeg", ".png"))]
     tot_ms, n = 0.0, 0
-    for f in files:
-        img = cv2.imread(f)
-        if img is None:
-            continue
-        t0 = time.time()
-        boxes = detect_tiles(det, img) if args.tiles else det.detect(img)
-        payload = None
-        for b in boxes[:3]:
-            payload = decode_frame(img, (b.x, b.y, b.w, b.h))
-            if payload:
-                break
-        if payload is None:
-            payload = decode_frame(img)
-        ms = (time.time() - t0) * 1000
-        tot_ms += ms
-        n += 1
-        print("%s: %d box(es) %s payload=%r (%.0f ms)" % (
-            os.path.basename(f), len(boxes),
-            [(b.x, b.y, b.w, b.h) for b in boxes[:3]], payload, ms))
-    if n:
-        print("avg %.1f ms/frame over %d frames (%s)" % (tot_ms / n, n, det.name))
-    else:
+    if not files:
         print("no readable images in %s" % (args.paths,))
         return 2
+    try:
+        for f in files:
+            img = cv2.imread(f)
+            if img is None:
+                continue
+            t0 = time.time()
+            boxes = detect_tiles(det, img) if args.tiles else det.detect(img)
+            payload = None
+            for b in boxes[:3]:
+                payload = decode_frame(img, (b.x, b.y, b.w, b.h))
+                if payload:
+                    break
+            if payload is None:
+                payload = decode_frame(img)
+            ms = (time.time() - t0) * 1000
+            tot_ms += ms
+            n += 1
+            print("%s: %d box(es) %s payload=%r (%.0f ms)" % (
+                os.path.basename(f), len(boxes),
+                [(b.x, b.y, b.w, b.h) for b in boxes[:3]], payload, ms))
+    except KeyboardInterrupt:
+        # Ctrl-C mid-decode is normal on a Pi (zbar + 9 tiles is slow): report
+        # what was measured instead of a stack trace through pyzbar.
+        print("[bench] interrupted after %d frame(s)" % n)
+    if not n:
+        print("no readable images in %s" % (args.paths,))
+        return 2
+    print("avg %.1f ms/frame over %d frames (%s)" % (tot_ms / n, n, det.name))
+    if args.tiles:
+        print("[bench] tiled: that is 9 inferences per frame — --no-tile is "
+              "~9x cheaper; the Hailo .hef is the real fix at 15 m")
+    return 0
 
 
 if __name__ == "__main__":

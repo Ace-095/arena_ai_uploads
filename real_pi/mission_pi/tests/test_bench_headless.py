@@ -172,11 +172,90 @@ def test_status_reports_real_focus_capability():
           st2.get("focus_ok") is False and st2.get("focus_controls") == [],
           st2.get("focus_controls"))
     c.focus_controls = ["AfMode", "LensPosition"]
-    check("a driven lens -> focus_ok True",
+    check("a driven lens with no known tuning stays unknown",
+          c.status().get("focus_ok") is None)
+    c.af_algorithm = True
+    check("a driven lens + an AF algorithm -> focus_ok True",
           c.status().get("focus_ok") is True)
     u = C.USBCamera("cam1", "/dev/video0", (640, 480), 66.0, "front")
     check("the CSI override does not leak into other camera kinds",
           "focus_controls" not in u.status(), sorted(u.status()))
+
+
+def test_af_algorithm_decides_autofocus_not_the_control_list():
+    """The field trap of 2026-10-11: `camera_controls` listed AfMode,
+    LensPosition + 6 more, and autofocus still could not work, because the
+    stock imx477 tuning has NO rpi.af algorithm (verified against
+    raspberrypi/libcamera: imx477.json has no rpi.af, imx708.json does).
+    Reading the control list alone claims success; this must not."""
+    import json
+    import tempfile
+
+    # the tuning-file shape: a LIST of single-key dicts (collapsing it to the
+    # first entry makes every sensor look like rpi.black_level only)
+    stock = {"algorithms": [{"rpi.black_level": {}}, {"rpi.agc": {}},
+                            {"rpi.sharpen": {}}]}
+    with_af = {"algorithms": [{"rpi.black_level": {}}, {"rpi.agc": {}},
+                              {"rpi.af": {"lens": {"i2c": "0x0c"}}}]}
+    check("all algorithms are listed, not just the first",
+          C.tuning_algorithms(stock) == ["rpi.black_level", "rpi.agc",
+                                        "rpi.sharpen"],
+          C.tuning_algorithms(stock))
+    check("a stock imx477-style tuning has NO autofocus algorithm",
+          C.tuning_has_af(stock) is False)
+    check("an Arducam-style tuning with rpi.af does",
+          C.tuning_has_af(with_af) is True)
+    check("a tuning with no algorithms at all is not a crash",
+          C.tuning_has_af({}) is False and C.tuning_has_af(None) is False)
+
+    with tempfile.TemporaryDirectory() as td:
+        pisp = os.path.join(td, "pisp")
+        os.makedirs(pisp)
+        with open(os.path.join(pisp, "imx477.json"), "w") as f:
+            json.dump(stock, f)
+        real_dirs = C.IPA_TUNING_DIRS
+        C.IPA_TUNING_DIRS = (pisp,)
+        try:
+            check("the default tuning for a sensor is found by name",
+                  C.default_tuning_path("imx477") ==
+                  os.path.join(pisp, "imx477.json"))
+            check("an unknown sensor has no default tuning",
+                  C.default_tuning_path("imx999") is None)
+
+            c = C.Camera("cam2", 0, (2028, 1520), 75.0, "bottom",
+                         autofocus=True, tuning_file="imx477_af.json")
+            # exactly what the Pi reported, and exactly what it does NOT prove
+            c.focus_controls = ["AfSpeed", "AfMode", "AfRange", "LensPosition",
+                                "AfTrigger", "AfWindows", "AfMetering",
+                                "AfPause"]
+            c.model = "imx477"   # what the rig / camera_properties reports
+            c._resolve_af_algorithm(None)       # no json installed -> default
+            check("the stock default tuning is inspected, not assumed",
+                  c.af_algorithm is False, c.af_algorithm)
+            check("autofocus is reported IMPOSSIBLE while the control list "
+                  "says otherwise", c.focus_possible() is False)
+            st = c.status()
+            check("status.focus_ok is False in the field state "
+                  "(af_mode:auto would have hidden this)",
+                  st.get("focus_ok") is False and st.get("af_algorithm") is False,
+                  {k: st.get(k) for k in ("focus_ok", "af_algorithm",
+                                          "focus_controls")})
+
+            c._resolve_af_algorithm(with_af)    # Arducam's json dropped in
+            check("with an AF tuning loaded, autofocus becomes possible",
+                  c.focus_possible() is True and c.af_algorithm is True)
+
+            # a sensor whose IPA cannot be read stays UNKNOWN, not a claim
+            c2 = C.Camera("cam2", 0, (2028, 1520), 75.0, "bottom",
+                          autofocus=True)
+            c2.focus_controls = ["AfMode", "LensPosition"]
+            c2._resolve_af_algorithm(None)
+            c2.model = "imx999"
+            c2._resolve_af_algorithm(None)
+            check("an unreadable tuning reports unknown, never a false OK",
+                  c2.focus_possible() is None, c2.status().get("focus_ok"))
+        finally:
+            C.IPA_TUNING_DIRS = real_dirs
 
 
 def test_tuning_lookup_dedupes_and_looks_in_models():
@@ -237,6 +316,7 @@ if __name__ == "__main__":
     test_no_camera_keeps_the_physical_hint()
     test_two_cameras_fill_both_roles()
     test_status_reports_real_focus_capability()
+    test_af_algorithm_decides_autofocus_not_the_control_list()
     test_tuning_lookup_dedupes_and_looks_in_models()
     print("-" * 60)
     if FAILS:

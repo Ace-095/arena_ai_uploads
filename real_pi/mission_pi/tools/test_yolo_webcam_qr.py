@@ -363,6 +363,17 @@ def main():
     t_prev = time.time()
     fps = 0.0
     t_last_line = 0.0
+    t_run_start = time.time()
+    n_line_prev = 0
+    t_line_prev = t_run_start
+    hinted_empty = False
+    t_true_start = time.time()
+    hint = ("[hint] no detector boxes at all after %d frames (%.0fs). Check, in "
+            "this order: (1) a QR is actually IN VIEW and big enough (>= ~25px "
+            "in the frame); (2) look at the saved JPEG (--save-frames) — the "
+            "camera may be pointed at a wall or dark; (3) rerun with "
+            "--conf 0.10 and read maxconf= in the line above; (4) --no-tile is "
+            "~9x faster (one inference) at the cost of small-QR reach at 15 m")
 
     def hud(frame, raw_n, filt_n, payload_any):
         lines = [
@@ -387,7 +398,8 @@ def main():
             cv2.putText(frame, "QR CONFIRMED: %s" % payload_any, (8, y + 6),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 1, cv2.LINE_AA)
 
-    while True:
+    try:
+      while True:
         ok, frame = cap.read()
         if not ok:
             if is_file:
@@ -458,11 +470,23 @@ def main():
                             cv2.LINE_AA)
         hud(frame, len(raw), len(kept), payload_any)
 
+        maxconf = max([b.conf for b in raw], default=0.0)
         if not _show:
             if now - t_last_line >= 1.0:
                 t_last_line = now
-                print("[bench] frame=%d raw=%d filt=%d payload=%r fps=%.1f"
-                      % (n_frames, n_raw, n_filt, payload_any, fps))
+                # windowed fps: a cumulative average keeps DROPPING on screen
+                # and looks like the tool is dying instead of steady at 1 fps
+                win_dt = max(1e-3, now - t_line_prev)
+                win_fps = (n_frames - n_line_prev) / win_dt
+                n_line_prev, t_line_prev = n_frames, now
+                print("[bench] frame=%d raw=%d filt=%d maxconf=%.2f payload=%r "
+                      "fps=%.1f (%.0f ms/frame)"
+                      % (n_frames, n_raw, n_filt, maxconf, payload_any,
+                         win_fps, 1000.0 / max(1e-3, win_fps)))
+                if (not hinted_empty and n_raw == 0 and n_frames >= 10
+                        and (now - t_true_start) >= 10.0):
+                    hinted_empty = True
+                    print(hint % (n_frames, now - t_true_start))
                 if args.save_frames:
                     path = os.path.join(args.save_frames, "bench_%05d.jpg"
                                         % n_frames)
@@ -519,6 +543,15 @@ def main():
         if args.max_frames and n_frames >= args.max_frames:
             print("[bench] max-frames reached (%d)" % n_frames)
             break
+    except KeyboardInterrupt:
+        # Ctrl-C on a slow CPU run should print a summary, not 15 lines of
+        # traceback through onnxruntime/pyzbar.
+        print("[bench] interrupted at frame %d" % n_frames)
+        if not det.name == "classical" and tiled and n_frames >= 3:
+            print("[bench] if that felt stuck: tiled inference is 9 passes per "
+                  "frame — ONNX on the Pi 5 CPU measures ~1 fps at 2028x1520. "
+                  "Use --no-tile for a fast full-frame pass, or run the Hailo "
+                  ".hef for 15 m real-time (training/compile_hef.md)")
 
     cap.release()
     if _show:

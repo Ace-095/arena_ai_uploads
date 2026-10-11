@@ -173,23 +173,53 @@ the role:
     tuning_file: imx477_af.json
 ```
 
-**Is the focus motor actually driven?** Ask libcamera — this is the ground
-truth, and it settles any doubt about which overlay is installed:
+**Can this camera autofocus at all?** Not a question about the control list —
+measured on the UC-517 (2026-10-11), `camera_controls` listed **eight** AF
+controls (`AfMode`, `AfTrigger`, `AfPause`, `AfSpeed`, `AfRange`, `AfWindows`,
+`AfMetering`, `LensPosition`) and autofocus still could not work, because
+libcamera logged
+
+```
+WARN IPARPI ipa_base.cpp:812 Could not set AF_MODE - no AF algorithm
+```
+
+The ADVERTISEMENT of those controls comes from the pipeline/IPA regardless of
+whether an AF algorithm was built, so the control list proves nothing. What
+decides it is the **tuning file libcamera loads**:
 
 ```bash
+# does the tuning that WILL be used carry the autofocus algorithm?
 python3 - <<'PY'
-from picamera2 import Picamera2
-p = Picamera2(0)
-print({k: v for k, v in p.camera_controls.items()
-       if any(s in k.lower() for s in ("af", "lens", "focus"))})
+import json, glob
+for p in sorted(glob.glob("/usr/share/libcamera/ipa/rpi/*/*.json")):
+    d = json.load(open(p))
+    algos = [list(a)[0] for a in (d.get("algorithms") or []) if a]
+    print("%-60s rpi.af: %s" % (p, any(a.endswith(".af") for a in algos)))
 PY
 ```
 
-* `{'AfMode': …, 'LensPosition': …}` → the VCM **is** wired: the overlay in
-  use is Arducam's, and both autofocus and manual focus are possible.
-* `{}` → no lens subdev: the kernel is driving the sensor only (stock
-  overlay, or a module without a motor). The camera still streams and QR
-  detection works; focus is whatever the lens is screwed to.
+Verified against `raspberrypi/libcamera`: the stock **`imx477.json` has no
+`rpi.af`** (15 algorithms, none of them AF), while **`imx708.json` has one**
+(17 algorithms, Pi Cam 3). That is the whole story of the UC-517's dead
+autofocus: the AF algorithm for IMX477 ships only with Arducam's
+`imx477_af.json`. Adding it — no sudo needed, drop it next to `config.yaml`
+or in `models/` — is what creates the algorithm; the control list will not
+change, but `af_algorithm`/`focus_ok` in the camera status will flip to
+`true`, and only then is it worth asking whether the VCM moves.
+
+`focus_ok` semantics per camera status:
+
+* `false` → provably cannot autofocus: no focus controls **or** no `rpi.af`
+  in the tuning in use (the app says which, in the log).
+* `true` → controls **and** an AF algorithm: autofocus is possible; the
+  mechanical part is proven by a sweep (below).
+* `null` → not opened yet, or the tuning could not be inspected — unknown is
+  reported as unknown, never as OK.
+
+Manual focus (`lens_position`) is a different control and does not need
+`rpi.af`; it needs the camera to expose `LensPosition`, which `focus_ok` also
+reflects. Where the lens sits mechanically can only be settled by looking at
+a frame: run `tools/focus_sweep.py`.
 
 `tools/focus_sweep.py` runs that check itself and exits with a clear message
 instead of pretending. The same answer now rides along in every camera

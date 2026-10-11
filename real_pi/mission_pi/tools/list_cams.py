@@ -10,12 +10,16 @@ roles — the 30-second answer to "why is cam2 red?":
 Exit 0 when every configured role gets a camera, 1 otherwise.
 """
 import argparse
+import json
 import os
 import re
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                os.pardir))
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(HERE, os.pardir))
+
+# The camera helpers own the tuning logic (one implementation, tested there).
+from cameras import IPA_TUNING_DIRS, tuning_has_af  # noqa: E402
 
 
 def parse_boot_config(text):
@@ -300,17 +304,47 @@ def print_file_checks():
     (including a dev box with no /boot/firmware/config.txt at all)."""
     print("== files ==")
     seen = False
-    for base in ("/usr/share/libcamera/ipa/rpi/pisp",
-                 "/usr/share/libcamera/ipa/rpi/vc4"):
+    for base in IPA_TUNING_DIRS:
         if os.path.isdir(base):
             seen = True
+            tag = os.path.basename(base)
             p = os.path.join(base, "imx477_af.json")
-            print("  %s   %s" % (os.path.join(os.path.basename(base),
-                                              "imx477_af.json"),
+            print("  %s   %s" % (os.path.join(tag, "imx477_af.json"),
                                  "OK" if os.path.isfile(p) else
                                  "MISSING (UC-517 autofocus needs it)"))
+            # Decisive question: does the tuning libcamera WILL load for this
+            # sensor carry the autofocus algorithm? The camera advertises
+            # AfMode/LensPosition either way, so this is the real gate.
+            for sensor in ("imx477", "imx708"):
+                tp = os.path.join(base, "%s.json" % sensor)
+                if not os.path.isfile(tp):
+                    continue
+                has = None
+                try:
+                    with open(tp) as f:
+                        has = tuning_has_af(json.load(f))
+                except Exception as e:
+                    print("  %s  unreadable (%r)" % (tp, e))
+                    continue
+                if has:
+                    print("  %s.json contains rpi.af -> autofocus is AVAILABLE "
+                          "for %s with the installed tuning" % (sensor, sensor))
+                else:
+                    print("  %s.json has NO rpi.af -> autofocus CANNOT work for "
+                          "%s (this is what 'Could not set AF_MODE - no AF "
+                          "algorithm' means, even though AfMode/LensPosition "
+                          "appear in the camera's control list)" % (sensor,
+                                                                    sensor))
     if not seen:
-        print("  libcamera AF tuning dir: not present on this machine")
+        print("  libcamera IPA tuning dir: not present on this machine "
+              "(%s)" % ", ".join(IPA_TUNING_DIRS))
+    # a tuning file we ship ourselves is searched next to the config, in
+    # models/, by path — no sudo, survives OS updates
+    for cand in (os.path.join(HERE, "imx477_af.json"),
+                 os.path.join(HERE, "models", "imx477_af.json")):
+        if os.path.isfile(cand):
+            print("  repo-local %s -> used before libcamera's own copy"
+                  % cand)
     hef = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        os.pardir, "models", "qr_yolov8n.hef")
     print("  models/qr_yolov8n.hef   %s" % (

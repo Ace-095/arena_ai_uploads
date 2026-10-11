@@ -27,6 +27,53 @@ import time
 
 log = logging.getLogger("cameras")
 
+#: Where libcamera keeps per-sensor tuning files (Pi 5 = pisp, older = vc4).
+IPA_TUNING_DIRS = ("/usr/share/libcamera/ipa/rpi/pisp",
+                   "/usr/share/libcamera/ipa/rpi/vc4")
+
+
+def tuning_algorithms(tuning):
+    """Algorithm names in a libcamera tuning file, e.g. ['rpi.agc', 'rpi.af'].
+
+    The file shape is `"algorithms": [{"rpi.agc": {...}}, ...]` — a LIST of
+    single-key dicts, which is worth stating because collapsing it to the
+    first entry makes every sensor look as if it only had `rpi.black_level`.
+    """
+    out = []
+    for algo in (tuning or {}).get("algorithms") or []:
+        if isinstance(algo, dict):
+            out.extend(str(k) for k in algo)
+        elif algo:
+            out.append(str(algo))
+    return out
+
+
+def tuning_has_af(tuning):
+    """Does this tuning file carry the AUTOFOCUS algorithm (rpi.af)?
+
+    This — not the camera's control list — decides whether autofocus can work.
+    Verified against raspberrypi/libcamera: the stock `imx477.json` has no
+    `rpi.af`, while `imx708.json` (Pi Cam 3) does. libcamera still ADVERTISES
+    AfMode/LensPosition for IMX477, so `camera_controls` claims autofocus is
+    possible and then only logs "Could not set AF_MODE - no AF algorithm".
+    """
+    return any(name.split(".")[-1] == "af" for name in tuning_algorithms(tuning))
+
+
+def default_tuning_path(sensor, dirs=None):
+    """The `<sensor>.json` libcamera would load when we pass no tuning file.
+
+    `dirs` is resolved at CALL time so a test (or a different install layout)
+    can patch IPA_TUNING_DIRS — a bound default would freeze the module value.
+    """
+    if not sensor:
+        return None
+    for d in (IPA_TUNING_DIRS if dirs is None else dirs):
+        p = os.path.join(d, "%s.json" % sensor)
+        if os.path.isfile(p):
+            return p
+    return None
+
 try:
     from picamera2 import Picamera2
     _HAVE_PICAM = True
@@ -418,12 +465,17 @@ class Camera(_BaseCamera):
         #   /usr/share/libcamera/ipa/rpi/pisp/imx477_af.json
         # Without it the camera opens fine but has no focus controls.
         self.tuning_file = str(tuning_file).strip() if tuning_file else None
-        # Filled at open: the focus-related control names the camera actually
-        # exposes ([] = no lens subdev, so autofocus is impossible). None =
-        # not opened yet / unknown. libcamera merely LOGS "Could not set
-        # AF_MODE - no AF algorithm" and does not raise, so reading this back
-        # is the only way to know the truth.
+        # Filled at open: the focus-related control names the camera exposes
+        # ([] = none at all). None = not opened yet / unknown.
         self.focus_controls = None
+        # Does the LOADED TUNING carry the rpi.af algorithm? True/False, or
+        # None when it could not be determined. This is the real gate for
+        # autofocus: the control list is advertised even when the algorithm is
+        # absent, and libcamera merely LOGS "Could not set AF_MODE - no AF
+        # algorithm" instead of raising.
+        self.af_algorithm = None
+        #: Which tuning file was actually used (path or name) — for the log.
+        self.tuning_source = self.tuning_file
         # Pinned manual focus, in dioptres (libcamera's LensPosition unit:
         # 0 = infinity, 1 = 1 m, 0.067 = 15 m). A downward camera looking at
         # the ground from a fixed altitude does not want continuous autofocus
@@ -469,8 +521,11 @@ class Camera(_BaseCamera):
         st["lens_position"] = self.lens_position
         st["focus_controls"] = (None if self.focus_controls is None
                                 else list(self.focus_controls))
-        st["focus_ok"] = (None if self.focus_controls is None
-                          else bool(self.focus_controls))
+        st["af_algorithm"] = self.af_algorithm
+        st["tuning_source"] = self.tuning_source
+        # False as soon as EITHER the controls or the tuning's rpi.af is
+        # missing — the control list alone would report a comforting True.
+        st["focus_ok"] = self.focus_possible()
         return st
 
     def _load_tuning(self):
@@ -539,12 +594,65 @@ class Camera(_BaseCamera):
                     self.name, spec, ", ".join(candidates))
         return None
 
+    def focus_possible(self):
+        """True / False / None (unknown) — CAN this camera autofocus at all?
+
+        False is provable from two independent facts, either of which is
+        enough: no focus controls on the camera, or no `rpi.af` algorithm in
+        the tuning file that was loaded.
+        """
+        if self.focus_controls == [] or self.af_algorithm is False:
+            return False
+        if self.focus_controls and self.af_algorithm is True:
+            return True
+        return None
+
+    def _resolve_af_algorithm(self, tuning):
+        """Set self.af_algorithm / self.tuning_source from the tuning in use."""
+        import json
+        if not self.model and self._picam is not None:
+            try:
+                props = getattr(self._picam, "camera_properties", None) or {}
+                if props.get("Model"):
+                    self.model = str(props["Model"])
+            except Exception:
+                pass
+        info, source = tuning, self.tuning_file
+        if info is None:
+            # We pass nothing, so libcamera uses <sensor>.json from its own
+            # IPA dir — read exactly that file to answer the question.
+            source = default_tuning_path(self.model)
+            if source:
+                try:
+                    with open(source) as f:
+                        info = json.load(f)
+                except Exception as e:
+                    log.debug("%s: could not read %s: %r", self.name, source, e)
+                    info = None
+        self.af_algorithm = (None if info is None else tuning_has_af(info))
+        self.tuning_source = source
+
     def _open(self):
         if not _HAVE_PICAM:
             raise RuntimeError("picamera2 not installed: %r" % (_PICAM_ERR,))
         tuning = self._load_tuning()
         self._picam = (Picamera2(self.index, tuning=tuning)
                        if tuning is not None else Picamera2(self.index))
+        # The SENSOR NAME decides which default tuning libcamera picks, and
+        # the camera knows it even when config never said: read it from the
+        # opened device before judging the tuning (rig-supplied model is kept
+        # when present).
+        if not self.model:
+            try:
+                props = getattr(self._picam, "camera_properties", None) or {}
+                if props.get("Model"):
+                    self.model = str(props["Model"])
+            except Exception as e:
+                log.debug("%s: no camera_properties: %r", self.name, e)
+        try:
+            self._resolve_af_algorithm(tuning)
+        except Exception as e:
+            log.debug("%s: AF-algorithm check failed: %r", self.name, e)
         cfg = self._picam.create_video_configuration(
             main={"size": tuple(self.size), "format": "RGB888"})
         self._picam.configure(cfg)
@@ -560,17 +668,32 @@ class Camera(_BaseCamera):
                            if any(s in k.lower()
                                   for s in ("af", "lens", "focus")))
             self.focus_controls = names
-            if self.wants_autofocus() and not names:
-                log.warning("%s: autofocus is configured but this camera "
-                            "exposes NO focus controls (no AF algorithm) — "
-                            "the lens cannot be moved by software. Set "
-                            "cameras.%s.autofocus: false (a fixed lens "
-                            "focused near infinity is sharp from ~0.9 m to "
-                            "infinity at 15 m), or install the AF tuning "
-                            "file; see tools/focus_sweep.py --help",
-                            self.name, self.facing or "?")
-            elif names:
-                log.info("%s focus controls: %s", self.name, ", ".join(names))
+            if names:
+                log.info("%s focus controls: %s (AF algorithm in %s: %s)",
+                         self.name, ", ".join(names),
+                         self.tuning_source or self.model,
+                         self.af_algorithm)
+            if self.wants_autofocus() and self.focus_possible() is not True:
+                how = []
+                if not names:
+                    how.append("the camera exposes no AfMode/LensPosition "
+                               "controls at all")
+                if self.af_algorithm is False:
+                    how.append("the tuning in use (%s) has no rpi.af algorithm"
+                               % (self.tuning_source or self.model))
+                elif self.af_algorithm is None:
+                    how.append("the tuning in use could not be inspected, so "
+                               "rpi.af presence is unknown")
+                log.warning("%s: autofocus is configured but CANNOT work — %s. "
+                            "libcamera only warns ('Could not set AF_MODE - no "
+                            "AF algorithm'); nothing here raises. Fix: load a "
+                            "tuning file that HAS an AF algorithm (Arducam's "
+                            "imx477_af.json for the UC-517 — drop it next to "
+                            "config.yaml, in models/, or in the IPA dir), or "
+                            "set cameras.%s.autofocus: false and rely on the "
+                            "fixed lens (focused at ~infinity it is sharp from "
+                            "~0.9 m to infinity, so 15 m is covered)",
+                            self.name, "; ".join(how), self.facing or "?")
         except Exception as e:
             log.debug("%s: could not read camera_controls: %r", self.name, e)
 

@@ -256,6 +256,21 @@ python3 tools/test_yolo_webcam_qr.py --source csi:bottom --onnx \
 `--source csi[:role|:slot|:index]` = `csi:bottom` (default guess: the
 downward camera), `csi:front`, `csi:cam2`, `csi:1`. `--hailo` without the
 HAT/HEF prints why and falls back to the CPU ladder instead of crashing.
+
+**Measured throughput (Pi 5, 2026-10-11, no HEF yet)** — the number that
+decides the field behaviour: tiled (3×3) ONNX inference over the 2028×1520
+frame runs at **~1 fps** (~900 ms/frame); one full-frame inference
+(`--no-tile`) is ~9× cheaper but cannot see an A3 QR at 15 m (≈8 px). So on
+the CPU ladder the mission can either see the QR or keep up — not both. The
+`.hef` is what makes 15 m real-time, and the bench prints `maxconf=` plus a
+windowed `ms/frame` so this is visible rather than inferred. `--save-frames
+DIR` writes annotated JPEGs (one per second) — the way to *see* a headless
+run over SSH.
+
+Running over SSH with no display is detected automatically (Qt would abort the
+process, not raise); `--show` forces a window, `--headless` silences the note,
+and Ctrl-C prints a summary instead of a traceback.
+
 For a pure model check on stills from that same camera:
 
 ```
