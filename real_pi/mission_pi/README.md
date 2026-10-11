@@ -268,8 +268,12 @@ DIR` writes annotated JPEGs (one per second) — the way to *see* a headless
 run over SSH.
 
 Running over SSH with no display is detected automatically (Qt would abort the
-process, not raise); `--show` forces a window, `--headless` silences the note,
-and Ctrl-C prints a summary instead of a traceback.
+whole process, not raise). A set `DISPLAY` is not enough to trust: the tool
+tries to open a throwaway window **in a child process**, so the classic
+`ssh -X`/`.bashrc` `DISPLAY` with no X cookie — which kills Qt with SIGABRT —
+degrades to a headless run instead of taking the bench with it. `--show` forces
+a window, `--headless` silences the note, `--save-frames DIR` writes annotated
+JPEGs, and Ctrl-C prints a summary instead of a traceback.
 
 For a pure model check on stills from that same camera:
 
@@ -324,17 +328,31 @@ Details + the executed test matrix + the bench procedure:
   sweep when the tuning has no `rpi.af` algorithm (LensPosition is a no-op
   then — proven in the field), and flags a flat curve as "the lens did not
   move / there is nothing to focus on" instead of reporting a winner
+* `hailo_decode.py` — the ONE place that turns a HEF's output into boxes:
+  styles A / A'' / B / **A'** (`[1, 5*C, N]` NMS rows, features-major,
+  normalised) and the `(N,5)` flat form, plus the HailoRT configure calls that
+  moved in 4.2x (`hef.create_configure_params(StreamInterface.PCIe)`,
+  `InputVStreamParams.make(network_group, …)`), with fallbacks for older
+  versions. Pure numpy, no Hailo runtime — so every branch is unit-tested
+  without the HAT
 * `tools/hef_info.py` — is this `.hef` usable on THIS Pi? Prints the HEF's
   architecture, its input/output tensors and which output style our parser
-  will use (NMS-in-HEF vs raw head; anything else means "no boxes ever"), and
-  validates a Hailo `nms_config.json` (`--nms-config`) against the model
+  will use — A (class id in the last column), A'' (class axis), B (raw head),
+  or **A' — the Hailo NMS rows `[1, 5*C, N]`, which is what our own HEF
+  returns as `[1, 5, 100]`**: 5 values `y_min, x_min, y_max, x_max, score`
+  (normalised) × 100 boxes × 1 class. Anything else means "no boxes ever". It also validates a
+  Hailo `nms_config.json` (`--nms-config`) against the model, and answers from
+  the SAME code the runtime uses (`hailo_decode.py`), so the verdict cannot
+  drift from the Pi's behaviour
 * `tools/make_calib_set.py` — build the Hailo DFC calibration set from our
   own frames (camera/video/dir), dropping dark, flat and near-duplicate
   frames and letterboxing to 640×640 exactly like the runtime; prints the
   `hailo optimize` command. See `training/compile_hef.md`
 * `tools/qr_bench.py` — detector+decoder over images, boxes/payload/ms
   (`--detector onnx|pt|yolo|hailo|classical|auto`; `onnx` runs the mission's
-  own ONNX rung, so the ms you see is the ms the mission gets)
+  own ONNX rung, so the ms you see is the ms the mission gets). The names an
+  operator types are aliases of the mission's own kinds — `onnx`, `pt`,
+  `yolov8`, `yolo_onnx`… — and an unknown one raises with the full list
 * `tools/link_doctor.py` — end-to-end Pi-link diagnosis (local or `--remote`)
 * `tools/fake_sitl.py` — SITL stand-in: tcp 5760/5762 + optional udp mirror
   (`--udp`), `--auto --loop` flies a demo mission by itself. Also a **writable

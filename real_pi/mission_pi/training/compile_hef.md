@@ -78,17 +78,39 @@ $HAILO_MODEL_ZOO/yolov8n.alls     # base: has the yolov8 meta-arch + nms_postpro
 
 Copy it and change only what our model needs (1 class). Keep
 `nms_postprocess` — our runtime parses the NMS tensor directly
-(`detector.py::HailoYolo8Detector._parse`, style A: last dim 6,
-`[x1,y1,x2,y2,score,class]`). Lower the NMS floor only if the bench shows
-weak boxes being dropped:
+(`hailo_decode.py`, the code `detector.py` calls). Lower the NMS floor only if
+the bench shows weak boxes being dropped:
 
 ```
 nms_postprocess(meta_arch=yolov8, engine=cpu, score_threshold=0.25, iou_threshold=0.5, ...)
 ```
 
-The runtime **also** parses the raw head (style B: `(1,5,8400)` cxcywh+conf),
-so a HEF compiled *without* NMS still works — just slower, because NMS then
-runs on the Pi's CPU. Prefer the NMS-in-HEF variant.
+### What the HEF actually emits (measured, 2026-10-12)
+
+Compiling with `nms_postprocess` gives ONE output,
+`qr_yolov8n/yolov8_nms_postprocess` = **`[1, 5, 100]`**: 5 values x 100 boxes x
+1 class. HailoRT stores it **features-major** —
+
+| axis | meaning |
+|---|---|
+| `[0]` | batch (1) |
+| `[1]` | **5 values per box, in this order**: `y_min, x_min, y_max, x_max, score` — **normalised to 0..1**, not pixels |
+| `[2]` | up to 100 detections (the `max_proposals` of the NMS config) |
+
+So it is *not* "100 boxes of 6" and *not* the `(1,5,8400)` raw head. The old
+parser read shape `[1,5,100]` as unsupported and returned no boxes for every
+frame — which looks exactly like a dead model. `tools/hef_info.py` and
+`hailo_decode.py` read it as **style A'**, and the box order is auto-detected
+(y_min-first vs x_min-first) from the geometry, so a version that emits xyxy
+still works.
+
+For C classes the same tensor is `[1, 5*C, N]`; a 400-row output would mean an
+80-class (COCO) network and `hef_info` warns about it.
+
+The runtime **also** parses the raw head (style B: `(1,5,8400)` cxcywh+conf,
+where the anchor count 8400 is what distinguishes it from A'), so a HEF
+compiled *without* NMS still works — just slower, because NMS then runs on the
+Pi's CPU. Prefer the NMS-in-HEF variant.
 
 ## 3. Parse → optimize → compile
 

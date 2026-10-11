@@ -8,12 +8,16 @@ the middle of a mission:
   2. what does it expect (input tensor name/shape) and what does it emit?
   3. will our runtime parser understand those outputs?
 
-The last one is decided by `detector.py::HailoYolo8Detector._parse`:
-  * style A — NMS done inside the HEF: a tensor whose last dim is 6
-    (x1,y1,x2,y2,score,class)   -> preferred (NMS on the Hailo, free on the Pi)
-  * style B — raw ultralytics head (1,5,8400) cxcywh+conf -> also parsed, but
-    NMS then runs on the Pi's CPU.
-If neither matches, every inference silently returns no boxes — which looks
+The last one is decided by `hailo_decode.py`, the same code the runtime uses:
+  * style A    — NMS done inside the HEF, class id in the last column:
+    (..., 6) = x1,y1,x2,y2,score,class
+  * style A''  — same, with an explicit class axis: (b, c, N, 5)
+  * style B    — raw ultralytics head (1,5,8400) cxcywh+conf: parsed, but NMS
+    then runs on the Pi CPU
+  * style A'   — Hailo's fixed NMS tensor, FEATURES-MAJOR rows: (b, 5*C, N) of
+    (y_min, x_min, y_max, x_max, score) normalised. This is what our own
+    QR HEF returns as (1, 5, 100) = 1 class x 100 boxes x 5 values.
+If none matches, every inference silently returns no boxes — which looks
 like "the model is bad" and is really "the outputs are in a shape nobody
 reads". This tool says so up front.
 
@@ -33,41 +37,48 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, os.pardir))
+sys.path.insert(0, os.path.join(HERE, os.pardir, "mission_pi"))
 
-#: What our parser needs, kept next to the classifier so the two cannot drift.
+try:
+    import hailo_decode as HD          # the parser the runtime uses
+except Exception as _e:                # pragma: no cover - needs numpy
+    HD = None
+    HD_ERR = _e
+else:
+    HD_ERR = None
+
+#: Kept for callers/tests that import these names; the rules themselves live in
+#: hailo_decode so the inspector and the runtime cannot drift apart.
 STYLE_A_LAST_DIM = 6
 STYLE_B_HEAD = (1, 5)
 STYLE_B_MIN_ANCHORS = 1000
 
 
 def classify_outputs(shapes):
-    """[(name, shape), ...] -> (style, detail) with style in "A"/"B"/None.
+    """[(name, shape), ...] -> (style, detail), style in the decoder's names.
 
-    Pure: this is the contract between the HEF we compile and the runtime
-    parser, so it is tested without any Hailo hardware.
+    Delegates the shape rules to hailo_decode (the code the Pi actually runs),
+    then reports the branch the RUNTIME would choose: the first style in
+    DECODE_ORDER present in the outputs, so the verdict never depends on the
+    order the HEF happens to list its tensors in.
     """
-    norm = []
+    if HD is None:
+        return None, ("hailo_decode.py is not importable (%r) — install numpy "
+                      "to get a verdict" % (HD_ERR,))
+    found = []
+    details = {}
     for name, shape in shapes or []:
-        shp = tuple(int(d) for d in (shape or ()) if d is not None)
-        if shp:
-            norm.append((name, shp))
-    # Two passes, A before B — exactly like detector.py::_parse, which scans
-    # every output for the NMS tensor before falling back to the raw head. A
-    # single pass would make the verdict depend on tensor order, and the
-    # verdict must describe what the RUNTIME will do, not what looks tidy.
-    for name, shp in norm:
-        if shp[-1] == STYLE_A_LAST_DIM and len(shp) >= 2:
-            return "A", ("%s %s — NMS-in-HEF (x1,y1,x2,y2,score,class); the "
-                         "Hailo does the NMS" % (name, list(shp)))
-    for name, shp in norm:
-        if (len(shp) == 3 and shp[0] == 1 and shp[1] == STYLE_B_HEAD[1]
-                and shp[2] >= STYLE_B_MIN_ANCHORS):
-            return "B", ("%s %s — raw ultralytics head; parsed, but NMS then "
-                         "runs on the Pi CPU" % (name, list(shp)))
-    return None, ("no output looks like either supported shape — the runtime "
-                  "would return NO boxes for every frame. Compile with the "
-                  "zoo's yolov8n .alls (nms_postprocess), or export the raw "
-                  "(1,5,8400) head.")
+        st = HD.style_of_shape(shape)
+        if st and st not in found:
+            found.append(st)
+            details[st] = HD.describe_shape(name, shape)
+    for st in HD.DECODE_ORDER:
+        if st in found:
+            return st, details[st]
+    return None, ("no output matches any layout the runtime reads (A, A'', B, "
+                  "A', A'-flat) — every frame would come back with NO boxes. "
+                  "Compile with the zoo's yolov8n .alls (nms_postprocess) or "
+                  "export the raw (1,5,8400) head.")
 
 
 #: Class counts that mean "this is somebody else's network": the stock Hailo
@@ -75,6 +86,8 @@ def classify_outputs(shapes):
 #: Our runtime filter keeps class 0 only, so a COCO HEF can never report 'qr' —
 #: it would look like a model that detects nothing (or everything but QR).
 FOREIGN_CLASS_COUNTS = (80, 84)
+#: Values per box in a Hailo NMS tensor (rows layout, style A').
+NMS_ROWS = 5
 
 
 def class_count_hint(shapes):
@@ -99,6 +112,14 @@ def class_count_hint(shapes):
             return ("%s suggests %d classes — our model has exactly 1 ('qr'); "
                     "the runtime keeps class 0 only."
                     % (name, shp[1]))
+        # (1, 5*C, N) rows layout: 5 values per box x C classes. Gate on the
+        # decoder's own verdict — [1, 100, 6] also divides by 5 but is style A
+        # (one class, class id in the last column) and must never be flagged.
+        if (len(shp) == 3 and HD is not None and HD.style_of_shape(shp) == "A'"
+                and shp[1] // NMS_ROWS > 1):
+            return ("%s packs %d classes x %d boxes — our model has exactly 1 "
+                    "('qr'); the runtime would read only the first class's "
+                    "rows." % (name, shp[1] // NMS_ROWS, shp[2]))
     return None
 
 

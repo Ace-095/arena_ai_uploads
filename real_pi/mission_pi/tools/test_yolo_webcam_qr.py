@@ -67,26 +67,90 @@ except Exception:
 PRESET_KEYS = "1234567"  # key -> preset list position
 
 
-def decide_show(headless, show, env=None):
+def probe_display(cv_mod=None, env=None):
+    """Can a window REALLY open here? -> (ok, reason).
+
+    `DISPLAY` being set is not enough. On a Pi over SSH, `DISPLAY=:0` (often
+    exported from .bashrc, or left over from an `ssh -X`) points at the
+    desktop's X server while the session has no X cookie — and then Qt/GTK
+    ABORT the whole process (SIGABRT, not a Python exception), which no
+    try/except can survive. The only safe way to ask is in a CHILD process:
+    if the child dies, the bench still runs.
+
+    Also catches an OpenCV built without GUI support (opencv-python-headless),
+    where imshow simply does not exist.
+    """
+    env = os.environ if env is None else env
+    if cv_mod is None:
+        try:
+            import cv2 as cv_mod          # imported lazily elsewhere too
+        except Exception as e:
+            return False, "cv2 is not importable (%r) — cannot open a window" % (e,)
+    if not env.get("DISPLAY") and not env.get("WAYLAND_DISPLAY"):
+        return False, ("no DISPLAY/WAYLAND_DISPLAY — this is a headless shell "
+                       "(SSH): use --save-frames to see annotated JPEGs, or "
+                       "--show from a VNC/desktop terminal")
+    if not hasattr(cv_mod, "imshow") or not hasattr(cv_mod, "namedWindow"):
+        return False, ("this cv2 has no GUI support (opencv-python-headless?) "
+                       "— no window is possible in this Python; use "
+                       "--save-frames")
+    if not hasattr(os, "fork"):                     # Windows: env check only
+        return True, "display env present (cannot probe on this platform)"
+    try:
+        pid = os.fork()
+    except OSError:
+        return True, "display env present (fork unavailable to probe)"
+    if pid == 0:                                    # child: try, then die
+        code = 0
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, 1)
+            os.dup2(devnull, 2)
+            cv_mod.namedWindow("__display_probe__")
+            cv_mod.destroyAllWindows()
+        except Exception:
+            code = 2
+        os._exit(code)
+    _, status = os.waitpid(pid, 0)
+    if os.WIFSIGNALED(status):
+        return False, ("DISPLAY is set (%s) but no window can be created here "
+                       "— the attempt was killed by signal %d (no X cookie / "
+                       "no X forwarding). Running headless; use --save-frames, "
+                       "or run this from the VNC desktop's terminal"
+                       % (os.environ.get("DISPLAY") or os.environ.get(
+                           "WAYLAND_DISPLAY"), os.WTERMSIG(status)))
+    if os.WEXITSTATUS(status) != 0:
+        return False, ("DISPLAY is set but OpenCV could not open a window "
+                       "there — running headless (use --save-frames)")
+    return True, "display probe succeeded — window will open"
+
+
+def decide_show(headless, show, env=None, probe=None):
     """Open a window? -> (show, reason).
 
     Qt ABORTS the whole process (SIGABRT, not a Python exception) when it
     cannot init a platform plugin, and over SSH there is no display — so the
     decision has to be made BEFORE the first imshow(), never as a try/except
-    around it. Explicit flags always win; otherwise a display decides.
+    around it. Explicit flags always win; otherwise a display decides, and a
+    display that cannot actually open a window counts as no display.
 
-    Pure so it can be tested with no display and no camera.
+    Pure apart from `probe` (injected in tests) so it can be tested with no
+    display, no camera and no Qt.
     """
     env = os.environ if env is None else env
     if headless:
         return False, "headless requested"
     if show:
         return True, "window forced with --show"
-    if env.get("DISPLAY") or env.get("WAYLAND_DISPLAY"):
-        return True, "display found"
-    return False, ("no DISPLAY/WAYLAND_DISPLAY (SSH?) — running headless; "
-                   "re-run with --show once you have a desktop, or --headless "
-                   "to silence this note")
+    if not env.get("DISPLAY") and not env.get("WAYLAND_DISPLAY"):
+        return False, ("no DISPLAY/WAYLAND_DISPLAY (SSH?) — running headless; "
+                       "use --save-frames to see annotated JPEGs, or --show "
+                       "from a VNC/desktop terminal")
+    # A display is announced — but announcing is not the same as working, and
+    # a broken one aborts the process, so ask for real (in a child) first.
+    probe = probe_display if probe is None else probe
+    ok, why = probe(None, env)
+    return bool(ok), why
 
 
 def load_cfg(path):
@@ -291,8 +355,7 @@ def main():
     # A window needs a display; Qt aborts the process, not an exception, when
     # there is none — so decide here (and say which branch was taken).
     _show, why = decide_show(args.headless, args.show)
-    if not _show:
-        print("[bench] %s" % why)
+    print("[bench] window %s — %s" % ("ON" if _show else "OFF (headless)", why))
     if args.save_frames:
         os.makedirs(args.save_frames, exist_ok=True)
         print("[bench] annotated frames -> %s (1/s)" % args.save_frames)

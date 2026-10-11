@@ -50,22 +50,90 @@ def test_headless_decision():
     none_env = {}
     desktop = {"DISPLAY": ":0"}
     wayland = {"WAYLAND_DISPLAY": "wayland-0"}
+    ok_probe = lambda cv, env: (True, "fake display works")          # noqa: E731
+    bad_probe = lambda cv, env: (False, "fake: killed by signal 6")  # noqa: E731
 
-    show, why = B.decide_show(False, False, none_env)
+    show, why = B.decide_show(False, False, none_env, probe=ok_probe)
     check("no display -> headless (Qt would abort the process)",
           show is False and "DISPLAY" in why, (show, why))
-    show2, _ = B.decide_show(False, False, desktop)
+    show2, _ = B.decide_show(False, False, desktop, probe=ok_probe)
     check("a normal desktop still opens the window", show2 is True)
-    show3, _ = B.decide_show(False, False, wayland)
+    show3, _ = B.decide_show(False, False, wayland, probe=ok_probe)
     check("Wayland counts as a display", show3 is True)
-    show4, why4 = B.decide_show(True, False, desktop)
+    show4, why4 = B.decide_show(True, False, desktop, probe=bad_probe)
     check("--headless wins over a display", show4 is False)
-    show5, why5 = B.decide_show(False, True, none_env)
+    show5, why5 = B.decide_show(False, True, none_env, probe=bad_probe)
     check("--show forces a window (e.g. X-forwarded)",
           show5 is True and "forced" in why5, (show5, why5))
-    show6, _ = B.decide_show(True, True, desktop)
+    show6, _ = B.decide_show(True, True, desktop, probe=ok_probe)
     check("--headless wins when both are given (safe default)",
           show6 is False)
+    # DISPLAY set but unusable is the real-world case that started this: an
+    # `ssh -X`/`.bashrc` DISPLAY with no X cookie aborts the process, so a
+    # display that cannot open a window must count as no display.
+    show7, why7 = B.decide_show(False, False, desktop, probe=bad_probe)
+    check("DISPLAY set but the probe fails -> headless, reason kept",
+          show7 is False and "signal" in why7, (show7, why7))
+
+
+class _HeadlessCV2:
+    """opencv-python-headless: imshow/namedWindow simply do not exist."""
+
+
+class _FakeCV2:
+    """A cv2 whose window calls fail — the probe must survive that."""
+    called = False
+
+    @staticmethod
+    def imshow(name, img):
+        pass
+
+    @staticmethod
+    def namedWindow(name):
+        _FakeCV2.called = True
+        raise RuntimeError("boom")
+
+    @staticmethod
+    def destroyAllWindows():
+        pass
+
+
+class _WorkingCV2:
+    """A cv2 whose window calls succeed (so the child exits 0)."""
+
+    @staticmethod
+    def imshow(name, img):
+        pass
+
+    @staticmethod
+    def namedWindow(name):
+        pass
+
+    @staticmethod
+    def destroyAllWindows():
+        pass
+
+
+def test_display_probe():
+    """probe_display must never raise, must not need a real display, and must
+    answer 'no' for every one of the ways a window can be impossible."""
+    if not hasattr(os, "fork"):
+        check("display probe skipped (no fork on this platform)", True)
+        return
+
+    ok, why = B.probe_display(cv_mod=_WorkingCV2(), env={})
+    check("no DISPLAY -> False without touching the window API",
+          ok is False and "headless" in why, (ok, why))
+    ok3, why3 = B.probe_display(cv_mod=_HeadlessCV2(), env={"DISPLAY": ":0"})
+    check("headless-only cv2 build (no imshow attr) -> False, blames cv2",
+          ok3 is False and "GUI" in why3, (ok3, why3))
+    ok4, why4 = B.probe_display(cv_mod=_FakeCV2(), env={"DISPLAY": ":0"})
+    check("a window that cannot be created -> False (parent survives)",
+          ok4 is False and "headless" in why4, (ok4, why4))
+    check("the failing window call happened in a CHILD process",
+          _FakeCV2.called is False)
+    ok5, why5 = B.probe_display(cv_mod=_WorkingCV2(), env={"DISPLAY": ":0"})
+    check("a working display probe -> True", ok5 is True, (ok5, why5))
 
 
 # ------------------------------------------------------- 2. detector names --

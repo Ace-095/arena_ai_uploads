@@ -26,10 +26,43 @@ instead of classical — A3 at 10m/15m will actually be detected.
 import importlib
 import logging
 import os
+import sys
 import threading
 from collections import namedtuple
 
 log = logging.getLogger("detector")
+
+# HEF output decoding lives in hailo_decode.py: pure numpy, no Hailo runtime,
+# so every layout branch is unit-tested. Import by path too — the tools run it
+# from directories where the package root is not on sys.path.
+try:
+    from .hailo_decode import (decode_hailo_outputs as _decode_hailo_outputs,
+                               hailo_configure_params as _hailo_configure_params,
+                               hailo_vstream_params as _hailo_vstream_params,
+                               nms_shape_of as _nms_shape_of,
+                               describe_outputs as describe_hef_outputs)
+except Exception:                                    # run as a plain script
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from hailo_decode import (decode_hailo_outputs as _decode_hailo_outputs,
+                                  hailo_configure_params as _hailo_configure_params,
+                                  hailo_vstream_params as _hailo_vstream_params,
+                                  nms_shape_of as _nms_shape_of,
+                                  describe_outputs as describe_hef_outputs)
+    except Exception:                                # no numpy at all
+        _decode_hailo_outputs = None
+
+        def _hailo_configure_params(*a, **k):
+            raise RuntimeError("hailo_decode.py missing (needs numpy)")
+
+        def _hailo_vstream_params(*a, **k):
+            raise RuntimeError("hailo_decode.py missing (needs numpy)")
+
+        def _nms_shape_of(*a, **k):
+            return None, None
+
+        def describe_hef_outputs(*a, **k):
+            return ["hailo_decode.py not importable — install numpy"]
 
 BBox = namedtuple("BBox", ["x", "y", "w", "h", "conf", "source"])
 
@@ -126,10 +159,9 @@ def _host_nms(boxes, iou_thr=0.5):
 class HailoYolo8Detector(Detector):
     """YOLOv8n (1 class: qr) on the Hailo AI HAT.
 
-    Handles both HEF output styles:
-      * NMS-in-HEF (Hailo zoo retrain flow): a tensor with last dim 6
-        [x1,y1,x2,y2,score,class] (relative or input-pixel coords).
-      * raw ultralytics-style head: (1, 5, 8400) cxcywh+conf in input px.
+    Output layouts are handled by `hailo_decode.decode_hailo_outputs`, which
+    covers all four shapes HailoRT can hand us — including the UC-517 HEF's
+    (1, 5, 100) NMS tensor (five features x 100 detections, normalised).
     """
     name = "hailo"
 
@@ -137,9 +169,11 @@ class HailoYolo8Detector(Detector):
         if not _HAVE_NP or not _HAVE_CV2:
             raise RuntimeError("hailo detector needs numpy + cv2")
         try:
-            from hailo_platform import (HEF, VDevice, ConfigureParams,
-                                        InputVStreamParams, OutputVStreamParams,
-                                        InferVStreams, FormatType)
+            import hailo_platform as hp
+            HEF = hp.HEF
+            VDevice = hp.VDevice
+            FormatType = hp.FormatType
+            InferVStreams = hp.InferVStreams
         except Exception as e:
             raise RuntimeError("hailo_platform import failed (%r) — "
                                "install hailo-all / hailort on the Pi" % (e,))
@@ -150,17 +184,33 @@ class HailoYolo8Detector(Detector):
         self.conf_thr = float(conf_thr)
         self.iou_thr = float(iou_thr)
         self._lock = threading.Lock()
+        self._out_style = None
         hef = HEF(hef_path)
         self._vdev = VDevice()
-        cfg = ConfigureParams.create_from_hef(hef, interface="PCIe")
+        # HailoRT 4.23 dropped ConfigureParams.create_from_hef in favour of
+        # hef.create_configure_params(StreamInterface.PCIe) — see hailo_decode.
+        cfg = _hailo_configure_params(hef, hp)
         self._ng = self._vdev.configure(hef, cfg)[0]
         self._ng_params = self._ng.create_params()
-        in_p = InputVStreamParams.make(self._ng_params, format_type=FormatType.UINT8)
-        out_p = OutputVStreamParams.make(self._ng_params, format_type=FormatType.FLOAT32)
+        in_p = _hailo_vstream_params(hp, self._ng, self._ng_params, True,
+                                     FormatType.UINT8)
+        out_p = _hailo_vstream_params(hp, self._ng, self._ng_params, False,
+                                      FormatType.FLOAT32)
         self._streams = InferVStreams(self._ng, in_p, out_p)
         infos = hef.get_input_vstream_infos()
         self._in_name = infos[0].name if infos else None
-        log.info("hailo ready: %s (in=%s size=%d)", hef_path, self._in_name, self.input_size)
+        self._out_infos = hef.get_output_vstream_infos()
+        # Log the runtime's own description of the outputs once, so a field log
+        # always says which layout is in play (nms_shape beats shape guessing).
+        desc = []
+        for vi in self._out_infos:
+            nc, mb = _nms_shape_of(vi)
+            shp = list(getattr(vi, "shape", []) or [])
+            desc.append("%s%s%s" % (vi.name, shp,
+                                    "" if nc is None else
+                                    " nms(classes=%s,boxes=%s)" % (nc, mb)))
+        log.info("hailo ready: %s (in=%s size=%d) outs=%s",
+                 hef_path, self._in_name, self.input_size, "; ".join(desc) or "?")
 
     def detect(self, frame_bgr):
         try:
@@ -182,43 +232,27 @@ class HailoYolo8Detector(Detector):
                 for (x1, y1, x2, y2, c) in boxes]
 
     def _parse(self, outs, scale, px, py, iw, ih):
-        S = self.input_size
-        # style A: NMS tensor (..., 6)
-        for o in outs:
-            a = _np.asarray(o)
-            if a.shape[-1] == 6 and a.size >= 6:
-                det = a.reshape(-1, 6)
-                out = []
-                for x1, y1, x2, y2, sc, cl in det:
-                    if sc < self.conf_thr or int(cl) != 0:
-                        continue
-                    if max(x1, y1, x2, y2) <= 1.5:  # relative -> input px
-                        x1, y1, x2, y2 = x1 * S, y1 * S, x2 * S, y2 * S
-                    X1 = max(0, (x1 - px) / scale)
-                    Y1 = max(0, (y1 - py) / scale)
-                    X2 = min(iw, (x2 - px) / scale)
-                    Y2 = min(ih, (y2 - py) / scale)
-                    if X2 > X1 and Y2 > Y1:
-                        out.append((X1, Y1, X2, Y2, float(sc)))
-                return _host_nms(out, self.iou_thr)
-        # style B: raw head (1, 5, 8400) cxcywh + conf, input px
-        for o in outs:
-            a = _np.asarray(o)
-            if a.ndim == 3 and a.shape[1] == 5 and a.shape[2] > 1000:
-                det = a[0].transpose(1, 0)
-                out = []
-                for cx, cy, w, h, sc in det:
-                    if sc < self.conf_thr:
-                        continue
-                    x1, y1 = cx - w / 2 - px, cy - h / 2 - py
-                    x2, y2 = cx + w / 2 - px, cy + h / 2 - py
-                    X1, Y1 = max(0, x1 / scale), max(0, y1 / scale)
-                    X2, Y2 = min(iw, x2 / scale), min(ih, y2 / scale)
-                    if X2 > X1 and Y2 > Y1:
-                        out.append((X1, Y1, X2, Y2, float(sc)))
-                return _host_nms(out, self.iou_thr)
-        log.debug("hailo: unrecognized output shapes %s", [getattr(o, "shape", "?") for o in outs])
-        return []
+        """All HEF layouts -> frame boxes; logs the layout once per change."""
+        style = []
+
+        def _note(s):
+            style.append(s)
+
+        boxes = _decode_hailo_outputs(
+            outs, input_size=self.input_size, conf_thr=self.conf_thr,
+            nms_fn=lambda bs: _host_nms(bs, self.iou_thr),
+            scale=scale, px=px, py=py, iw=iw, ih=ih, note=_note)
+        chosen = style[0] if style else None
+        if chosen != self._out_style:
+            self._out_style = chosen
+            if chosen:
+                log.info("hailo output layout: %s", chosen)
+            else:
+                log.warning("hailo: unrecognized output shapes %s — no boxes "
+                            "can come from this HEF until the parser learns "
+                            "them (see tools/hef_info.py)",
+                            [list(getattr(o, "shape", []) or []) for o in outs])
+        return boxes
 
     def close(self):
         try:

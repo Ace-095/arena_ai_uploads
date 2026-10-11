@@ -170,15 +170,23 @@ def test_compile_doc_matches_the_real_model():
 # ------------------------------------------- HEF <-> parser contract --
 def test_hef_output_style_classification():
     """The HEF's output shape decides whether the runtime ever returns a box.
-    Both supported styles must be recognised, and anything else must be called
-    out as fatal instead of silently yielding an empty detection list."""
+    Every layout the runtime can read must be recognised, and anything else
+    must be called out as fatal instead of silently yielding empty lists."""
     a, detail_a = HI.classify_outputs(
         [("qr_yolov8n/yolov8_nms_postprocess", [1, 100, 6])])
-    check("NMS-in-HEF output is style A", a == "A" and "Hailo does the NMS" in detail_a,
+    check("NMS-in-HEF output is style A", a == "A" and "style A —" in detail_a,
           (a, detail_a))
     b, detail_b = HI.classify_outputs([("output0", [1, 5, 8400])])
     check("raw ultralytics head is style B", b == "B" and "Pi CPU" in detail_b,
           (b, detail_b))
+    # The HEF the user compiled for the UC-517 is exactly this. Reading it as
+    # "unsupported" is the bug that made the HAT look idle on the Pi.
+    r, detail_r = HI.classify_outputs(
+        [("qr_yolov8n/yolov8_nms_postprocess", [1, 5, 100])])
+    check("the real UC-517 NMS output (1,5,100) is style A'",
+          r == "A'" and "Hailo NMS rows" in detail_r, (r, detail_r))
+    check("an NMS output with a class axis is style A''",
+          HI.classify_outputs([("nms", [1, 1, 100, 5])])[0] == "A''")
     c, detail_c = HI.classify_outputs([("weird", [1, 84, 8400])])
     check("an unsupported output is reported as NO boxes", c is None and "NO boxes" in detail_c,
           (c, detail_c))
@@ -188,6 +196,62 @@ def test_hef_output_style_classification():
     check("style A is preferred even when listed second",
           HI.classify_outputs([("raw", [1, 5, 8400]),
                                ("nms", [1, 100, 6])])[0] == "A")
+
+
+def test_hailo_decode_reads_every_layout():
+    """hailo_decode is the code that runs on the Pi, so each branch is fed a
+    synthetic tensor here: a wrong branch on the drone looks exactly like a
+    model that detects nothing."""
+    import numpy as np
+    from hailo_decode import decode_hailo_outputs
+
+    # A' — Hailo's fixed NMS tensor: 5 rows, normalised, (y,x,y,x,score).
+    t = np.zeros((1, 5, 100), dtype=np.float32)
+    t[0, 0, 0], t[0, 1, 0] = 0.30, 0.42      # y_min, x_min
+    t[0, 2, 0], t[0, 3, 0] = 0.46, 0.58      # y_max, x_max
+    t[0, 4, 0] = 0.91
+    t[0, 4, 1:] = 0.01                       # below the floor -> dropped
+    boxes = decode_hailo_outputs([t], input_size=640, conf_thr=0.35)
+    check("A' yields exactly the one box above the threshold", len(boxes) == 1, boxes)
+    if boxes:
+        x1, y1, x2, y2, sc = boxes[0]
+        check("A' box is (x_min,y_min,x_max,x_max)*640 in the right order",
+              abs(x1 - 268.8) < 0.5 and abs(y1 - 192.0) < 0.5
+              and abs(x2 - 371.2) < 0.5 and abs(y2 - 294.4) < 0.5
+              and abs(sc - 0.91) < 1e-6, boxes[0])
+
+    # Same tensor with the rows swapped mid-detection (xyxy) must still work.
+    t2 = t.copy()
+    t2[0, 0, 0], t2[0, 1, 0] = 0.42, 0.30
+    t2[0, 2, 0], t2[0, 3, 0] = 0.58, 0.46
+    b2 = decode_hailo_outputs([t2], input_size=640, conf_thr=0.35)
+    check("an xyxy-order NMS tensor is read the same way",
+          len(b2) == 1 and abs(b2[0][0] - 268.8) < 0.5, b2)
+
+    # A — class id in the last column, already in pixels.
+    b3 = np.array([[20, 40, 120, 140, 0.8, 0]], dtype=np.float32)
+    check("style A (last dim 6) still works",
+          len(decode_hailo_outputs([b3], input_size=640, conf_thr=0.35)) == 1)
+
+    # B — raw head, 8400 anchors, cxcywh; only the anchored count is allowed to
+    # select this branch instead of A'.
+    head = np.zeros((1, 5, 8400), dtype=np.float32)
+    head[0, :, 0] = [320, 320, 64, 64, 0.77]
+    b4 = decode_hailo_outputs([head], input_size=640, conf_thr=0.35)
+    check("style B (raw head) is still read as cxcywh",
+          len(b4) == 1 and abs(b4[0][0] - 288) < 0.5, b4)
+
+    check("an unreadable shape returns [] instead of raising",
+          decode_hailo_outputs([np.zeros((1, 3, 7), np.float32)]) == [])
+    check("no outputs at all is not a crash",
+          decode_hailo_outputs([]) == [] and decode_hailo_outputs(None) == [])
+    note = []
+    decode_hailo_outputs([t], input_size=640, conf_thr=0.35, note=note.append)
+    check("the decoder reports which layout it used", note and note[0] == "A'", note)
+    note2 = []
+    decode_hailo_outputs([np.zeros((1, 3, 7), np.float32)], note=note2.append)
+    check("an unreadable output reports None (so the log can warn once)",
+          note2 and note2[0] is None, note2)
 
 
 def test_foreign_class_count_warning():
@@ -201,9 +265,14 @@ def test_foreign_class_count_warning():
     check("a 4-D output with more than one class is called out",
           "classes" in (HI.class_count_hint([("x", [1, 3, 100, 6])]) or ""),
           HI.class_count_hint([("x", [1, 3, 100, 6])]))
+    check("rows layout with more than one class is called out",
+          "1" in (HI.class_count_hint([("nms", [1, 400, 100])]) or ""),
+          HI.class_count_hint([("nms", [1, 400, 100])]))
     check("our own 1-class shapes are NOT flagged",
           HI.class_count_hint([("x", [1, 100, 6])]) is None and
-          HI.class_count_hint([("output0", [1, 5, 8400])]) is None)
+          HI.class_count_hint([("output0", [1, 5, 8400])]) is None and
+          HI.class_count_hint([("nms", [1, 5, 100])]) is None and
+          HI.class_count_hint([("nms", [1, 1, 100, 5])]) is None)
     check("empty input is not a crash", HI.class_count_hint([]) is None)
 
 
