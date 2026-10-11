@@ -97,13 +97,24 @@ function createHarness(baseUrl) {
     if (!r.ok) throw new Error('fault injection rejected: HTTP ' + r.status);
     return r.json();
   }
+  async function caps(body) {
+    // Test-only: change what the FIXTURE flight controller advertises
+    // (firmware capability bits / silence), so the UI's "can this FC take a
+    // fence at all?" line can be exercised. Never present in production.
+    const r = await fetch(baseUrl + '/__test/caps', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body || {}),
+    });
+    if (!r.ok) throw new Error('caps injection rejected: HTTP ' + r.status);
+    return r.json();
+  }
   function boot() {
     w.eval(fs.readFileSync(path.join(root, 'js/app.js'), 'utf8'));
     return settle();
   }
 
   return {dom, w, $, calls, vertices, setPolygon, boot, settle, click,
-          writes, lastBody, fault};
+          writes, lastBody, fault, caps};
 }
 
 module.exports = {createHarness};

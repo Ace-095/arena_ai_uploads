@@ -27,8 +27,16 @@ AUTO mission ──► 15 m over home ──► DO_SPRAYER fires ──► Pi ta
 | Pi 5 ↔ Pixhawk | USB-A ↔ USB (telem2 coverts to `/dev/ttyACM0`) | FC auto-detect probes `by-id`, `ttyACM*`, `ttyUSB*` @ 115200/57600/921600 |
 | AI HAT+ 26 TOPS | PCIe ribbon, `hailo-all` stack | `hailortcli scan` must see it; needs `dtparam=pciex1_gen=2` |
 | Pi Cam 3 (imx708) | CSI 0 or 1, facing FORWARD | role assigned by sensor, not port |
-| Waveshare IMX477 IR-CUT B (bottom) | other CSI, facing DOWN | 113° diag (~100° HFOV), 2.7 mm f/2.8, FIXED focus — set `bottom.hfov_deg` (calibrate!); day IR-CUT mode |
+| Arducam UC-517 (IMX477 + VCM focus) — *or* Waveshare IMX477 IR-CUT B (bottom) | other CSI, facing DOWN | **both report `imx477`** — pin the role with `cameras.bottom.csi_index` when both are fitted; UC-517: `autofocus: true` + `tuning_file: imx477_af.json` + `dtoverlay=imx477,vcm` at boot; Waveshare: fixed focus, 113° diag, day IR-CUT mode. Calibrate `hfov_deg` — [setup guide](../docs/CAMERA_AND_PIXHAWK_SETUP.md) |
 | Router/LTE | Pi + laptop join the same field LAN | Pi serves `http://<pi-ip>:8000`; laptop pastes that as the Pi link |
+
+Camera roles come from `config.yaml`, and every key has a fallback: `kind`,
+`match_name`/`match_vidpid`, per-role `csi_index` (an explicit libcamera index
+wins; a stale or duplicate index only warns and falls back to the sensor
+match), `autofocus` (`true`/`false`/unset = sensor default) and `tuning_file`
+(a missing file warns and uses the default tuning — the camera still streams).
+`tools/list_cams.py` prints the real sensor strings + indices on your Pi and
+what the config picks, so role assignment is verified, not assumed.
 
 Why router/LTE: the Pi streams + pushes events to whatever can reach
 its HTTP port. A portable field router gives Pi + laptop one LAN (LTE
@@ -36,16 +44,20 @@ uplink on the router is only needed if someone remote must watch too).
 
 ## The 15 m detection math (why the pipeline looks like this)
 
-Bottom lens (Waveshare IMX477 B, ~100° HFOV from the 113° diagonal,
-4056 px wide): at 15 m the footprint is **~36 m wide → 8.9 mm/px**. An
-A3 QR (297 mm side) is **~34 px** in the frame, **~5 px** after a naive
-640 resize. 5 px is hopeless — so:
+Numbers below are computed from the FOV in `config.yaml`, so **they move when
+the lens changes** — recalibrate `hfov_deg` first. With the fitted Arducam
+UC-517 (75° HFOV): at 15 m the footprint is **~23 m wide → 11.4 mm/px binned /
+5.7 mm/px full-res**. An A3 QR (297 mm side) is then **~26 px** binned
+(**~52 px** at full res) but only **~8 px** after a naive 640 resize. (The
+previous Waveshare lens, ~100° HFOV, gave ~36 m and ~17 px binned.) 8 px is
+hopeless — so:
 
-1. **Bottom cam runs YOLO on 3×3 tiles of the frame**: the QR is ~15 px
-   on the 640 network input there. Detectable for a fine-tuned 1-class
-   YOLOv8n — and the 36 m footprint means a 50×50 m fence needs only a
-   few grid rows. (2028×1520 binned @40 fps + 3×3 is the fps/range sweet
-   spot; 4056×3040@10 full-res buys decode margin at 15 m.)
+1. **Bottom cam runs YOLO on 3×3 tiles of the frame**: each tile is
+   ~676 px wide, so the A3 QR lands at ~25 px on the 640 network input.
+   Detectable for a fine-tuned 1-class YOLOv8n — and the 23 m footprint
+   means a 50×50 m fence needs only a few grid rows. (2028×1520 binned
+   @40 fps + 3×3 is the fps/range sweet spot; 4056×3040@10 full-res buys
+   decode margin at 15 m.)
 2. **Detect → crop full-res → upscale → decode**: YOLO proposes the box,
    pyzbar/cv2 decode the zoomed crop (plus full-frame + tiled attempts
    every Nth frame as backup).
@@ -60,11 +72,18 @@ bottom cam takes over). The 26 TOPS HAT runs both streams without
 breaking a sweat (YOLOv8n-640 ≈ milliseconds); without the HAT the
 classical fallback still works at short range.
 
-Bottom lens truth (per `cam.txt` on `main:uploads/`): the Waveshare B is
-fixed-focus, f/2.8, 113° diagonal with <1.5% distortion — no PDAF, so
-verify 15 m sharpness with `tools/cam_probe.py` snaps before trusting
-far decodes, and leave the IR-CUT in day mode (no illuminator onboard).
-Set `rotation_deg` so "image up" == nose direction.
+Bottom lens truth: the **currently fitted** bottom module is the **Arducam
+UC-517** — IMX477 + motorised (VCM) focus, ~75° HFOV on the stock 3.9 mm M12
+lens
+(both `hfov_deg` and the Waveshare's 100°/113° values are kept side by side in
+`config.yaml`: the UC-517 block is active, the Waveshare block is commented out).
+Focus is only real with `dtoverlay=imx477,vcm` at boot **and** the Arducam AF
+tuning file (`imx477_af.json`) loaded — `config.yaml` does the latter via
+`autofocus: true` + `tuning_file`. The previous Waveshare B was fixed-focus,
+f/2.8, 113° diagonal, no PDAF; for either module, measure the ground footprint
+at 15 m rather than trusting the datasheet (steps in
+[`../docs/CAMERA_AND_PIXHAWK_SETUP.md`](../docs/CAMERA_AND_PIXHAWK_SETUP.md)),
+and set `rotation_deg` so "image up" == nose direction.
 
 > **No Pi yet?** Run the whole stack on a Linux laptop against SITL:
 > `SIM_GUIDE.md` (webcam + printed QR + Mission Planner, Gazebo later).
@@ -228,6 +247,14 @@ which server may write it: it asks the origin's `/health` for
 the buttons are blocked (or the MP relay is used, deliberately, via the
 *allow MP bridge fallback* tick).
 
+Every fence state also carries **`fc_capability`** — what the controller says
+about itself (`AUTOPILOT_VERSION`): firmware version, MAVLink 2 on/off, and
+whether the capability bits implement the fence mission type. The UI shows this
+in the `fc firmware` row so a Pixhawk whose firmware predates mission fences is
+visible *before* an upload is attempted. `known: false` means the FC did not
+answer — that is reported as *unproven*, never as ready, and it never disables
+the buttons: the readback comparison stays the thing that decides success.
+
 Details + the executed test matrix + the bench procedure:
 [`../docs/GEOFENCE_UI_TO_PIXHAWK.md`](../docs/GEOFENCE_UI_TO_PIXHAWK.md).
 
@@ -237,7 +264,10 @@ Details + the executed test matrix + the bench procedure:
 
 ## Bench tools
 
-* `tools/fc_probe.py` — FC heartbeat/mode/pos/home/batt, `--fence`, `--plan`
+* `tools/fc_probe.py` — FC heartbeat/mode/pos/home/batt, `--fence`, `--plan`,
+  and **`--fence-check`**: firmware + MAVLink 2 + `FENCE_*` params + stored
+  fence, with a `FENCE-READY` / not-ready verdict and a non-zero exit code, so
+  a new (or clone) Pixhawk can be judged before the UI is asked to upload
 * `tools/cam_probe.py` — list CSI cams, save one snap each
 * `tools/qr_bench.py` — detector+decoder over images, boxes/payload/ms
 * `tools/link_doctor.py` — end-to-end Pi-link diagnosis (local or `--remote`)

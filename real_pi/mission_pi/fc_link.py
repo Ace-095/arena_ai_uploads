@@ -190,6 +190,17 @@ class FCLink:
         self._hb_sources = {}    # (sysid, type) -> count; proves who is on the wire
         self.armed = False
         self.last_hb = 0.0
+        # Protocol marker seen on received vehicle frames: 253 = MAVLink 2.
+        # The FENCE extension mission type does not exist in MAVLink 1.
+        self.mavlink2 = False
+        # Last AUTOPILOT_VERSION (firmware + capability flags), for
+        # "can this FC take a polygon fence?" checks (tools/fc_probe.py).
+        self.ap_version = {}
+        # Memo for the fence-capability answer, which the HTTP layer reads on
+        # every fence state: asking a silent board costs seconds, and the
+        # answer only changes with the board/link. Reset to None to force a
+        # re-read (tests do this after changing the fixture's capabilities).
+        self._cap_cache = None
         self._subs = {}
         self._subs_lock = threading.Lock()
         self._send_lock = threading.Lock()
@@ -461,7 +472,19 @@ class FCLink:
                     time.sleep(min(2.0, 0.1 * (quiet // 20)))
                 continue
             quiet = 0
+            # Protocol marker of the frames the FC actually sends: 253 (0xFD)
+            # is MAVLink 2, 254 (0xFE) is MAVLink 1. The fence extension
+            # mission type only exists in MAVLink 2, so this is the honest
+            # answer to "will a fence upload work on this link?".
+            try:
+                buf = m.get_msgbuf()
+                if buf:
+                    self.mavlink2 = (buf[0] == 253)
+            except Exception:
+                pass
             t = m.get_type()
+            if t == "AUTOPILOT_VERSION":
+                self._record_autopilot_version(m)
             if t == "HEARTBEAT" and m.get_srcSystem() != 51:
                 try:
                     hbsys = m.get_srcSystem()
@@ -850,6 +873,76 @@ class FCLink:
             return float(m.param_value)
         finally:
             self.unsubscribe(q)
+
+    # -- firmware / fence capability (bench checks) ----------------------
+    def _record_autopilot_version(self, m):
+        try:
+            fw = int(m.flight_sw_version)
+            self.ap_version = {
+                "flight_sw_version": fw,
+                "version": "%d.%d.%d" % ((fw >> 24) & 0xFF, (fw >> 16) & 0xFF,
+                                         (fw >> 8) & 0xFF),
+                "fw_type": fw & 0xFF,
+                "capabilities": int(getattr(m, "capabilities", 0) or 0),
+                "vendor_id": getattr(m, "vendor_id", None),
+                "product_id": getattr(m, "product_id", None),
+            }
+        except Exception as e:
+            log.debug("AUTOPILOT_VERSION parse failed: %r", e)
+
+    def get_autopilot_version(self, timeout=4.0):
+        """Ask the FC for AUTOPILOT_VERSION (firmware + capabilities).
+
+        ArduPilot answers MAV_CMD_REQUEST_MESSAGE(512) with
+        param1=AUTOPILOT_VERSION(148); older firmware also answers
+        MAV_CMD_REQUEST_AUTOPILOT_CAPABILITIES(520).
+        """
+        _require_pymavlink()
+        if self.ap_version:
+            return dict(self.ap_version)
+        ts, tc = self.target_system, self.target_component
+        mid = getattr(mavutil.mavlink, "MAVLINK_MSG_ID_AUTOPILOT_VERSION", 148)
+        q = self.subscribe(["AUTOPILOT_VERSION"])
+        try:
+            done = time.monotonic() + timeout
+            self._send(self.conn.mav.command_long_send, ts, tc, 512, 0,
+                       float(mid), 0, 0, 0, 0, 0, 0)
+            # request_capabilities is the pre-4.1 wording; harmless if ignored
+            try:
+                self._send(self.conn.mav.command_long_send, ts, tc, 520, 0,
+                           1, 0, 0, 0, 0, 0, 0)
+            except Exception:
+                pass
+            while time.monotonic() < done:
+                try:
+                    m = q.get(timeout=max(0.01, done - time.monotonic()))
+                except queue.Empty:
+                    break
+                if m.get_srcSystem() != self.target_system:
+                    continue
+                self._record_autopilot_version(m)
+                if self.ap_version:
+                    return dict(self.ap_version)
+                raise FCError("malformed AUTOPILOT_VERSION from FC")
+            return {}
+        finally:
+            self.unsubscribe(q)
+
+    def fence_capability(self):
+        """(mavlink2_ok, fence_ok, text) — what the FC itself advertises.
+
+        capabilities bit MAV_PROTOCOL_CAPABILITY_MISSION_FENCE is the FC
+        saying it implements the FENCE mission type; a Pixhawk 2.4.8 on old
+        firmware does not set it, and the UI upload would fail in the air.
+        """
+        caps = self.ap_version.get("capabilities")
+        M = mavutil.mavlink
+        if caps is None:
+            return None, None, "FC did not report AUTOPILOT_VERSION"
+        m2 = bool(int(caps) & int(getattr(M, "MAV_PROTOCOL_CAPABILITY_MAVLINK2", 0)))
+        fence = bool(int(caps) & int(getattr(M, "MAV_PROTOCOL_CAPABILITY_MISSION_FENCE", 0)))
+        return m2, fence, ("capabilities=0x%X (mavlink2=%s mission_fence=%s)"
+                           % (int(caps), m2, fence))
 
     def set_mode(self, mode, timeout=5.0):
         """DO_SET_MODE with canonical encoding: param1=1 (custom enabled),

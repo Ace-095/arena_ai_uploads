@@ -36,6 +36,7 @@ sys.path.insert(0, os.path.join(PI, "tools"))
 import httpx                          # noqa: E402
 import uvicorn                        # noqa: E402
 
+from pymavlink import mavutil         # noqa: E402
 from fc_link import FCLink            # noqa: E402
 import fake_sitl                      # noqa: E402
 from server import create_app         # noqa: E402
@@ -95,6 +96,21 @@ class FenceE2ETest(unittest.TestCase):
                     "clear": "reject"}.get(want, want)
             self.veh.fence_fault = name
             return {"ok": True, "fault": self.veh.fence_fault}
+
+        @app.post("/__test/caps")
+        async def test_caps(req: Request):
+            """Test-only: change what the fake FC advertises (firmware
+            capability bits, or silence) so the UI's 'can this FC take a
+            fence at all?' line can be driven from the browser script.
+            Also drops the link's memoised capability answer."""
+            body = await req.json()
+            self.veh.ap_version_silent = bool(body.get("silent", False))
+            caps = body.get("caps", None)
+            self.veh.ap_version_caps = None if caps is None else int(caps)
+            self.fc.ap_version = {}
+            self.fc._cap_cache = None
+            return {"ok": True, "caps": self.veh.ap_version_caps,
+                    "silent": self.veh.ap_version_silent}
 
         sock = socket.socket()
         sock.bind(("127.0.0.1", 0))
@@ -456,6 +472,53 @@ class FenceE2ETest(unittest.TestCase):
         self.assertEqual(len(self.veh.fence), 4)
 
     # ==================================================================
+    # 4b-2. Can THIS controller take a fence at all? (the question a Pixhawk
+    #       2.4.8 on old firmware fails) — firmware + MAVLink2 + capability
+    # ==================================================================
+    def test_37_fence_capability_is_readable_before_uploading(self):
+        ver = self.fc.get_autopilot_version(timeout=5.0)
+        self.assertTrue(ver, "no AUTOPILOT_VERSION answer")
+        self.assertEqual(ver["version"], "4.5.7")
+        self.assertTrue(self.fc.mavlink2,
+                        "link must be MAVLink 2 for the fence mission type")
+        m2, fence_ok, text = self.fc.fence_capability()
+        self.assertTrue(m2, text)
+        self.assertTrue(fence_ok, text)
+
+    def test_38_silent_fc_is_reported_as_not_fence_ready(self):
+        """A controller that never answers must NOT be reported as capable.
+
+        Fixture: the fake FC genuinely ignores REQUEST_MESSAGE(148) — the
+        shape of a 2.4.8 whose link/firmware cannot answer. The honest
+        answers are {} from the version getter and 'unknown' (None) from
+        the capability check; silence must never read as 'ready'.
+        """
+        self.veh.ap_version_silent = True
+        ver = self.fc.get_autopilot_version(timeout=2.0)
+        self.assertEqual(ver, {}, "a silent FC must not yield a version")
+        m2, fence_ok, text = self.fc.fence_capability()
+        self.assertIsNone(fence_ok, "silence must not read as fence-capable")
+        self.assertIsNone(m2)
+        self.assertIn("did not report", text)
+
+    def test_39_old_firmware_without_mission_fence_bits_is_not_ready(self):
+        """The classic 2.4.8 case: MAVLink 2 link, firmware without fences.
+
+        It answers AUTOPILOT_VERSION, so the check must dig into the
+        capability bits and report fence_ok=False instead of passing the
+        firmware string through as a green light.
+        """
+        M = mavutil.mavlink
+        self.veh.ap_version_caps = int(M.MAV_PROTOCOL_CAPABILITY_MAVLINK2)
+        ver = self.fc.get_autopilot_version(timeout=5.0)
+        self.assertTrue(ver, "this fixture does answer")
+        m2, fence_ok, text = self.fc.fence_capability()
+        self.assertTrue(m2, text)
+        self.assertFalse(fence_ok,
+                         "firmware without MISSION_FENCE must not be 'ready'")
+        self.assertIn("mission_fence=False", text)
+
+    # ==================================================================
     # 4c. The browser itself: real index.html + app.js button clicks, and the
     #     flight controller's own state afterwards. Closes the whole loop.
     # ==================================================================
@@ -479,11 +542,15 @@ class FenceE2ETest(unittest.TestCase):
         self.assertIn("DONE fence-dom", r.stdout)
 
         # --- and what the FLIGHT CONTROLLER did while the browser clicked ---
-        # The DOM script uploaded the drawn polygon, hit two failure modes and
-        # then cleared. The fake FC is the record of truth for all of it.
+        # The DOM script uploaded the drawn polygon, hit two failure modes,
+        # cleared, then deliberately uploaded once more against a fixture FC
+        # that advertises NO fence support (warning must be shown, upload must
+        # still be attempted) and cleared again. The fake FC is the record of
+        # truth for all of it, so: empty now, two clears, no overlapping
+        # transfers.
         self.assertEqual(self.veh.fence, [],
                          "the last UI action was 'clear', so the FC must be empty")
-        self.assertEqual(self.veh.fence_clears, 1)
+        self.assertEqual(self.veh.fence_clears, 2)
         self.assertEqual(self.veh.concurrent_uploads, 0,
                          "the browser caused overlapping fence transfers")
         # 3 uploads reached the FC: the good one, the 'reject' one (refused at
@@ -493,6 +560,51 @@ class FenceE2ETest(unittest.TestCase):
         self.assertGreaterEqual(self.veh.fence_writes, 1)
         # the UI must never have left the FC holding a half-written polygon
         self.assertIn(len(self.veh.fence), (0, 4))
+
+    def test_41_probe_fence_check_agrees_with_the_fixture_firmware(self):
+        """`tools/fc_probe.py --fence-check` is the bench verdict the operator
+        actually reads, so it must say the same thing the API does — and its
+        exit code must never be 0 on an unproven board."""
+        import contextlib
+        import io
+
+        import fc_probe
+
+        M = mavutil.mavlink
+
+        def run():
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = fc_probe.fence_check(self.fc)
+            return rc, buf.getvalue()
+
+        self.fc.ap_version = {}                        # forget any cached answer
+        rc, out = run()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("FENCE-READY", out)
+        self.assertIn("fence mission type", out)       # the capability line
+
+        # old firmware: answers, but without MISSION_FENCE
+        self.veh.ap_version_caps = int(M.MAV_PROTOCOL_CAPABILITY_MAVLINK2)
+        self.fc.ap_version = {}
+        rc, out = run()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("does NOT implement the fence mission type", out)
+        self.assertIn("NOT fence-ready", out)
+
+        # a board that never answers the capability question at all
+        self.veh.ap_version_caps = None
+        self.veh.ap_version_silent = True
+        self.fc.ap_version = {}
+        rc, out = run()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("did not answer AUTOPILOT_VERSION", out)
+
+        # and the healthy board is read back as ready once the fixture is sane
+        self.veh.ap_version_silent = False
+        self.fc.ap_version = {}
+        rc, out = run()
+        self.assertEqual(rc, 0, out)
 
     # ==================================================================
     # 5. The exact bytes the browser sends

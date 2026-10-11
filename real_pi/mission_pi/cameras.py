@@ -402,25 +402,61 @@ class Camera(_BaseCamera):
     kind = "rpi"
 
     def __init__(self, name, index, size, hfov_deg, facing,
-                 rotation_deg=0, jpeg_quality=80):
+                 rotation_deg=0, jpeg_quality=80, autofocus=None,
+                 tuning_file=None):
         super().__init__(name, index, size, hfov_deg, facing,
                          rotation_deg, jpeg_quality)
         self._picam = None
+        # None = "let the sensor decide" (imx708 autofocuses by default, every
+        # other sensor does not). True/False = explicit config decision.
+        # Needed because a motorised-focus third-party module (Arducam UC-517 =
+        # IMX477 + VCM lens) IS autofocus, while a Waveshare IMX477 IR-CUT is
+        # NOT — same sensor string, opposite answer.
+        self.autofocus = None if autofocus is None else bool(autofocus)
+        # Arducam's motorised-focus cameras need THEIR tuning file for AfMode /
+        # LensPosition to exist at all on Pi 5 (pisp IPA):
+        #   /usr/share/libcamera/ipa/rpi/pisp/imx477_af.json
+        # Without it the camera opens fine but has no focus controls.
+        self.tuning_file = str(tuning_file).strip() if tuning_file else None
+
+    def wants_autofocus(self):
+        """Explicit config wins; otherwise only the Pi Cam 3 (imx708)."""
+        if self.autofocus is not None:
+            return self.autofocus
+        return "imx708" in (self.model or "")
+
+    def _load_tuning(self):
+        if not self.tuning_file:
+            return None
+        try:
+            tuning = Picamera2.load_tuning_file(self.tuning_file)
+        except Exception as e:
+            # Not fatal: a missing tuning file must degrade to the default
+            # tuning (camera still streams), never stop the mission.
+            log.warning("%s tuning file %r not loadable (%r) — using the "
+                        "default tuning; autofocus controls may be absent",
+                        self.name, self.tuning_file, e)
+            return None
+        log.info("%s using tuning file %s", self.name, self.tuning_file)
+        return tuning
 
     def _open(self):
         if not _HAVE_PICAM:
             raise RuntimeError("picamera2 not installed: %r" % (_PICAM_ERR,))
-        self._picam = Picamera2(self.index)
+        tuning = self._load_tuning()
+        self._picam = (Picamera2(self.index, tuning=tuning)
+                       if tuning is not None else Picamera2(self.index))
         cfg = self._picam.create_video_configuration(
             main={"size": tuple(self.size), "format": "RGB888"})
         self._picam.configure(cfg)
         controls = {"AeEnable": True}
-        if "imx708" in self.model:
+        if self.wants_autofocus():
             try:
                 from libcamera import controls as CTRLS
                 controls["AfMode"] = CTRLS.AfModeEnum.Continuous
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("%s: autofocus requested but unavailable: %r",
+                          self.name, e)
         try:
             self._picam.set_controls(controls)
         except Exception as e:
@@ -467,7 +503,7 @@ class Camera(_BaseCamera):
         for k in ("contrast", "saturation", "sharpness"):
             if tuning is not None and k in tuning:
                 ctrls[k.capitalize()] = max(0.0, float(t[k]))
-        if tuning is not None and "af_mode" in tuning and "imx708" in (self.model or ""):
+        if tuning is not None and "af_mode" in tuning and self.wants_autofocus():
             try:
                 from libcamera import controls as LC
                 ctrls["AfMode"] = {"manual": LC.AfModeEnum.Manual,
@@ -983,13 +1019,46 @@ class CameraRig:
                     c = Camera(name, idx, ccfg.get("size", [1920, 1080]),
                                ccfg.get("hfov_deg", 66.0), facing,
                                ccfg.get("rotation_deg", 0),
-                               ccfg.get("jpeg_quality", 80))
+                               ccfg.get("jpeg_quality", 80),
+                               autofocus=ccfg.get("autofocus"),
+                               tuning_file=ccfg.get("tuning_file"))
                     c.model = model
                     c.device_desc = "csi %s (idx %d)" % (model, idx)
                     return c
 
-                # pass 1: explicit role match_name (e.g. imx477 -> bottom)
                 used = set()
+                # pass 0: explicit CSI index pin (cameras.<role>.csi_index).
+                # Required when two cameras report the SAME sensor — e.g. an
+                # Arducam UC-517 and a Waveshare module are both "imx477", so
+                # match_name cannot tell them apart, and which one becomes
+                # "bottom" decides the whole 15 m camera model (lens, FOV,
+                # focus). Pinning the libcamera index makes roles certain.
+                for name, ccfg, facing in slots:
+                    if name in assigned:
+                        continue
+                    want_idx = ccfg.get("csi_index")
+                    if want_idx in (None, "", "auto"):
+                        continue
+                    try:
+                        want_idx = int(want_idx)
+                    except (TypeError, ValueError):
+                        log.warning("%s csi_index %r is not an integer — "
+                                    "ignoring it", name, ccfg.get("csi_index"))
+                        continue
+                    hit = next(((i, m) for i, m, _ in found if i == want_idx), None)
+                    if hit is None or want_idx in used:
+                        log.warning("%s csi_index %d not available (found: %s)%s",
+                                    name, want_idx,
+                                    [i for i, _m, _ in found],
+                                    " — already taken" if want_idx in used else "")
+                        continue
+                    i, m = hit
+                    assigned[name] = _mk(name, i, m, ccfg, facing)
+                    used.add(i)
+                    log.info("%s pinned to CSI index %d (%s) by csi_index",
+                             name, i, m)
+
+                # pass 1: explicit role match_name (e.g. imx477 -> bottom)
                 for name, ccfg, facing in slots:
                     if name in assigned:
                         continue

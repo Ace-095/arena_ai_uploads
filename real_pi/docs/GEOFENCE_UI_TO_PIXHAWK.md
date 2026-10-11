@@ -79,6 +79,23 @@ operator decision. The UI *reads* those parameters and shows them (row
 `enforcement`) precisely so "vertices stored" cannot be mistaken for "the
 vehicle will stop at the boundary".
 
+It also asks the controller what it *is* before offering to write to it
+(`AUTOPILOT_VERSION`, `MAV_CMD_REQUEST_MESSAGE(148)`), and reports the answer in
+the UI's `fc firmware` row through `fc_capability` in every fence state:
+
+| field | meaning |
+|---|---|
+| `known` | the FC answered — `false` means fence support is **unproven**, not absent |
+| `mavlink2` | capability bit + the frame marker actually seen on the wire |
+| `mission_fence` | `MAV_PROTOCOL_CAPABILITY_MISSION_FENCE` — the FC implements the fence mission type |
+| `version` | e.g. `4.5.7` (with `fw_type`: 3 = ArduCopter) |
+
+A **definite** `mission_fence: false` (a 2.4.8 on firmware that predates mission
+fences) turns the row red and logs a WARN, but deliberately does **not** disable
+the buttons: the operator may still attempt the upload, and the readback check
+remains the thing that decides success. An **unknown** answer stays neutral —
+unproven capability must never be presented as either green or blocked.
+
 ---
 
 ## 2. Wire format (why Mission Planner is not needed)
@@ -150,7 +167,13 @@ aircraft.
 | E32 | Two clicks at once | never two transfers in flight (fake counts overlapping `MISSION_COUNT`), every `200` is readback-confirmed, final FC fence is exactly the drawn polygon |
 | E35 | **Negative control:** raw MAVLink client sends `param1 != count`, `command=16`, wrong frame | FC refuses (`INVALID_PARAM1` / `UNSUPPORTED`); the same client with legal items is accepted — proves the suite is not vacuous |
 | E40 | The exact JSON `map.js` builds (`{vertices:[{lat,lon},…]}`) | accepted; reply carries every field `renderFence()` reads |
-| E45 | **Real browser buttons → Pi → FC.** `index.html` + `app.js` in jsdom, clicking `UPLOAD FENCE`, `refresh from FC`, `clear on FC` against this Pi | UI shows `MATCH`/`LOADED on FC`; the fake FC afterwards is empty with exactly 1 clear, 0 concurrent transfers |
+| E37 | **Can this FC take a fence at all?** `AUTOPILOT_VERSION` (REQUEST_MESSAGE 148) read before any upload | firmware `4.5.7`, link is MAVLink 2, capability bits report `mission_fence` |
+| E38 | FC that never answers 148 (real 2.4.8 risk) | version getter returns `{}`, capability reads **unknown** (`None`) — silence is never "ready" |
+| E39 | FC answers but advertises MAVLink 2 **without** `MISSION_FENCE` (old firmware) | `mavlink2=true`, `mission_fence=false`, text says which bit is missing |
+| E41 | `tools/fc_probe.py --fence-check` run against the same three fixtures | exit 0 + `FENCE-READY` only for the healthy board; the old-firmware and silent boards both exit 1 with the reason named |
+| E45 | **Real browser buttons → Pi → FC.** `index.html` + `app.js` in jsdom, clicking `UPLOAD FENCE`, `refresh from FC`, `clear on FC` against this Pi | UI shows `MATCH`/`LOADED on FC`; the fake FC afterwards is empty with exactly 2 clears, 0 concurrent transfers |
+| E46 | Same browser run, fixture FC that advertises no fence support | `fc firmware` row reads `NO fence mission type` (red) **before** upload; the upload is still attempted and readback-verified — warns, never silently blocks |
+| E47 | Same browser run, fixture FC that is silent | `fc firmware` row reads `unknown (FC did not report AUTOPILOT_VERSION)`; no false green, no block |
 
 ### 3.3 The UI's own routing — `mission-ui/tests/test_writer_detection_dom.cjs`
 
@@ -264,6 +287,7 @@ came back:
 |---|---|
 | `GET /health` | `"service": "mission_pi"`, `"role": "fence-writer"`, `"link": true`, `"fc": {"device": "tcp:127.0.0.1:5781", "armed": false}` |
 | `GET /api/fence` (empty FC) | `confirmed: true`, `vertex_count: 0`, plus read-only `fc_params` (`FENCE_ENABLE: 1`, `FENCE_TYPE: 12`, `FENCE_ACTION: 1`) |
+| `tools/fc_probe.py --fence-check` | same FC through the bench probe: firmware `4.5.7` (type 3 = ArduCopter), `MAVLink 2`, `FENCE_*` params, stored fence, verdict `FENCE-READY` (exit 0) |
 | `POST /api/fence` (4-vertex square) | `200`, `confirmed: true`, `fc_count: 4`, `fc_uploaded: true`, **and the vehicle's own fence now held those 4 vertices** |
 | arm the vehicle, then `POST` | `409 "Disarm before editing fence"`, `confirmed: false`, nothing written |
 | arm the vehicle, then `DELETE` | `409`, same reason |
@@ -285,7 +309,11 @@ restarted on the same port, without restarting `mission_pi`.
    expect. Check those in Mission Planner / with `tools/param_probe.py` before
    trusting the boundary. The UI shows them read-only in the `enforcement` row.
 2. **The real Pixhawk.** Everything above ran against the fake vehicle. The
-   bench procedure in §4 is the remaining step, and only you can run it.
+   bench procedure in §4 is the remaining step, and only you can run it. For a
+   **2.4.8 clone** the two things that decide success are firmware vintage and
+   flash size (2 MB → current ArduCopter, 1 MB → `Pixhawk1-1M` builds that
+   predate mission fences): run `tools/fc_probe.py --fence-check`, and see
+   `docs/CAMERA_AND_PIXHAWK_SETUP.md` §2 for the full list of causes and fixes.
 3. **In-flight behaviour.** Fence edits while armed are refused by design, so
    nothing here tests changing a boundary in flight (ArduPilot does not support
    that safely either).

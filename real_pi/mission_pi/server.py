@@ -608,6 +608,34 @@ def create_app(rig, mission, fc, streams=None, bringup=None, pulse_s=2.0,
     from contextlib import nullcontext
     fence_lock = asyncio.Lock()
 
+    # Firmware/MAVLink capability of the attached FC, memoised ON THE LINK:
+    # the answer is a property of the board, and on a silent board the request
+    # itself costs seconds. A REAL 2.4.8 that cannot take a mission fence must
+    # be visible in the UI BEFORE an upload is attempted, never only as a 502.
+    def read_fence_capability():
+        if not fc or not fc.link_ok():
+            return {"known": False, "mavlink2": None, "mission_fence": None,
+                    "text": "no FC link"}
+        now = time.monotonic()
+        cached = getattr(fc, "_cap_cache", None)
+        if cached and now - cached["t"] < (60.0 if cached["value"].get("known") else 10.0):
+            return cached["value"]
+        try:
+            if not getattr(fc, "ap_version", None):
+                fc.get_autopilot_version(timeout=2.0)
+            m2, fence_ok, text = fc.fence_capability()
+        except Exception as e:                    # never break the fence page
+            return {"known": False, "mavlink2": None, "mission_fence": None,
+                    "text": "capability read failed: %s" % e}
+        value = {"known": fence_ok is not None, "mavlink2": m2,
+                 "mission_fence": fence_ok, "text": text,
+                 "version": (getattr(fc, "ap_version", None) or {}).get("version")}
+        try:
+            fc._cap_cache = {"t": now, "value": value}
+        except Exception:                         # a link without the memo
+            pass
+        return value
+
     def fence_state(vertices, confirmed=False, reason="", **extra):
         verts = [tuple(v) for v in vertices]
         return {"ok": confirmed, "source": "pi",
@@ -621,6 +649,7 @@ def create_app(rig, mission, fc, streams=None, bringup=None, pulse_s=2.0,
                 "fence": verts, "fc_fence": verts if confirmed else [],
                 "fc_count": len(verts) if confirmed else 0,
                 "vertices_latlon": [{"lat": a, "lon": b} for a, b in verts],
+                "fc_capability": read_fence_capability(),
                 **extra}
 
     def read_fence_params():

@@ -35,10 +35,14 @@ class FakeCSI(C._BaseCamera):
     kind = "rpi"
 
     def __init__(self, name, index, size, hfov_deg, facing,
-                 rotation_deg=0, jpeg_quality=80):
+                 rotation_deg=0, jpeg_quality=80, autofocus=None,
+                 tuning_file=None):
         super().__init__(name, index, size, hfov_deg, facing, rotation_deg,
                          jpeg_quality)
         self.kind = "rpi"
+        # recorded so the tests can prove config -> object wiring
+        self.autofocus = None if autofocus is None else bool(autofocus)
+        self.tuning_file = tuning_file
         self._open_calls = 0
 
     def _open(self):
@@ -86,6 +90,9 @@ class HW:
 
 REAL_LIST_CAMERAS = C.list_cameras
 REAL_V4L2 = C.v4l2_capture_devices
+# make_rig() swaps C.Camera for FakeCSI and never restores it, so capture
+# the real class up-front for tests that need its own methods.
+REAL_CAMERA = C.Camera
 
 CFG = {"cameras": {"auto_detect": True, "single_cam_role": "bottom",
                    "front": {"kind": "auto", "match_name": "imx708",
@@ -261,6 +268,90 @@ def test_explicit_kind_wins():
     hw.unpatch(REAL_LIST_CAMERAS, REAL_V4L2)
 
 
+def test_csi_index_pin_beats_identical_sensors():
+    """The Arducam UC-517 and a Waveshare module BOTH report "imx477".
+
+    match_name cannot tell them apart, so without a pin the wrong physical
+    camera can become "bottom" — and the bottom lens is what the whole 15 m
+    QR model (FOV, footprint, focus) is built on.
+    """
+    hw = HW()
+    # two IMX477s: an Arducam UC-517 and a Waveshare IR-CUT module
+    hw.csi = [(0, "imx477", {}), (1, "imx477", {})]
+    hw.patch()
+    cfg = {"cameras": {"auto_detect": True,
+                       "front": {"kind": "auto", "match_name": "imx708",
+                                 "size": [1920, 1080], "hfov_deg": 66.0},
+                       "bottom": {"kind": "auto", "match_name": "imx477",
+                                  "csi_index": 1, "size": [2028, 1520],
+                                  "hfov_deg": 75.0}}}
+    a = make_rig(cfg).detect()
+    check("csi_index: bottom pinned to index 1 (not 'first imx477 found')",
+          a.get("cam2") is not None and a["cam2"].index == 1,
+          repr({k: (c.index, c.model) for k, c in a.items()}))
+    check("csi_index: bottom keeps its own lens numbers",
+          a["cam2"].hfov_deg == 75.0)
+    check("csi_index: the other camera takes the free slot",
+          a.get("cam1") is not None and a["cam1"].index == 0,
+          repr({k: (c.index, c.model) for k, c in a.items()}))
+
+    # pinning is optional and never fatal: a bad/absent index falls back to
+    # the sensor match instead of leaving the role empty
+    cfg["cameras"]["bottom"]["csi_index"] = 9
+    b = make_rig(cfg).detect()
+    check("csi_index: impossible index falls back to sensor match",
+          b.get("cam2") is not None and b["cam2"].model == "imx477",
+          repr({k: (c.index, c.model) for k, c in b.items()}))
+    cfg["cameras"]["bottom"]["csi_index"] = "not-a-number"
+    c = make_rig(cfg).detect()
+    check("csi_index: junk value falls back to sensor match",
+          c.get("cam2") is not None and c["cam2"].model == "imx477")
+    hw.unpatch(REAL_LIST_CAMERAS, REAL_V4L2)
+
+
+def test_csi_autofocus_and_tuning_are_config_driven():
+    """A motorised-focus IMX477 (UC-517) must be able to autofocus from
+    config, and the fixed-focus Waveshare must NOT be told to."""
+    hw = HW()
+    hw.csi = [(0, "imx708", {}), (1, "imx477", {})]
+    hw.patch()
+    cfg = {"cameras": {"auto_detect": True,
+                       "front": {"kind": "auto", "match_name": "imx708",
+                                 "size": [1920, 1080], "hfov_deg": 66.0,
+                                 "autofocus": True},
+                       "bottom": {"kind": "auto", "match_name": "imx477",
+                                  "size": [2028, 1520], "hfov_deg": 75.0,
+                                  "autofocus": True,
+                                  "tuning_file": "imx477_af.json"}}}
+    a = make_rig(cfg).detect()
+    check("autofocus: forwarded to the CSI object",
+          a["cam2"].autofocus is True)
+    check("tuning_file: forwarded to the CSI object",
+          a["cam2"].tuning_file == "imx477_af.json")
+    check("tuning_file: not invented for roles that did not ask",
+          getattr(a["cam1"], "tuning_file", None) is None)
+    hw.unpatch(REAL_LIST_CAMERAS, REAL_V4L2)
+
+    # the sensor-class rule itself (no hardware needed)
+    d = REAL_CAMERA("cam2", 1, (2028, 1520), 75.0, "bottom")
+    check("autofocus: unset + non-imx708 -> off (old behaviour kept)",
+          d.wants_autofocus() is False)
+    d.model = "imx708"
+    check("autofocus: unset + imx708 -> on (old behaviour kept)",
+          d.wants_autofocus() is True)
+    d.autofocus = False
+    check("autofocus: explicit false beats the sensor default",
+          d.wants_autofocus() is False)
+    e = REAL_CAMERA("cam2", 1, (2028, 1520), 75.0, "bottom", autofocus=True)
+    e.model = "imx477"
+    check("autofocus: explicit true enables it on an imx477 (UC-517)",
+          e.wants_autofocus() is True)
+    # a tuning file that does not exist must degrade, never raise
+    e.tuning_file = "definitely_not_a_tuning_file.json"
+    check("tuning_file: missing file degrades to None, no crash",
+          e._load_tuning() is None)
+
+
 if __name__ == "__main__":
     test_csi_sensor_roles()
     test_usb_vidpid_match_and_fallback()
@@ -268,8 +359,10 @@ if __name__ == "__main__":
     test_rescan_keeps_unchanged_and_adopts_new()
     test_rescan_drops_vanished()
     test_explicit_kind_wins()
+    test_csi_index_pin_beats_identical_sensors()
+    test_csi_autofocus_and_tuning_are_config_driven()
     print("-" * 60)
     if FAILS:
-        print("FAILED %d/%d: %s" % (len(FAILS), 6, ", ".join(FAILS)))
+        print("FAILED %d/%d: %s" % (len(FAILS), 8, ", ".join(FAILS)))
         sys.exit(1)
     print("all cam-autodetect tests passed")

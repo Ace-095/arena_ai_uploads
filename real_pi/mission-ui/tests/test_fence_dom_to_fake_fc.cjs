@@ -16,7 +16,8 @@ if (!base) throw new Error('Use the Python fixture, not a live flight controller
 
 async function main() {
   const h = createHarness(base);
-  const { $, calls, vertices, setPolygon, boot, settle, click, writes, lastBody, fault } = h;
+  const { $, calls, vertices, setPolygon, boot, settle, click, writes, lastBody,
+          fault, caps } = h;
   await boot();
 
   // connect the Pi link (the only writer this page may use)
@@ -32,6 +33,11 @@ async function main() {
   assert.deepEqual(lastBody().vertices, vertices);
   assert.match($('fReadback').textContent, /MATCH/, 'the FC readback must be shown as verified');
   assert.match($('fState').textContent, /LOADED on FC/);
+  // the panel must state what the FC itself advertises BEFORE an upload
+  assert.match($('fCapability').textContent, /fw 4\.5\.7/,
+               'the FC firmware version must be visible');
+  assert.match($('fCapability').textContent, /MAVLink 2/);
+  assert.match($('fCapability').textContent, /fence mission type OK/);
   assert.equal($('fVerts').textContent, '4');
   assert.match($('pConverted').textContent, /FC verified: 4 vertices/);
   console.log('PASS DOM: upload -> Pi -> FC, readback MATCH shown');
@@ -77,6 +83,36 @@ async function main() {
   assert.match($('pConverted').textContent, /cleared \(FC readback/);
   assert.equal($('fVerts').textContent, '0');
   console.log('PASS DOM: clear -> Pi -> FC, readback confirmed');
+
+  // 6. A Pixhawk 2.4.8 on old firmware: MAVLink 2 link, but the firmware does
+  //    not implement the fence mission type. The panel must SAY SO before the
+  //    operator presses UPLOAD — and the UI must not silently over-block.
+  await caps({caps: 8192});                 // MAVLINK2 only, no MISSION_FENCE
+  calls.length = 0;
+  await click('btnFenceRefresh');
+  assert.match($('fCapability').textContent, /MAVLink 2/);
+  assert.match($('fCapability').textContent, /NO fence mission type/,
+               'an FC without fence support must be flagged');
+  assert.match($('fCapability').style.color, /rgb\(255, 107, 107\)/,
+               'the warning must be visually distinct');
+  calls.length = 0;
+  await click('btnFenceApply');
+  assert.equal(calls.filter((c) => c.url.endsWith('/api/fence')).length, 1,
+               'the operator may still attempt it — warn, never silently block');
+  console.log('PASS DOM: old-firmware FC flagged before upload, not over-blocked');
+  // put the fixture back where the earlier steps left it (FC holding nothing),
+  // which is also the invariant the Python side asserts afterwards
+  calls.length = 0;
+  await click('btnFenceClear');
+  assert.equal($('fVerts').textContent, '0');
+
+  // 7. A silent FC (no AUTOPILOT_VERSION at all) reads as unknown, not as OK
+  //    and not as a hard failure.
+  await caps({caps: null, silent: true});
+  await click('btnFenceRefresh');
+  assert.match($('fCapability').textContent, /^unknown/);
+  console.log('PASS DOM: silent FC -> "unknown", never a false green');
+  await caps({caps: null, silent: false});
 
   h.dom.window.close();
   console.log('DONE fence-dom');

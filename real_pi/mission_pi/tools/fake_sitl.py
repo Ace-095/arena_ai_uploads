@@ -76,11 +76,17 @@ DEFAULT_PLAN = [
 # few ARRAY fields we send are listed explicitly (everything else zero-fills
 # as a scalar, which struct.pack coerces for both int and float fields).
 ARRAY_FIELDS = {"voltages": 10, "voltages_ext": 4, "q": 4, "rotation": 4}
+# uint8[N] fields need a SEQUENCE of the right length; a scalar 0 packs as
+# "'int' object is not subscriptable" (AUTOPILOT_VERSION.uid2 hit this).
+BYTE_ARRAY_FIELDS = {"flight_custom_version": 8, "middleware_custom_version": 8,
+                     "os_custom_version": 8, "uid2": 18}
 TEXT_FIELDS = ("param_id", "text", "name")
 
 
 def _zero_for(name):
     """Sane empty value for an unset MAVLink field."""
+    if name in BYTE_ARRAY_FIELDS:
+        return bytes(BYTE_ARRAY_FIELDS[name])
     if name in ARRAY_FIELDS:
         return [0] * ARRAY_FIELDS[name]
     if name in TEXT_FIELDS:
@@ -168,6 +174,14 @@ class FakeVehicle:
         # and validates every item strictly (cmd 5001, param1 == count).
         # fence_fault makes the fake lie on purpose so the UI's honesty can
         # be tested: 'reject' | 'discard' | 'corrupt' | 'stall'.
+        # --- firmware/capability fixtures ---------------------------------
+        # A Pixhawk 2.4.8 on old firmware / a MAVLink-1 link fails the fence
+        # capability check. Both real failure shapes can be reproduced here:
+        #   ap_version_silent : never answers REQUEST_MESSAGE(148)
+        #   ap_version_caps   : answers, but with different capability bits
+        #                       (e.g. drop MISSION_FENCE = old firmware)
+        self.ap_version_silent = False
+        self.ap_version_caps = None
         self.fence_fault = None
         self.fence_writes = 0                       # committed writes
         self.fence_clears = 0
@@ -382,7 +396,30 @@ class FakeVehicle:
             ack(M.MAV_RESULT_UNSUPPORTED)
             c.note("unsupported cmd %d" % cmd)
 
+    def _autopilot_version_msg(self):
+        """What a modern ArduCopter reports: version + capability bits.
+
+        capabilities advertises MAVLink2 + MISSION_FENCE, which is exactly
+        what tools/fc_probe.py --fence-check looks for.
+        """
+        fw = (4 << 24) | (5 << 16) | (7 << 8) | 3          # 4.5.7, type 3 = ArduCopter
+        caps = (int(M.MAV_PROTOCOL_CAPABILITY_MAVLINK2) |
+                int(M.MAV_PROTOCOL_CAPABILITY_MISSION_FENCE) |
+                int(M.MAV_PROTOCOL_CAPABILITY_MISSION_FLOAT))
+        if self.ap_version_caps is not None:
+            caps = int(self.ap_version_caps)
+        return _mk(M.MAVLink_autopilot_version_message,
+                   capabilities=caps, flight_sw_version=fw,
+                   board_version=0x020A0000,                       # "board hash"
+                   vendor_id=0x1209, product_id=0x5741)
+
     def _send_msgid(self, c, msgid):
+        if msgid == 148:                                # AUTOPILOT_VERSION
+            if self.ap_version_silent:
+                # emulate an FC that does not know this request at all
+                return
+            c.send(self._autopilot_version_msg())
+            return
         if msgid == 242:                                # HOME_POSITION
             c.send(self._home_msg())
         elif msgid == 33:                               # GLOBAL_POSITION_INT

@@ -57,6 +57,14 @@ The UI finds out which server it is talking to from `GET /health`
 normally served by the **bridge on the laptop** — treating that origin as "the
 Pi" is what once sent fence writes to a URL the bridge does not implement.
 
+The `fc firmware` row reports what the connected controller says about itself
+(firmware version, MAVLink 2, and whether its capability bits implement the
+fence mission type). A controller that answers **without** fence support turns
+the row red *before* you press UPLOAD — a Pixhawk 2.4.8 on old firmware cannot
+store a mission fence, and that must not first appear as a 502. A controller
+that does not answer at all reads `unknown`: unproven, never green, and it does
+not disable the buttons — the readback comparison still decides success.
+
 Full protocol details, the executed test matrix and the bench procedure are in
 [`../docs/GEOFENCE_UI_TO_PIXHAWK.md`](../docs/GEOFENCE_UI_TO_PIXHAWK.md).
 

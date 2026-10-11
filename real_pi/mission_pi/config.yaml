@@ -69,17 +69,58 @@ cameras:
       enabled: true
       profile: front_qr_boost
       software_mode: qr_boost
+  # --------------------------------------------------------------------------
+  # BOTTOM = the downward QR camera. Two IMX477 modules fit here and they are
+  # NOT interchangeable: both report the sensor string "imx477", but the lens,
+  # the FOV and the focus mechanism differ. Get the lens numbers right or the
+  # 15 m footprint / coverage grid / detection math is wrong.
+  #
+  #   Arducam UC-517  = IMX477 HQ module + motorised (VCM) focus lens.
+  #                     Autofocus works, but only with Arducam's tuning file,
+  #                     and the Pi 5 boot config must load the VCM driver:
+  #                       /boot/firmware/config.txt
+  #                         camera_auto_detect=0
+  #                         [all]
+  #                         dtoverlay=imx477,vcm
+  #                       (append ,cam0 if that camera is on the CAM0 port)
+  #                     Check the tuning file exists:
+  #                       ls /usr/share/libcamera/ipa/rpi/pisp/imx477_af.json
+  #                     Boot config, cable and FOV measuring:
+  #                       ../docs/CAMERA_AND_PIXHAWK_SETUP.md
+  #   Waveshare IMX477 IR-CUT B = fixed focus, 2.7 mm, 113 deg diagonal.
+  #
+  # After any hardware change run `python3 tools/list_cams.py`: it prints the
+  # real sensor string + libcamera index for THIS Pi and what these keys
+  # assign. If more than one camera reports imx477, uncomment csi_index so
+  # "bottom" is a certainty instead of enumeration order.
+  # --------------------------------------------------------------------------
   bottom:
     kind: auto
-    match_name: imx477       # CSI: Waveshare IMX477 IR-CUT B (113 deg diag)
+    match_name: imx477       # UC-517 and Waveshare both report imx477
+    # csi_index: 1           # pin the exact libcamera index for this role
+                             # (needed when two cameras share a sensor string)
     match_vidpid: ""
     size: [2028, 1520]       # 40 fps binned — SNR + fps sweet spot for 15 m
-    hfov_deg: 100.0
-    vfov_deg: 75.0
-    diagonal_fov_deg: 113.0
-    focal_length_mm: 2.7
+    # --- Arducam UC-517 (ACTIVE) ------------------------------------------
+    # Vendor figures for the motorised-focus module's stock M12 lens
+    # (3.9 mm f/2.8, quoted 75 deg H). Arducam ships other lenses on the same
+    # sensor (6 mm CS-mount 65 deg H, 100 deg H AF module), so MEASURE the
+    # real ground footprint at 15 m before trusting any of these four numbers
+    # -- hfov/vfov drive the footprint, mm/px, coverage grid and cue geometry.
+    hfov_deg: 75.0
+    vfov_deg: 60.0
+    diagonal_fov_deg: 90.0
+    focal_length_mm: 3.9
     aperture: 2.8
-    autofocus: false         # fixed focus — verify 15 m sharpness first!
+    autofocus: true          # VCM lens: needs tuning_file + the ,vcm overlay
+    tuning_file: imx477_af.json   # Arducam AF tuning for the Pi 5 (pisp) IPA
+    # --- Waveshare IMX477 IR-CUT B (previous hardware; uncomment to revert) -
+    # hfov_deg: 100.0
+    # vfov_deg: 75.0
+    # diagonal_fov_deg: 113.0
+    # focal_length_mm: 2.7
+    # aperture: 2.8
+    # autofocus: false       # fixed focus — verify 15 m sharpness first!
     rotation_deg: 0
     jpeg_quality: 80
     qr_boost:

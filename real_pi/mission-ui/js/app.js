@@ -153,6 +153,35 @@ function renderFence(d) {
         + 'Vertices stored on the FC do not by themselves enforce a breach.';
     }
   }
+  if ($('fCapability')) {
+    // Does THIS flight controller implement the fence mission type at all?
+    // A 2.4.8 on old firmware answers the link but cannot store a fence —
+    // better to say so before the operator presses UPLOAD.
+    const c = d.fc_capability || null;
+    const el = $('fCapability');
+    if (!c || !c.known) {
+      el.textContent = 'unknown' + (c && c.text ? ' (' + c.text + ')' : '');
+      el.style.color = '';
+      el.title = 'The FC did not report AUTOPILOT_VERSION, so fence support '
+        + 'is unproven. The upload will still be attempted and verified.';
+    } else {
+      const bits = (c.version ? 'fw ' + c.version + ' · ' : '')
+        + (c.mavlink2 ? 'MAVLink 2' : 'MAVLink 1')
+        + ' · ' + (c.mission_fence ? 'fence mission type OK' : 'NO fence mission type');
+      el.textContent = bits;
+      el.style.color = c.mission_fence ? '#5fd97a' : '#ff6b6b';
+      el.title = c.text || '';
+      if (!c.mission_fence && S._lastFenceCap !== 'no') {
+        S._lastFenceCap = 'no';
+        log('WARN', 'fence: this FC reports no fence mission type — '
+          + 'update the firmware (or fix the MAVLink 2 link) before relying on a fence upload.');
+      } else if (!c.mavlink2 && S._lastFenceCap !== 'v1') {
+        S._lastFenceCap = 'v1';
+        log('WARN', 'fence: the link is MAVLink 1, which has no fence mission '
+          + 'type — set SERIALx_PROTOCOL=2 on the FC.');
+      }
+    }
+  }
   if (d.reason && d.reason !== S._lastFenceReason) {
     S._lastFenceReason = d.reason;
     log(d.confirmed ? 'INFO' : 'WARN', 'fence: ' + d.reason);
