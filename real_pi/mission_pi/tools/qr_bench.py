@@ -29,8 +29,22 @@ def main():
         sys.exit("need opencv-python for qr_bench")
     from detector import get_detector, detect_tiles
     from decoder import decode_frame
-    det = get_detector({"kind": args.detector, "hef_path": args.hef,
-                        "conf_thr": args.conf})
+    # An explicit --detector hailo without the HAT/HEF must SAY SO and still
+    # produce a bench number (the CPU ladder is what the mission falls back to
+    # as well) — a traceback here tells the operator nothing.
+    try:
+        det = get_detector({"kind": args.detector, "hef_path": args.hef,
+                            "conf_thr": args.conf})
+    except Exception as e:
+        if args.detector != "hailo":
+            raise
+        print("[detector] HAILO unavailable (%r)" % e)
+        print("[detector] falling back to the CPU ladder — the mission does "
+              "the same (detector.kind: auto). Check `hailortcli scan` and "
+              "that %s exists (compile it on x86: training/compile_hef.md)."
+              % args.hef)
+        det = get_detector({"kind": "yolo", "conf_thr": args.conf,
+                            "prefer": ["onnx", "pt"]})
     files = []
     for p in args.paths:
         files += sorted(glob.glob(os.path.join(p, "*"))) if os.path.isdir(p) else [p]
@@ -57,6 +71,9 @@ def main():
             [(b.x, b.y, b.w, b.h) for b in boxes[:3]], payload, ms))
     if n:
         print("avg %.1f ms/frame over %d frames (%s)" % (tot_ms / n, n, det.name))
+    else:
+        print("no readable images in %s" % (args.paths,))
+        return 2
 
 
 if __name__ == "__main__":

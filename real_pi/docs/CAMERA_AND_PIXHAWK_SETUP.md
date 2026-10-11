@@ -24,16 +24,31 @@ is *not* a `/dev/video*` device and `kind: usb` is wrong for it.
 
 ### 1.1 Boot configuration (Pi 5, Bookworm)
 
-Arducam's own documented procedure for this module on a Pi 5:
+**Step 0 — the overlay that the stock kernel does not have.** The plain
+Raspberry Pi `imx477` overlay streams the sensor but knows nothing about the
+focus motor, and `vcm` only exists in Arducam's overlay. Without this step the
+symptom is `csi: none found` / `rpicam-hello` reporting no cameras at all —
+i.e. the camera looks like a cable fault:
 
 ```bash
-sudo nano /boot/firmware/config.txt
+cd ~ && mkdir -p imx477_dtb && cd imx477_dtb
+wget https://github.com/ArduCAM/Arducam-Pivariety-V4L2-Driver/releases/download/Arducam_pivariety_v4l2_v1.0/imx477_rpi_dtoverlay.tar.gz
+tar xzvf imx477_rpi_dtoverlay.tar.gz
+cd imx477_rpi_dtoverlay && ./build_and_install.sh      # needs kernel headers + dtc
+sudo reboot
 ```
 
+If `build_and_install.sh` refuses on a very new kernel, the fallback is the
+**stock** overlay (`dtoverlay=imx477` / `,cam0`): the camera then streams and
+QR detection works, but the focus motor is not driven and `autofocus: true`
+has no effect. Say so rather than assuming — the two are different failures.
+
+**Step 1 — declare the camera by hand** (`/boot/firmware/config.txt`). Pi 5
+does not auto-detect third-party CSI modules, and auto-detect also hides the
+overlay you add:
+
 ```ini
-# find:
-camera_auto_detect=1
-# change it to:
+# find and change:
 camera_auto_detect=0
 
 # under the [all] section:
@@ -42,7 +57,20 @@ dtoverlay=imx477,vcm
 # dtoverlay=imx477,vcm,cam0
 ```
 
-`vcm` is what makes the focus motor exist. Reboot.
+`vcm` is what makes the focus motor exist. Reboot, then prove it in this
+order — stop at the first failure and fix that one thing:
+
+```bash
+rpicam-hello --list-cameras          # expect: imx477 (with an AF mode) — not "no cameras"
+dmesg | grep -iE "imx477|i2c|vcm"    # probe errors / I2C address clashes
+ls /boot/firmware/overlays/ | grep -i imx477
+python3 tools/list_cams.py           # our side: sensor string, index, role
+python3 tools/cam_probe.py           # one snapshot per camera — is the picture right way up?
+```
+
+`tools/list_cams.py` now prints this whole picture itself: the parsed
+`camera_auto_detect` / `dtoverlay` lines, whether the Arducam AF tuning file
+exists, and whether `models/qr_yolov8n.hef` is present.
 
 ### 1.2 The two-camera trap (this is the one that bites)
 
