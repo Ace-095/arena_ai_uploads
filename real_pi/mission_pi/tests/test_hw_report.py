@@ -104,6 +104,70 @@ def test_report_prints_the_two_files_that_decide_success():
           ("OK" in out) == os.path.isfile(hef), out)
 
 
+def _vcm_dtbo(tmpdir, with_vcm=True):
+    """A fake dtbo: parameter names are plain strings in the blob."""
+    p = os.path.join(tmpdir, "imx477.dtbo")
+    body = (b"\xd0\x0d\xfe\xed" +
+            (b"\x00vcm\x00rotation\x00cam0\x00" if with_vcm
+             else b"\x00rotation\x00orientation\x00cam0\x00link-frequency\x00"))
+    with open(p, "wb") as f:
+        f.write(body)
+    return p
+
+
+def test_verdict_catches_the_real_field_failure():
+    """The exact state of the user's Pi: camera_auto_detect=1 and no camera
+    overlay at all. The verdict must name both, and fail."""
+    cfg = list_cams.parse_boot_config(
+        "camera_auto_detect=1\n[all]\ndtoverlay=vc4-kms-v3d\n")
+    ok, lines = list_cams.boot_verdict(cfg)
+    text = "\n".join(lines)
+    check("verdict fails when auto-detect is on", ok is False, text)
+    check("verdict says to set camera_auto_detect=0",
+          "camera_auto_detect=1" in text and "set it to 0" in text, text)
+    check("verdict gives the exact overlay line to add",
+          "dtoverlay=imx477,vcm" in text, text)
+
+
+def test_verdict_detects_the_stock_overlay_without_vcm(tmpdir="/tmp"):
+    """A correct config.txt + the STOCK dtbo is still broken: ,vcm cannot
+    apply. This is what a half-finished Arducam install looks like."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        stock = _vcm_dtbo(td, with_vcm=False)
+        cfg = list_cams.parse_boot_config(
+            "camera_auto_detect=0\n[all]\ndtoverlay=imx477,vcm\n")
+        ok, lines = list_cams.boot_verdict(cfg, dtbo_path=stock)
+        text = "\n".join(lines)
+        check("verdict fails with the stock dtbo + ,vcm", ok is False, text)
+        check("verdict names it as the STOCK overlay",
+              "STOCK" in text and "no vcm" in text, text)
+
+        good = _vcm_dtbo(td, with_vcm=True)
+        ok2, lines2 = list_cams.boot_verdict(cfg, dtbo_path=good)
+        text2 = "\n".join(lines2)
+        check("verdict passes with Arducam's dtbo", ok2 is True, text2)
+        check("verdict confirms vcm support", "supports vcm" in text2, text2)
+
+
+def test_verdict_handles_missing_dtbo_and_other_cameras():
+    cfg = list_cams.parse_boot_config(
+        "camera_auto_detect=0\n[all]\ndtoverlay=imx477,vcm\n")
+    ok, lines = list_cams.boot_verdict(cfg, dtbo_path="/nonexistent/imx477.dtbo")
+    text = "\n".join(lines)
+    check("verdict fails when the dtbo is missing", ok is False, text)
+    check("verdict names the missing file", "dtbo" in text, text)
+    check("verdict reminds about a second camera",
+          "imx708" in text, text)
+
+
+def test_vcm_scan_is_honest_about_unreadable_files():
+    check("unreadable dtbo -> None, never a guess",
+          list_cams.dtbo_supports_vcm("/nonexistent/x.dtbo") is None)
+    check("a directory is not a dtbo",
+          list_cams.dtbo_supports_vcm("/tmp") is None)
+
+
 def test_boot_report_returns_a_dict_without_a_pi():
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
@@ -117,6 +181,10 @@ if __name__ == "__main__":
     test_overlay_lines_are_found_and_comments_ignored()
     test_empty_and_junk_input_never_raise()
     test_report_prints_the_two_files_that_decide_success()
+    test_verdict_catches_the_real_field_failure()
+    test_verdict_detects_the_stock_overlay_without_vcm()
+    test_verdict_handles_missing_dtbo_and_other_cameras()
+    test_vcm_scan_is_honest_about_unreadable_files()
     test_boot_report_returns_a_dict_without_a_pi()
     print("-" * 60)
     if FAILS:

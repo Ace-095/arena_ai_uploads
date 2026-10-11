@@ -22,30 +22,45 @@ the package and the target board) with a **motorised focus (VCM) lens**. Some
 revisions have an IR-CUT filter. It is a **MIPI CSI-2** camera, not USB — so it
 is *not* a `/dev/video*` device and `kind: usb` is wrong for it.
 
-### 1.1 Boot configuration (Pi 5, Bookworm)
+### 1.1 Boot configuration (Pi 5, Bookworm/Trixie)
 
-**Step 0 — the overlay that the stock kernel does not have.** The plain
-Raspberry Pi `imx477` overlay streams the sensor but knows nothing about the
-focus motor, and `vcm` only exists in Arducam's overlay. Without this step the
-symptom is `csi: none found` / `rpicam-hello` reporting no cameras at all —
-i.e. the camera looks like a cable fault:
+Two independent things must be true before libcamera can see this camera:
+
+**(a) Arducam's overlay must be INSTALLED.** The stock Raspberry Pi `imx477`
+overlay has parameters `rotation, orientation, media-controller, cam0,
+always-on, link-frequency, sync-sink, sync-source` — there is **no `vcm`**.
+So on a machine with only the stock dtbo, `dtoverlay=imx477,vcm` fails to
+apply and the camera never appears (that is the "no cameras available" case,
+and it looks exactly like a cable fault):
 
 ```bash
 cd ~ && mkdir -p imx477_dtb && cd imx477_dtb
 wget https://github.com/ArduCAM/Arducam-Pivariety-V4L2-Driver/releases/download/Arducam_pivariety_v4l2_v1.0/imx477_rpi_dtoverlay.tar.gz
 tar xzvf imx477_rpi_dtoverlay.tar.gz
-cd imx477_rpi_dtoverlay && ./build_and_install.sh      # needs kernel headers + dtc
-sudo reboot
+cd imx477_rpi_dtoverlay && ./build_and_install.sh     # asks for your sudo password; then reboot
 ```
 
-If `build_and_install.sh` refuses on a very new kernel, the fallback is the
-**stock** overlay (`dtoverlay=imx477` / `,cam0`): the camera then streams and
-QR detection works, but the focus motor is not driven and `autofocus: true`
-has no effect. Say so rather than assuming — the two are different failures.
+The tarball carries `bookworm/`, `bullseye/` and `trixie/` variants and the
+script picks by OS (Trixie is supported; the `dtc` warnings it prints about
+`unit_address_vs_reg` are harmless). It **overwrites** the stock
+`/boot/firmware/overlays/imx477.dtbo`.
 
-**Step 1 — declare the camera by hand** (`/boot/firmware/config.txt`). Pi 5
-does not auto-detect third-party CSI modules, and auto-detect also hides the
-overlay you add:
+**Prove the install landed** — do not assume the script's "Complete!":
+
+```bash
+ls -l /boot/firmware/overlays/imx477.dtbo        # timestamp = just now
+strings /boot/firmware/overlays/imx477.dtbo | grep -i vcm
+#   vcm appears  -> Arducam's overlay is installed (focus motor possible)
+#   no output    -> still the STOCK overlay: re-run build_and_install.sh
+#                   (or: sudo cp imx477.dtbo /boot/firmware/overlays/)
+```
+
+To undo (restore the stock dtbo): `dpkg -S /boot/firmware/overlays/imx477.dtbo`
+names the owning package; `sudo apt install --reinstall <that package>`.
+
+**(b) The camera must be declared by hand** in `/boot/firmware/config.txt`
+(Pi 5 does not auto-detect third-party CSI modules, and `camera_auto_detect=1`
+also undoes manual overlays):
 
 ```ini
 # find and change:
@@ -53,24 +68,25 @@ camera_auto_detect=0
 
 # under the [all] section:
 dtoverlay=imx477,vcm
-# ...and if the camera is on the CAM0 port:
+# ...and if the camera is on the CAM0 connector:
 # dtoverlay=imx477,vcm,cam0
 ```
 
-`vcm` is what makes the focus motor exist. Reboot, then prove it in this
-order — stop at the first failure and fix that one thing:
+Reboot, then prove it in this order — stop at the first failure:
 
 ```bash
-rpicam-hello --list-cameras          # expect: imx477 (with an AF mode) — not "no cameras"
-dmesg | grep -iE "imx477|i2c|vcm"    # probe errors / I2C address clashes
-ls /boot/firmware/overlays/ | grep -i imx477
-python3 tools/list_cams.py           # our side: sensor string, index, role
-python3 tools/cam_probe.py           # one snapshot per camera — is the picture right way up?
+rpicam-hello --list-cameras          # expect imx477 — NOT "No cameras available!"
+dmesg | grep -iE "imx477|vcm|i2c"    # probe errors / an overlay that failed to apply
+python3 tools/list_cams.py           # parses config.txt AND checks the installed dtbo
+python3 tools/cam_probe.py           # one snapshot per camera
 ```
 
-`tools/list_cams.py` now prints this whole picture itself: the parsed
-`camera_auto_detect` / `dtoverlay` lines, whether the Arducam AF tuning file
-exists, and whether `models/qr_yolov8n.hef` is present.
+`tools/list_cams.py` prints a **verdict** for exactly this: whether
+`camera_auto_detect=0`, whether a camera `dtoverlay=` exists, and whether the
+installed `imx477.dtbo` really contains `vcm` (stock vs Arducam). If the boot
+config passes and libcamera still sees nothing, the cause is physical — and it
+says so: reseat the 15↔22-pin FPC (contacts the right way), try the other CAM
+connector (update the `,cam0` suffix to match), check `dmesg`.
 
 ### 1.2 The two-camera trap (this is the one that bites)
 
@@ -266,6 +282,10 @@ What it is really checking, and what to do if it fails:
 
 ## 3. Prove QR detection on the real camera (Hailo)
 
+> **Both of these are PI-side commands.** The laptop only runs the UI bridge;
+> it has no `hailortcli`, no `tools/`, and no camera. Running them there gives
+> "command not found" / "No such file or directory".
+
 Before flying — and before trusting any 15 m number — check the pipeline end
 to end with the actual CSI camera and the AI HAT. The bench tool runs the
 mission's own detector, filter and presets; it can use the Pi's CSI camera
@@ -302,6 +322,8 @@ so and falls back to the CPU ladder — it never crashes a bench run.
 The `.hef` is **not** in the repo: it comes from Hailo's Dataflow Compiler on
 an x86 machine (`training/compile_hef.md`, `models/README.md`). Without it,
 `detector.kind: auto` in `config.yaml` simply uses the ONNX rung on CPU.
+Check the HAT itself with `hailortcli scan` (a `[-] Device: …` line is the
+normal success output) and `hailortcli fw-control identify` — **on the Pi**.
 
 ---
 
