@@ -393,9 +393,70 @@ def test_tuning_lookup_dedupes_and_looks_in_models():
           "not found" in text, text)
 
 
+def test_focus_score_and_vision_hint():
+    """The 2026-10-12 report was "camera looks blurry not sharp at all idk
+    why" — with nothing in the output saying whether the fault was the light,
+    the surface or the lens. Every stats line now carries `focus=`, so the
+    reason has to be the RIGHT one: a black frame must not be called blurry,
+    and a blurred-but-bright frame must be."""
+    import numpy as np
+    import cv2
+    sharp = np.zeros((160, 220, 3), np.uint8)
+    sharp[::4, :] = 255                       # checkerboard-ish: high Laplacian
+    sharp[:, ::4] = 255
+    soft = cv2.GaussianBlur(sharp, (15, 15), 6.0)
+    s_sharp, s_soft = B.focus_score(sharp), B.focus_score(soft)
+    check("a sharp frame scores above a blurred copy",
+          s_sharp > s_soft > 0, (s_sharp, s_soft))
+    import focus_sweep as FS
+    check("the score is the sweep's own metric (they cannot drift)",
+          abs(s_sharp - FS.sharpness(sharp, cv2, centre=0.5)) < 1e-6,
+          (s_sharp, FS.sharpness(sharp, cv2, centre=0.5)))
+
+    dark = B.vision_hint(4.0, 1.0, 3.0)
+    check("a black frame is reported as black, not blurry",
+          dark and "BLACK" in dark and "SOFT" not in dark, dark)
+    flat = B.vision_hint(120.0, 4.0, 3.0)
+    check("no contrast is reported before sharpness",
+          flat and "CONTRAST" in flat and "SOFT" not in flat, flat)
+    softmsg = B.vision_hint(120.0, 30.0, 4.0)
+    check("contrast + no sharpness = the lens, said plainly",
+          softmsg and "SOFT" in softmsg and "MECHANICAL" in softmsg
+          and "focus=" in softmsg, softmsg)
+    check("a healthy frame produces no hint at all",
+          B.vision_hint(120.0, 40.0, 400.0) is None)
+    check("unmeasurable stats are not guessed at",
+          B.vision_hint(-1.0, -1.0, -1.0) is None)
+
+
+def test_bench_stamps_which_code_it_is():
+    """A log that cannot say which commit produced it is how a fixed bug gets
+    debugged twice: the Pi ran the other branch's build and the pasted output
+    still showed ord(k) and status 69."""
+    import codeinfo as CI
+    v = CI.code_version()
+    check("the bench's checkout is identified by a commit hash",
+          len(v.get("hash") or "") >= 7, v)
+    line = "%s" % CI.describe(v)
+    check("and it is printed as one readable line",
+          v["hash"][:7] in line and "(" in line, line)
+    check("a missing/broken git is reported, never raised",
+          "unknown" in CI.describe({"hash": "", "error": "OSError: no git"}) and
+          "no git" in CI.describe({}))
+    check("uncommitted work is visible in the stamp",
+          "uncommitted" in CI.describe({"hash": "abc1234", "branch": "b",
+                                        "dirty": True}),
+          CI.describe({"hash": "abc1234", "branch": "b", "dirty": True}))
+    out = subprocess.run([sys.executable, os.path.join(PI, "codeinfo.py")],
+                         capture_output=True, text=True).stdout
+    del out          # codeinfo has no CLI; the import above is the test
+
+
 if __name__ == "__main__":
     test_headless_decision()
     test_preset_keys_are_ints()
+    test_focus_score_and_vision_hint()
+    test_bench_stamps_which_code_it_is()
     test_detector_kind_aliases()
     test_qr_bench_accepts_the_documented_name()
     test_single_camera_is_not_a_failure()

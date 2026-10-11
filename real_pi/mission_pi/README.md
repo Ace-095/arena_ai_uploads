@@ -276,6 +276,15 @@ python3 tools/test_yolo_webcam_qr.py --source csi:bottom --onnx \
 downward camera), `csi:front`, `csi:cam2`, `csi:1`. `--hailo` without the
 HAT/HEF prints why and falls back to the CPU ladder instead of crashing.
 
+Each run stamps the code it is running — `[bench] code 1f98c25 (arena/…,
+uncommitted changes)` — because a log that cannot say which build produced it
+gets an already-fixed bug debugged twice. It prints one stats line per second:
+`raw= filt= maxconf= payload= frame_mean= frame_std= focus=`. `focus=` is the
+same Laplacian-variance metric `tools/focus_sweep.py` prints, so the mechanical
+lens ring can be set against a number, and the tool says out loud which of
+black / no-contrast / out-of-focus it is looking at rather than leaving "the
+camera looks blurry, idk why" to guesswork.
+
 **Measured throughput (Pi 5, 2026-10-11, no HEF yet)** — the number that
 decides the field behaviour: tiled (3×3) ONNX inference over the 2028×1520
 frame runs at **~1 fps** (~900 ms/frame); one full-frame inference

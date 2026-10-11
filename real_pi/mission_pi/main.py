@@ -123,6 +123,13 @@ def print_urls(port, host):
 # ---------------------------------------------------------------- check ----
 def run_check(args):
     print("== mission_pi bring-up check ==")
+    # Which build is this? A pasted --check output whose commit hash is not the
+    # one being worked on has already cost a full debugging round trip.
+    try:
+        from codeinfo import code_version, describe
+        print("[code] %s" % describe(code_version(), prefix="running "))
+    except Exception as e:
+        print("[code] version unknown (%r)" % e)
     cfg = load_config(args.config)
     _fcc = cfg.get("fc", {}) or {}
     # `conn:` is the documented key; accept `device:` too (easy to write).

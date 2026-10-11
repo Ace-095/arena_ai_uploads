@@ -213,6 +213,69 @@ def build_detector(args, conf_thr, prefer, kind="yolo"):
         return ClassicalDetector()
 
 
+#: Laplacian variance below which a frame that HAS contrast is called soft.
+#: A floor for "something is wrong", not a target: this metric also scales
+#: with resolution, contrast and sensor noise, so it is only meaningful next
+#: to itself (turn the lens ring and it must rise) or another camera of the
+#: same model. The 2026-10-12 field report was "camera looks blurry, idk why"
+#: with nothing in the output saying whether that was the lens, the light or
+#: the surface — hence a number in every stats line.
+MIN_FOCUS = 25.0
+
+
+def focus_score(frame, cv2mod=None):
+    """Sharpness of the centre 50% — -1.0 when it cannot be measured.
+
+    Same metric as `tools/focus_sweep.py` prints (the sweep's own function is
+    called, so the two can never drift), which is what lets a value seen live
+    be compared against a sweep table.
+    """
+    try:
+        import focus_sweep as FS
+        if cv2mod is None:
+            import cv2 as cv2mod
+        return FS.sharpness(frame, cv2mod, centre=0.5)
+    except Exception:
+        pass
+    try:                                   # sweep module unavailable: same maths
+        import cv2
+        g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        h, w = g.shape[:2]
+        y0, x0 = h // 4, w // 4
+        return float(cv2.Laplacian(g[y0:h - y0, x0:w - x0], cv2.CV_64F).var())
+    except Exception:
+        return -1.0
+
+
+def vision_hint(mean, std, focus):
+    """Why the camera can see nothing? -> one line, or None. Pure.
+
+    Ordered by what has to be fixed FIRST: a black frame has no contrast and
+    no sharpness either, so calling a lens cap "blurry" would send the
+    operator to adjust a lens that is fine. Returns None when the numbers are
+    unavailable (-1), because guessing is how time gets wasted.
+    """
+    if mean is None or mean < 0:
+        return None
+    if mean < 12:
+        return ("[hint] the frame is nearly BLACK (mean %.0f) — lens cap on, "
+                "no light, or exposure/gain wrong. Nothing can be detected in "
+                "a black frame." % mean)
+    if std < 8:
+        return ("[hint] the frame has almost no CONTRAST (std %.0f) — it is a "
+                "blank surface (wall, ceiling, out-of-focus distance). Point "
+                "the camera at the printed QR panel." % std)
+    if 0 <= focus < MIN_FOCUS:
+        return ("[hint] the frame has contrast (std %.0f) but is SOFT "
+                "(focus=%.0f, floor %.0f): the image is out of focus. On the "
+                "UC-517 focus is MECHANICAL — loosen the ring on the lens "
+                "barrel and turn it while watching focus= rise, at the "
+                "distance you care about, then re-tighten. --save-frames "
+                "/tmp/bench keeps the frames to compare afterwards."
+                % (std, focus, MIN_FOCUS))
+    return None
+
+
 def frame_stats(frame):
     """(mean, std) brightness/contrast of a BGR frame — pure, numpy only.
 
@@ -389,6 +452,11 @@ def main():
     # there is none — so decide here (and say which branch was taken).
     _show, why = decide_show(args.headless, args.show)
     print("[bench] window %s — %s" % ("ON" if _show else "OFF (headless)", why))
+    # Which code is this? A pasted log that cannot answer that cost a whole
+    # round trip on 2026-10-12 (the Pi ran the OTHER branch's build, so it
+    # still crashed on ord() and still reported status 69).
+    from codeinfo import code_version, describe as _describe_code
+    print("[bench] code %s" % _describe_code(code_version()))
     if args.save_frames:
         os.makedirs(args.save_frames, exist_ok=True)
         print("[bench] annotated frames -> %s (1/s)" % args.save_frames)
@@ -489,14 +557,15 @@ def main():
             "--conf 0.10 and read maxconf= in the line above; (4) --no-tile is "
             "~9x faster (one inference) at the cost of small-QR reach at 15 m")
 
-    def hud(frame, raw_n, filt_n, payload_any):
+    def hud(frame, raw_n, filt_n, payload_any, sharp=-1.0):
         lines = [
             "preset: %-10s conf %.2f  tile %s  req-decode: %s"
             % (active or "none", conf, "3x3" if tiled else "off",
                "ON " if qf.require_decode_for_cue else "off"),
-            "filter: conf>=%.2f side>=%dpx aspect %.1f-%.1f | raw:%d filt:%d | %.1f fps"
+            "filter: conf>=%.2f side>=%dpx aspect %.1f-%.1f | raw:%d filt:%d "
+            "| %.1f fps | focus %.0f"
             % (qf.min_conf, qf.min_side_px, qf.aspect_min, qf.aspect_max,
-               raw_n, filt_n, fps),
+               raw_n, filt_n, fps, sharp),
             "keys: f fakes  v req-decode  k/l conf  t tile  p 1-7 preset  q quit",
         ]
         y = 26
@@ -582,7 +651,7 @@ def main():
                 cv2.putText(frame, "qr %.2f" % b.conf, (x, max(12, y - 4)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1,
                             cv2.LINE_AA)
-        hud(frame, len(raw), len(kept), payload_any)
+        hud(frame, len(raw), len(kept), payload_any, focus_score(frame))
 
         maxconf = max([b.conf for b in raw], default=0.0)
         if not _show:
@@ -594,24 +663,18 @@ def main():
                 win_fps = (n_frames - n_line_prev) / win_dt
                 n_line_prev, t_line_prev = n_frames, now
                 fmean, fstd = frame_stats(frame)
+                fsharp = focus_score(frame)
                 print("[bench] frame=%d raw=%d filt=%d maxconf=%.2f "
-                      "payload=%r frame_mean=%.0f frame_std=%.0f fps=%.1f "
-                      "(%.0f ms/frame)"
+                      "payload=%r frame_mean=%.0f frame_std=%.0f focus=%.0f "
+                      "fps=%.1f (%.0f ms/frame)"
                       % (n_frames, n_raw, n_filt, maxconf, payload_any,
-                         fmean, fstd, win_fps, 1000.0 / max(1e-3, win_fps)))
-                if fmean >= 0 and not hinted_vision:
-                    if fmean < 12:
+                         fmean, fstd, fsharp, win_fps,
+                         1000.0 / max(1e-3, win_fps)))
+                if not hinted_vision:
+                    msg = vision_hint(fmean, fstd, fsharp)
+                    if msg:
                         hinted_vision = True
-                        print("[hint] the frame is nearly BLACK (mean %.0f) — "
-                              "lens cap on, no light, or exposure/gain wrong. "
-                              "Nothing can be detected in a black frame."
-                              % fmean)
-                    elif fstd < 8:
-                        hinted_vision = True
-                        print("[hint] the frame has almost no CONTRAST "
-                              "(std %.0f) — it is a blank surface (wall, "
-                              "ceiling, out-of-focus distance). Point the "
-                              "camera at the printed QR panel." % fstd)
+                        print(msg)
                 if (not hinted_empty and n_raw == 0 and n_frames >= 10
                         and (now - t_true_start) >= 10.0):
                     hinted_empty = True
