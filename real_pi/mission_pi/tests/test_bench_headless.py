@@ -114,6 +114,23 @@ class _WorkingCV2:
         pass
 
 
+def test_preset_keys_are_ints():
+    """The field crash: pressing 1-7 raised
+    `TypeError: ord() expected string of length 1, but int found`, because
+    cv2.waitKey returns an INT and the digit branch called ord() on it."""
+    check("1 selects the first preset", B.preset_index(ord("1"), 7) == 0)
+    check("7 selects the seventh", B.preset_index(ord("7"), 7) == 6)
+    check("a digit beyond the defined presets is refused, not a crash",
+          B.preset_index(ord("7"), 3) is None)
+    check("letters and out-of-range ints are refused",
+          B.preset_index(ord("f"), 7) is None and
+          B.preset_index(-1, 7) is None and
+          B.preset_index(255, 7) is None)
+    check("no ord() on an int anywhere in the key handling",
+          "ord(k)" not in open(os.path.join(PI, "tools",
+                                            "test_yolo_webcam_qr.py")).read())
+
+
 def test_display_probe():
     """probe_display must never raise, must not need a real display, and must
     answer 'no' for every one of the ways a window can be impossible."""
@@ -378,6 +395,7 @@ def test_tuning_lookup_dedupes_and_looks_in_models():
 
 if __name__ == "__main__":
     test_headless_decision()
+    test_preset_keys_are_ints()
     test_detector_kind_aliases()
     test_qr_bench_accepts_the_documented_name()
     test_single_camera_is_not_a_failure()

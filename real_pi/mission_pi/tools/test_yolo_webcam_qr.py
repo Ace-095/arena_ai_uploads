@@ -67,6 +67,21 @@ except Exception:
 PRESET_KEYS = "1234567"  # key -> preset list position
 
 
+def preset_index(key, n_presets):
+    """Which preset does this keypress select? -> index or None.
+
+    `cv2.waitKey` returns an INT; the field crash was
+    `TypeError: ord() expected string of length 1, but int found` — the digit
+    branch turned the int key back into a character. Keep the arithmetic here,
+    pure, so it is tested instead of discovered by pressing a key.
+    """
+    try:
+        idx = int(key) - ord("1")
+    except (TypeError, ValueError):
+        return None
+    return idx if 0 <= idx < int(n_presets) else None
+
+
 def probe_display(cv_mod=None, env=None):
     """Can a window REALLY open here? -> (ok, reason).
 
@@ -639,10 +654,9 @@ def main():
                     tiled = _apply_preset.get("tile_grid", [3, 3]) != [1, 1]
                 print("[key] preset -> %s (conf %.2f, req-decode %s, tile %s)"
                       % (active, conf, qf.require_decode_for_cue, tiled))
-            elif k in (ord("1"), ord("2"), ord("3"), ord("4"), ord("5"),
-                       ord("6"), ord("7")):
-                idx = ord(k) - ord("1")
-                if idx < len(names):
+            elif preset_index(k, len(names) or 1) is not None:
+                idx = preset_index(k, len(names))
+                if idx is not None:
                     active = names[idx]
                     _apply_preset = presets.get(active)
                     if _apply_preset:

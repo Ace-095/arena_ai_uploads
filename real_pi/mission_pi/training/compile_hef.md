@@ -51,39 +51,73 @@ is what you match the DFC against.
 ## 1. Calibration set (≥128 images, DIVERSE, letterboxed like the runtime)
 
 Quantization ranges are tuned on these images, so they must look like what the
-Pi feeds the network. `tools/make_calib_set.py` builds exactly that — from our
-own frames, with the same letterbox `detector.py` uses at runtime:
+Pi feeds the network — not like what `cv2.resize` happens to do. The two rules
+that matter, and that `tools/make_calib_set.py` enforces:
+
+* **same letterbox as the runtime** — the tool *imports* `detector._letterbox`
+  rather than re-implementing it, so the compiler cannot be pointed at a
+  distribution the network never sees in flight (an earlier version used
+  `INTER_AREA` when shrinking and differed by up to 131 grey levels on a
+  1520×2028 frame — those calib images are not what inference gets);
+* **diversity beats volume** — 300–1000 frames with real exposure and scene
+  variety are worth more than 1000 near-identical ones.
 
 ```bash
 cd real_pi/mission_pi
-# from the frames you already captured with the bench tool:
-python3 tools/make_calib_set.py --from /tmp/bench snaps --out calib
-# or straight off the CSI camera, walking the room for a minute:
-python3 tools/make_calib_set.py --camera csi:bottom --frames 300 --out calib
-# or from the training dataset itself (the most representative source):
-python3 tools/make_calib_set.py --from /tmp/qr_dataset_med/images/train --out calib
+
+# 1) capture frames ON THE PI (the camera lives there). Any of these work:
+#    a) 2 minutes of the bench tool, saving what it sees:
+python3 tools/test_yolo_webcam_qr.py --source csi:bottom --no-tile \
+    --preset day --save-frames /tmp/bench          # one jpg per frame
+#    b) the dataset you already built for training (most representative):
+#       /tmp/qr_dataset_med/images/train  (see training/make_qr_dataset.py)
+#    c) an existing video of a flight/walkthrough: --video flight.mp4
+
+# 2) build the set (this step is pure numpy/cv2 — it runs on the Pi or on x86)
+python3 tools/make_calib_set.py --from /tmp/bench \
+    --out training/calib --want 256 --npz
 ```
 
-It drops black/blown-out/flat frames and near-duplicates, warns when the set is
-monotonous (the #1 cause of *"cannot find suitable quantization params"*), and
-prints the `hailo optimize` line for you. 128 is the floor; 300–1000 varied
-frames is better. Include: the QR at several distances and angles, indoors and
-outdoors light, and a few frames with no QR in view (backgrounds matter).
+It drops black / blown-out / flat frames and near-duplicates, warns when the
+set is monotonous (the #1 cause of *"cannot find suitable quantization
+params"*), and prints the `hailo optimize` line for you. What it refuses to
+do is guess: with fewer than 128 frames, or a brightness spread under 25 grey
+levels, or all frames at one exposure, it says so instead of compiling a set
+that will quantize badly.
 
-## 2. Model script (.alls) — start from the Zoo's yolov8n
+**Include, deliberately:** the QR at several distances (2 m → 15 m) and angles,
+day and night lighting, and frames with **no** QR in view — background hunting
+is most of what the network does at altitude. `--npz` additionally writes
+`training/calib.npz` (`(N,640,640,3)` uint8) for DFC flows that want a numpy
+set instead of a folder.
+
+## 2. Model script (.alls) — the Zoo's yolov8n, with three edits
 
 ```bash
-$HAILO_MODEL_ZOO/yolov8n.alls     # base: has the yolov8 meta-arch + nms_postprocess
+cp $HAILO_MODEL_ZOO/hailo_model_zoo/cfg/alls/generic/yolov8n.alls ./yolov8n.alls
 ```
 
-Copy it and change only what our model needs (1 class). Keep
-`nms_postprocess` — our runtime parses the NMS tensor directly
-(`hailo_decode.py`, the code `detector.py` calls). Lower the NMS floor only if
-the bench shows weak boxes being dropped:
+The Zoo file already carries the yolov8 meta-arch, the sigmoid fixup on every
+head and `nms_postprocess` — the parts that are easy to get wrong. Edit only
+these lines (the Zoo's originals are quoted so you can confirm you are looking
+at the same file):
 
-```
-nms_postprocess(meta_arch=yolov8, engine=cpu, score_threshold=0.25, iou_threshold=0.5, ...)
-```
+| Zoo line | change to | why |
+|---|---|---|
+| `nms_postprocess("../../postprocess_config/yolov8n_nms_config.json", meta_arch=yolov8, engine=cpu)` | point the path at **our** `training/nms_config.json` (absolute path is simplest) | our config is 1 class, `score_threshold 0.25`, and it names **our** decoders `qr_yolov8n/bbox_decoder41\|52\|62` — the COCO one has 80 classes and 80 decoders and will not match this network |
+| `change_output_activation(conv42\|conv53\|conv63, sigmoid)` | leave as is | those are our head convs (stride 8/16/32); removing it makes every score meaningless |
+| `normalization([0,0,0],[255,255,255])` | leave as is | the runtime feeds plain uint8 RGB (`FormatType.UINT8`) — adding a mean/std here is the classic "boxes shifted or scaled" bug |
+
+Keep `nms_postprocess` — our runtime parses the NMS tensor directly
+(`hailo_decode.py`, the code `detector.py` calls). The class count itself comes
+from the parse step (§3, the network yaml's `classes: 1`), not from the .alls.
+
+The NMS floor lives in `training/nms_config.json` and is deliberately low
+(`nms_scores_th 0.25`): it is applied BEFORE our own filter, so a high value
+deletes exactly the small, far-away QR this mission hunts. Validate any config
+you edit with `tools/hef_info.py --nms-config training/nms_config.json` — it
+cross-checks the decoder names, strides and the reg/cls pairs per head, which
+is how a rebuilt HEF silently ends up with no usable boxes.
 
 ### What the HEF actually emits (measured, 2026-10-12)
 
@@ -135,7 +169,7 @@ hailo parse --hw-arch hailo8 \
 # 2) optimize: quantize with OUR calibration set
 hailo optimize --hw-arch hailo8 \
     --har qr_yolov8n.har \
-    --calib-path calib/ \
+    --calib-path training/calib/ \
     --model-script yolov8n.alls \
     --output-har-path qr_yolov8n_quantized.har
 

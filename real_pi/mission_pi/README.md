@@ -364,9 +364,11 @@ Details + the executed test matrix + the bench procedure:
   the SAME code the runtime uses (`hailo_decode.py`), so the verdict cannot
   drift from the Pi's behaviour
 * `tools/make_calib_set.py` — build the Hailo DFC calibration set from our
-  own frames (camera/video/dir), dropping dark, flat and near-duplicate
-  frames and letterboxing to 640×640 exactly like the runtime; prints the
-  `hailo optimize` command. See `training/compile_hef.md`
+  own frames (`--from <dir>` of bench/dataset images, or `--video <file>`),
+  dropping dark, flat and near-duplicate frames and letterboxing to 640×640
+  with the runtime's OWN `detector._letterbox`, so the compiler sees the real
+  input distribution; prints the `hailo optimize` command. See
+  `training/compile_hef.md` §1
 * `tools/qr_bench.py` — detector+decoder over images, boxes/payload/ms
   (`--detector onnx|pt|yolo|hailo|classical|auto`; `onnx` runs the mission's
   own ONNX rung, so the ms you see is the ms the mission gets). The names an

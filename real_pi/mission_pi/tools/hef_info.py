@@ -81,6 +81,76 @@ def classify_outputs(shapes):
                   "export the raw (1,5,8400) head.")
 
 
+#: The three YOLOv8 detection heads, as the Hailo zoo names them after a
+#: `hailo parse --net-name qr_yolov8n`: stride -> (regression, classification).
+#: Hailo's own postprocess_config/yolov8n_nms_config.json uses exactly this
+#: pairing (8->conv41/conv42, 16->conv52/conv53, 32->conv62/conv63), and the
+#: compiled HEF's layer names in models/qr_yolov8n.hef match it.
+HEAD_LAYERS = {8: ("conv41", "conv42"),
+               16: ("conv52", "conv53"),
+               32: ("conv62", "conv63")}
+#: The prefix those layers carry — the net name passed to `hailo parse`.
+DEFAULT_NET_NAME = "qr_yolov8n"
+
+
+def validate_decoders(cfg, net_name=DEFAULT_NET_NAME):
+    """The bbox_decoders block must name the real heads, once each.
+
+    Getting this wrong is silent in a nasty way: the DFC errors out at compile
+    time at best, and at worst produces an NMS op that reads the wrong feature
+    maps, so the HEF detects nothing (or nonsense) while looking healthy. The
+    shipped template had three decoders all called
+    `qr_yolov8n/yolov8_nms_postprocess` with the strides shifted by one head —
+    this check exists because that was found by comparing against Hailo's own
+    config, not by any error message.
+    """
+    ok = True
+    lines = []
+    decoders = cfg.get("bbox_decoders") or []
+    if len(decoders) != len(HEAD_LAYERS):
+        return False, ["BAD  bbox_decoders=%d — YOLOv8 has exactly %d detection "
+                       "heads (strides %s)"
+                       % (len(decoders), len(HEAD_LAYERS),
+                          ", ".join(str(s) for s in sorted(HEAD_LAYERS)))]
+    names = [d.get("name") for d in decoders]
+    if len(set(names)) != len(names):
+        ok = False
+        lines.append("BAD  two decoders share a name (%s) — each bbox_decoder "
+                     "needs its own, e.g. <net>/bbox_decoder41" % (names,))
+    seen = set()
+    for d in decoders:
+        stride = d.get("stride")
+        if stride not in HEAD_LAYERS:
+            ok = False
+            lines.append("BAD  decoder %r has stride %r — only %s are YOLOv8 "
+                         "head strides" % (d.get("name"), stride,
+                                           sorted(HEAD_LAYERS)))
+            continue
+        seen.add(stride)
+        reg, cls = HEAD_LAYERS[stride]
+        want_reg, want_cls = "%s/%s" % (net_name, reg), "%s/%s" % (net_name, cls)
+        bad = []
+        if d.get("reg_layer") != want_reg:
+            bad.append("reg_layer=%r (want %r)" % (d.get("reg_layer"), want_reg))
+        if d.get("cls_layer") != want_cls:
+            bad.append("cls_layer=%r (want %r)" % (d.get("cls_layer"), want_cls))
+        if bad:
+            ok = False
+            lines.append("BAD  stride %s: %s" % (stride, "; ".join(bad)))
+    if seen != set(HEAD_LAYERS):
+        ok = False
+        lines.append("BAD  decoders cover strides %s, missing %s"
+                     % (sorted(seen), sorted(set(HEAD_LAYERS) - seen)))
+    if ok:
+        lines.append("OK   bbox_decoders name all three heads once each "
+                     "(8/16/32 -> conv41/42, conv52/53, conv62/63 under %r)"
+                     % net_name)
+    lines.append("note the layer prefix comes from `hailo parse --net-name`; "
+                 "if you parse with a different name, update this file (the "
+                 "DFC will not find the layers otherwise)")
+    return ok, lines
+
+
 #: Class counts that mean "this is somebody else's network": the stock Hailo
 #: zoo / Ultralytics YOLOv8n ships 80 COCO classes, where class 0 is 'person'.
 #: Our runtime filter keeps class 0 only, so a COCO HEF can never report 'qr' —
@@ -123,7 +193,7 @@ def class_count_hint(shapes):
     return None
 
 
-def validate_nms_config(cfg):
+def validate_nms_config(cfg, net_name=None):
     """Check a Hailo nms_config.json against THIS project. -> (ok, lines).
 
     Pure so the template we ship is verified in CI rather than trusted. The
@@ -171,8 +241,9 @@ def validate_nms_config(cfg):
     else:
         lines.append("note nms_iou_th missing — the zoo default is 0.7")
     if cfg.get("bbox_decoders"):
-        lines.append("OK   bbox_decoders present (%d)"
-                     % len(cfg.get("bbox_decoders") or []))
+        dec_ok, dec_lines = validate_decoders(cfg, net_name or DEFAULT_NET_NAME)
+        ok = ok and dec_ok
+        lines += dec_lines
     else:
         lines.append("note no bbox_decoders — the zoo's yolov8n .alls supplies "
                      "them; that is fine if you use the zoo script")

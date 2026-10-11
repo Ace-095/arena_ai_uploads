@@ -1,282 +1,323 @@
 #!/usr/bin/env python3
-"""Build a calibration set for the Hailo Dataflow Compiler from OUR frames.
+"""Build the Hailo DFC calibration set from frames THIS mission actually sees.
 
-The DFC runs on x86 only, but the images it calibrates on must look like what
-the Pi actually feeds the network — otherwise the quantization ranges are
-tuned for the wrong distribution and the .hef detects poorly (the classic
-"compiles fine, finds nothing" failure).
+Quantization is where a "it worked on my desktop" model quietly loses the small
+far-away QR: the compiler computes activation ranges from the calibration
+images, so a set of dark indoor frames will clip every bright ground scene. The
+set must therefore be captured through the SAME camera/lens/pipeline as the
+flight and carry the same framing the runtime feeds:
 
-So this tool:
-  * collects frames from the Pi's own camera, a video, a directory, or a
-    mix of all three;
-  * drops near-black / blown-out / near-duplicate frames (a monotonous set is
-    the #1 cause of "cannot find suitable quantization parameters");
-  * LETTERBOXES every frame to the network input (640x640, plain uint8 RGB)
-    exactly like `detector.py::_letterbox` does at runtime — so calibration
-    and inference see the same thing;
-  * writes `calib/NNN.jpg` plus a summary and the exact `hailo optimize`
-    command to paste on the x86 box.
+  * each image is letterboxed to the network input exactly like
+    `detector.py` does (test: test_hef_and_focus.py), so calibration sees 640x640
+    with the same black padding and scale as inference — a plain resize/squash
+    would be a different distribution
+  * near-black, blown-out and near-duplicate frames are dropped: 50 copies of
+    one frame calibrate nothing (the set is judged by how much it varies)
+  * the summary at the end says whether the set is diverse enough, in numbers,
+    instead of letting a monotone set look fine
 
 USAGE (on the Pi, from mission_pi/)
-  # from the frames you already captured (fastest, honest):
-  python3 tools/make_calib_set.py --from /tmp/bench snaps --out calib
-  # straight off the camera, walking it around the room for ~1 minute:
-  python3 tools/make_calib_set.py --camera csi:bottom --frames 200 --out calib
-  # from a video file / a folder of training images (the dataset is ideal):
-  python3 tools/make_calib_set.py --video /tmp/flight.mp4 --out calib
-  python3 tools/make_calib_set.py --from /tmp/qr_dataset_med/images/train --out calib
+  # 1) collect from the real camera (stills, any tool) — e.g.
+  python3 tools/cam_probe.py --snap-dir snaps
+  #    and/or run the bench and keep its annotated frames' source frames:
+  python3 tools/test_yolo_webcam_qr.py --source csi:bottom --no-tile \
+      --save-frames /tmp/bench --max-frames 200
+  # 2) build the set
+  python3 tools/make_calib_set.py --from snaps /tmp/bench --out training/calib
+  # 3) that prints the exact `hailo optimize --calib-path …` line to use.
 
-Requirements on the Pi: numpy + cv2 (already there). No Hailo software needed
-— the DFC consumes the folder on x86.
+Only cv2 + numpy are needed; no Hailo runtime (the DFC runs on x86).
 """
 import argparse
 import glob
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                os.pardir))
+import numpy as np
+
+try:
+    import cv2
+except Exception as e:                       # pragma: no cover
+    print("cv2 is required (%r) — the Pi/laptop venv has it" % (e,))
+    sys.exit(2)
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+PI = os.path.dirname(HERE)
+sys.path.insert(0, PI)
+
+try:                                  # the single source of truth for input prep
+    from detector import _letterbox as _runtime_letterbox
+except Exception:                     # pragma: no cover - detector unimportable
+    _runtime_letterbox = None
 
 IMG_EXT = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
 
+#: The DFC docs recommend 64-1024 images; fewer than this makes the activation
+#: ranges noisy, and the zoo's own flows use ~1000. 128 is the floor where a
+#: set stops being mostly luck for a 1-class model.
+MIN_IMAGES = 128
 
-def frame_stats(frame):
-    """(mean, std) of a BGR frame as plain brightness numbers 0-255.
 
-    Pure (takes any array-like with `.mean()`): a near-black frame calibrates
-    nothing and usually means a lens cap or a dark room, so the tools print
-    these numbers instead of leaving you to guess.
+# ------------------------------------------------------------------ pure bits --
+def letterbox_to(frame, size=640):
+    """The runtime's OWN letterbox (detector._letterbox), so calibration sees
+    the exact tensor inference sees — same scale, same padding, same
+    interpolation. Re-implementing it here would drift the moment the runtime
+    changes, and the compiler would then compute ranges for a different input
+    distribution. Only a minimal local copy is kept for the case where
+    detector.py cannot be imported at all.
     """
-    import numpy as np
-    a = np.asarray(frame)
-    if a.ndim == 3:
-        a = a.mean(axis=2)
-    return float(a.mean()), float(a.std())
+    if _runtime_letterbox is not None:
+        return _runtime_letterbox(frame, size)[0]
+    h, w = frame.shape[:2]
+    s = min(size / float(w), size / float(h))
+    nw, nh = int(w * s), int(h * s)
+    img = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_LINEAR)
+    canvas = np.zeros((size, size, 3), dtype=np.uint8)
+    canvas[(size - nh) // 2:(size - nh) // 2 + nh,
+           (size - nw) // 2:(size - nw) // 2 + nw] = img
+    return canvas
 
 
-def signature(frame, size=16):
-    """Tiny grayscale fingerprint for near-duplicate detection."""
-    import numpy as np
-    a = np.asarray(frame)
-    if a.ndim == 3:
-        a = a.mean(axis=2)
-    h, w = a.shape[:2]
-    ys = (np.arange(size) * h // size).astype(int)
-    xs = (np.arange(size) * w // size).astype(int)
-    small = a[ys][:, xs].astype(np.float32)
-    return small
+def frame_quality(frame):
+    """(mean, std) of the grayscale frame — the two numbers that say whether
+    this frame can teach the compiler anything."""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return float(gray.mean()), float(gray.std())
 
 
-def is_duplicate(sig, kept_sigs, thr=3.0):
-    """True when `sig` is within `thr` mean-abs-difference of a kept one."""
-    import numpy as np
-    for k in kept_sigs:
-        if float(np.abs(sig - k).mean()) < thr:
+def keepable(mean, std, min_mean=12.0, max_mean=245.0, min_std=10.0):
+    """Dark/blown/flat frames are silently useless for calibration."""
+    if mean < min_mean:
+        return False, "too dark (mean %.0f)" % mean
+    if mean > max_mean:
+        return False, "blown out (mean %.0f)" % mean
+    if std < min_std:
+        return False, "flat/blank (std %.0f)" % std
+    return True, ""
+
+
+#: Two frames count as "the same scene" only when they also look equally
+#: exposed. Brightness variety is not noise to be deduplicated away — it is
+#: exactly what the compiler needs to see, since it drives the activation
+#: ranges. Without this, a set captured at three exposures collapses to one.
+BRIGHTNESS_TOL = 12.0
+SIMILAR_COS = 0.86          # combined key cosine above this = same scene
+
+
+def signature(frame, bins=32, n=8):
+    """(key, mean): a cheap 'is this a new scene?' fingerprint.
+
+    The key mixes the brightness DISTRIBUTION with a coarse layout thumbnail,
+    both unit-normalised, so it is not fooled the way a mean-subtracted
+    thumbnail alone is: two totally different noisy scenes share that, while
+    their histograms do not. `mean` rides along because dedupe must not throw
+    away exposure variety (see BRIGHTNESS_TOL).
+    """
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    hist = cv2.calcHist([gray], [0], None, [bins], [0, 256]).reshape(-1)
+    hist = hist / (float(hist.sum()) or 1.0)
+    thumb = cv2.cvtColor(cv2.resize(frame, (n, n),
+                                    interpolation=cv2.INTER_AREA),
+                         cv2.COLOR_BGR2GRAY).astype(np.float32)
+    thumb -= thumb.mean()
+    thumb /= (float(np.sqrt((thumb ** 2).sum())) or 1.0)
+    key = np.concatenate([hist, thumb.reshape(-1)]).astype(np.float32)
+    norm = float(np.sqrt((key ** 2).sum())) or 1.0
+    return key / norm, float(gray.mean())
+
+
+def too_similar(key, mean, kept, thresh=0.14, tol=BRIGHTNESS_TOL):
+    """kept: [(key, mean), ...] from frames already accepted.
+
+    Same scene AND same exposure -> a duplicate (drop it). Same scene but a
+    different exposure -> keep: those frames teach the compiler different
+    activation ranges.
+    """
+    for k, kmean in kept:
+        if (float((key * k).sum()) > (1.0 - thresh)
+                and abs(mean - kmean) < tol):
             return True
     return False
 
 
-def collect_from_paths(paths):
-    """Every image file under the given files/directories (sorted)."""
+def summarize(stats, want):
+    """stats: [(mean, std), ...] -> human lines about the set's diversity."""
+    lines = []
+    if not stats:
+        return ["BAD  no frames kept — nothing to calibrate with"]
+    means = np.array([s[0] for s in stats])
+    stds = np.array([s[1] for s in stats])
+    lines.append("kept %d frame(s); brightness mean %.0f-%.0f, detail (std) "
+                 "%.0f-%.0f" % (len(stats), means.min(), means.max(),
+                                stds.min(), stds.max()))
+    if len(stats) < MIN_IMAGES:
+        lines.append("WARN only %d frames — the DFC docs suggest 64-1024 and "
+                     "the zoo flows use ~1000; below ~%d the activation ranges "
+                     "get noisy. Capture more scenes, not more copies."
+                     % (len(stats), MIN_IMAGES))
+    if means.max() - means.min() < 25:
+        lines.append("WARN every frame has nearly the same brightness — a set "
+                     "from one time of day/location quantizes badly for the "
+                     "others. Add ground shots at the distance you hunt from.")
+    if stds.max() - stds.min() < 8:
+        lines.append("WARN very little variation in scene detail — include "
+                     "cluttered ground, not only sky/floor.")
+    if not any("WARN" in ln for ln in lines):
+        lines.append("OK   the set varies enough to be worth compiling with")
+    return lines
+
+
+# ------------------------------------------------------------------- plumbing --
+def iter_paths(paths):
     out = []
     for p in paths:
         if os.path.isdir(p):
-            for ext in IMG_EXT:
-                out += sorted(glob.glob(os.path.join(p, "*" + ext)))
-                out += sorted(glob.glob(os.path.join(p, "*" + ext.upper())))
-        elif os.path.isfile(p):
+            for f in sorted(os.listdir(p)):
+                if f.lower().endswith(IMG_EXT):
+                    out.append(os.path.join(p, f))
+        elif os.path.isfile(p) and p.lower().endswith(IMG_EXT):
             out.append(p)
-    # de-dup while keeping order (a path can be reached twice)
-    seen, uniq = set(), []
-    for p in out:
-        if p not in seen:
-            seen.add(p)
-            uniq.append(p)
-    return uniq
+    return out
 
 
-def summarize(stats, kept, candidates, out_dir, size, dropped):
-    """Human summary + the command to run next. Pure: takes numbers only."""
-    lines = []
-    lines.append("[calib] %d candidates -> %d kept (%s) in %s" % (
-        candidates, kept, ", ".join("%s %d" % (k, v)
-                                    for k, v in sorted(dropped.items()))
-        or "nothing dropped", out_dir))
-    if stats:
-        means = [m for m, _ in stats]
-        stds = [s for _, s in stats]
-        lines.append("[calib] brightness mean %.1f (%.1f..%.1f), contrast "
-                     "%.1f (%.1f..%.1f) — a narrow spread means a monotonous "
-                     "set, which is what breaks quantization"
-                     % (sum(means) / len(means), min(means), max(means),
-                        sum(stds) / len(stds), min(stds), max(stds)))
-    if kept < 128:
-        lines.append("[calib] WARNING: %d images < 128 — the DFC will still "
-                     "run, but 'cannot find suitable quantization params' "
-                     "becomes likely. Capture more frames (vary distance, "
-                     "lighting and the QR's size in frame)." % kept)
-    lines.append("[calib] on the x86 box (DFC venv):")
-    lines.append("    hailo optimize --hw-arch <hailo8|hailo8l> --har best.har "
-                 "\\")
-    lines.append("        --calib-path calib/ --model-script yolov8n.alls \\")
-    lines.append("        --output-har-path qr.har")
-    lines.append("    (--hw-arch must match `hailortcli fw-control identify` "
-                 "on the Pi; see training/compile_hef.md)")
-    if size:
-        lines.append("[calib] images are letterboxed to %dx%d uint8 RGB — the "
-                     "same as detector.py feeds at runtime" % (size, size))
-    return lines
+def iter_video(path, stride=5):
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        print("[calib] cannot open video %s" % path)
+        return
+    i = 0
+    while True:
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            break
+        if i % max(1, stride) == 0:
+            yield frame
+        i += 1
+    cap.release()
+
+
+def collect(args):
+    """-> (list of (frame, source, mean, std), skipped count)."""
+    frames, skipped = [], 0
+    sigs = []
+
+    def consider(frame, src, label):
+        nonlocal skipped
+        # Quality and diversity are judged on the REAL frame: letterboxing
+        # first would add the same black bars to every frame, pull every mean
+        # down by the padding ratio and pile the histograms onto 0 — which made
+        # genuinely different scenes score as duplicates and dusk frames as
+        # "too dark". The padding is applied at SAVE time, so the written
+        # images still match the runtime input exactly.
+        mean, std = frame_quality(frame)
+        ok, why = keepable(mean, std, args.min_mean, args.max_mean,
+                           args.min_std)
+        if not ok:
+            if args.verbose:
+                print("[calib] skip %s: %s" % (label, why))
+            skipped += 1
+            return
+        sig = signature(frame)
+        if too_similar(sig[0], sig[1], sigs, args.dedupe):
+            skipped += 1
+            if args.verbose:
+                print("[calib] skip %s: near-duplicate of a kept frame"
+                      % label)
+            return
+        sigs.append(sig)
+        if args.letterbox:
+            frame = letterbox_to(frame, args.letterbox)
+        frames.append((frame, src, mean, std))
+
+    for p in iter_paths(args.sources):
+        if len(frames) >= args.want:
+            break
+        img = cv2.imread(p, cv2.IMREAD_COLOR)
+        if img is None:
+            print("[calib] unreadable image %s" % p)
+            continue
+        consider(img, p, p)
+
+    if args.video:
+        n = 0
+        for frame in iter_video(args.video, args.video_stride):
+            if len(frames) >= args.want:
+                break
+            n += 1
+            consider(frame, args.video, "%s#%d" % (args.video, n))
+
+    return frames, skipped
 
 
 def main():
     ap = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--from", dest="paths", action="append", default=[],
-                    help="image file or directory (repeatable)")
-    ap.add_argument("--video", action="append", default=[],
-                    help="video file to sample frames from (repeatable)")
-    ap.add_argument("--camera", default="",
-                    help="csi[:role|:slot|:index] — capture live")
-    ap.add_argument("--frames", type=int, default=200,
-                    help="max frames to take from --camera/--video (default 200)")
-    ap.add_argument("--every", type=float, default=0.25,
-                    help="seconds between captured frames (default 0.25)")
-    ap.add_argument("--out", default="calib", help="output directory")
-    ap.add_argument("--size", type=int, default=640,
-                    help="network input size to letterbox to (default 640)")
-    ap.add_argument("--native", action="store_true",
-                    help="save frames at capture resolution instead of "
-                         "letterboxing to --size")
-    ap.add_argument("--min-mean", type=float, default=12.0,
-                    help="drop frames darker than this (default 12)")
-    ap.add_argument("--max-mean", type=float, default=243.0,
-                    help="drop frames brighter than this (default 243)")
-    ap.add_argument("--min-std", type=float, default=8.0,
-                    help="drop flat frames (no texture) below this (default 8)")
-    ap.add_argument("--dup-threshold", type=float, default=2.0,
-                    help="near-duplicate removal threshold, 0 = keep all "
-                         "(default 2.0 on a 16x16 signature)")
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--from", dest="sources", nargs="*", default=[],
+                    help="directories/files of frames (jpg/png)")
+    ap.add_argument("--video", default="", help="video file to sample frames from")
+    ap.add_argument("--video-stride", type=int, default=5,
+                    help="take every Nth video frame (default 5)")
+    ap.add_argument("--out", default="training/calib",
+                    help="output directory for the .jpg set (default "
+                         "training/calib)")
+    ap.add_argument("--want", type=int, default=256,
+                    help="how many frames to keep (default 256)")
+    ap.add_argument("--letterbox", type=int, default=640,
+                    help="letterbox each frame to NxN like the runtime does "
+                         "(0 = keep native resolution)")
+    ap.add_argument("--min-mean", type=float, default=12.0)
+    ap.add_argument("--max-mean", type=float, default=245.0)
+    ap.add_argument("--min-std", type=float, default=10.0,
+                    help="drop frames flatter than this (blank wall/ceiling)")
+    ap.add_argument("--dedupe", type=float, default=0.14,
+                    help="0 = keep everything, higher = drop more near-duplicates")
     ap.add_argument("--npz", action="store_true",
-                    help="also write calib.npz with an (N,size,size,3) uint8 "
-                         "'images' array for flows that want a numpy set")
+                    help="also write <out>.npz with an (N,H,W,3) uint8 array "
+                         "for flows that want a numpy calibration set")
+    ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
-    try:
-        import cv2
-        import numpy as np
-    except Exception as e:
-        print("need opencv + numpy on the Pi: %r" % e)
+    if not args.sources and not args.video:
+        ap.print_help()
+        print("\ngive --from <dir> and/or --video <file>")
         return 2
 
-    from detector import _letterbox   # the runtime's own letterbox
-
-    sources = list(args.paths)
-    files = collect_from_paths(sources)
-    mode = "files"
-    if not files and not args.video and not args.camera:
-        print("nothing to read: give --from <dir>, --video <file> or "
-              "--camera csi:bottom")
-        return 2
+    frames, skipped = collect(args)
+    if not frames:
+        print("[calib] nothing kept — are the paths right, and are the frames "
+              "above --min-mean/--min-std?")
+        return 3
 
     os.makedirs(args.out, exist_ok=True)
-    dropped = {"dark": 0, "blown": 0, "flat": 0, "duplicate": 0,
-               "unreadable": 0}
-    kept_sigs, stats, n = [], [], 0
-    n_cand = 0
+    for i, (frame, _src, _m, _s) in enumerate(frames, 1):
+        cv2.imwrite(os.path.join(args.out, "calib_%04d.jpg" % i), frame,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), 95])
 
-    def take(frame, tag):
-        nonlocal n, n_cand
-        n_cand += 1
-        if frame is None:
-            dropped["unreadable"] += 1
-            return False
-        if n >= args.frames:
-            return False
-        mean, std = frame_stats(frame)
-        stats.append((mean, std))
-        if mean < args.min_mean:
-            dropped["dark"] += 1
-            return False
-        if mean > args.max_mean:
-            dropped["blown"] += 1
-            return False
-        if std < args.min_std:
-            dropped["flat"] += 1
-            return False
-        if args.dup_threshold > 0:
-            sig = signature(frame)
-            if is_duplicate(sig, kept_sigs, args.dup_threshold):
-                dropped["duplicate"] += 1
-                return False
-            kept_sigs.append(sig)
-        out = frame if args.native else _letterbox(frame, args.size)[0]
-        path = os.path.join(args.out, "%04d.jpg" % n)
-        if not cv2.imwrite(path, out):
-            print("[calib] could not write %s" % path)
-            dropped["unreadable"] += 1
-            return False
-        n += 1
-        return True
+    print("[calib] wrote %d frame(s) to %s (skipped %d)"
+          % (len(frames), args.out, skipped))
+    for ln in summarize([(m, s) for (_f, _s2, m, s) in frames], args.want):
+        print("[calib] %s" % ln)
 
-    for path in files:
-        take(cv2.imread(path), path)
+    if args.npz:
+        arr = np.stack([f for (f, _s2, _m, _s) in frames]).astype(np.uint8)
+        npz = os.path.splitext(args.out.rstrip("/"))[0] + ".npz"
+        np.savez_compressed(npz, images=arr)
+        print("[calib] wrote %s — images %s (uint8 RGB, N,H,W,3)"
+              % (npz, list(arr.shape)))
 
-    for vid in args.video:
-        cap = cv2.VideoCapture(vid)
-        if not cap.isOpened():
-            print("[calib] cannot open video %s" % vid)
-            continue
-        step = max(1, int(cap.get(cv2.CAP_PROP_FPS) * args.every))
-        idx = 0
-        while n < args.frames:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            if idx % step == 0:
-                take(frame, vid)
-            idx += 1
-        cap.release()
-
-    if args.camera and n < args.frames:
-        try:
-            from cameras import CameraRig
-            import yaml
-            cfg = {}
-            conf_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                     os.pardir, "config.yaml")
-            if os.path.isfile(conf_path):
-                with open(conf_path) as f:
-                    cfg = yaml.safe_load(f) or {}
-            from tools.test_yolo_webcam_qr import CSISource
-            import time
-            src = CSISource(args.camera, cfg)
-            while n < args.frames:
-                ok, frame = src.read()
-                if not ok or frame is None:
-                    break
-                take(frame, args.camera)
-                time.sleep(max(0.0, args.every))
-            src.release()
-        except Exception as e:
-            print("[calib] camera source failed (%r) — files/videos already "
-                  "collected are kept" % e)
-
-    if args.npz and n:
-        arr = []
-        for i in range(n):
-            img = cv2.imread(os.path.join(args.out, "%04d.jpg" % i))
-            if img is not None:
-                arr.append(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-        if arr:
-            np.savez_compressed(os.path.join(args.out, "calib.npz"),
-                                images=np.stack(arr).astype(np.uint8))
-            print("[calib] wrote %s/calib.npz %s" % (args.out,
-                  np.stack(arr).shape))
-
-    for line in summarize(stats, n, n_cand, args.out,
-                          None if args.native else args.size, dropped):
-        print(line)
-    return 0 if n else 1
+    print("[calib] now compile with:" )
+    print("  hailo optimize --hw-arch <hailo8|hailo8l> \\\n"
+          "      --calib-path %s --model-script yolov8n.alls \\\n"
+          "      -y -o qr_yolov8n_quantized.har qr_yolov8n.har" % args.out)
+    print("[calib] (that model script is the Zoo's yolov8n.alls with the edits "
+          "in training/compile_hef.md §2 — 1 class, and nms_postprocess "
+          "pointing at training/nms_config.json so the HEF's decoders carry "
+          "OUR names: check with tools/hef_info.py --nms-config)")
+    print("[calib] (arch comes from `hailortcli fw-control identify` ON THE PI "
+          "— hailo8 and hailo8l HEFs are not interchangeable)")
+    return 0
 
 
 if __name__ == "__main__":

@@ -6,25 +6,24 @@
   "classes": 1,
   "regression_length": 16,
   "background_removal": false,
-  "background_removal_index": 0,
   "bbox_decoders": [
     {
-      "name": "qr_yolov8n/yolov8_nms_postprocess",
-      "stride": 32,
+      "name": "qr_yolov8n/bbox_decoder41",
+      "stride": 8,
       "reg_layer": "qr_yolov8n/conv41",
       "cls_layer": "qr_yolov8n/conv42"
     },
     {
-      "name": "qr_yolov8n/yolov8_nms_postprocess",
+      "name": "qr_yolov8n/bbox_decoder52",
       "stride": 16,
-      "reg_layer": "qr_yolov8n/conv53",
-      "cls_layer": "qr_yolov8n/conv54"
+      "reg_layer": "qr_yolov8n/conv52",
+      "cls_layer": "qr_yolov8n/conv53"
     },
     {
-      "name": "qr_yolov8n/yolov8_nms_postprocess",
-      "stride": 8,
-      "reg_layer": "qr_yolov8n/conv63",
-      "cls_layer": "qr_yolov8n/conv64"
+      "name": "qr_yolov8n/bbox_decoder62",
+      "stride": 32,
+      "reg_layer": "qr_yolov8n/conv62",
+      "cls_layer": "qr_yolov8n/conv63"
     }
   ]
 }

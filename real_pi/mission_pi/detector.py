@@ -196,6 +196,7 @@ class HailoYolo8Detector(Detector):
         self.nms_order = _order_of(nms_order)
         self._lock = threading.Lock()
         self._out_style = None
+        self._fails = 0        # consecutive infer failures (see detect)
         self._stack = contextlib.ExitStack()
         try:
             hef = HEF(hef_path)
@@ -217,6 +218,17 @@ class HailoYolo8Detector(Detector):
             # once, here, and keep it open until close().
             self._streams = self._stack.enter_context(
                 InferVStreams(self._ng, in_p, out_p))
+            # ...and the network group must be ACTIVATED. Writing to a vstream
+            # while it is not fails on the device with
+            #   HAILO_NETWORK_GROUP_NOT_ACTIVATED(69)
+            # "Trying to write to vstream … before its network group is
+            # activated", once per frame. This is the nesting Hailo's own
+            # examples use: InferVStreams outside, activate() inside (with the
+            # scheduler enabled activate() is a no-op and returns an empty
+            # context manager, which is fine).
+            activate = getattr(self._ng, "activate", None)
+            if callable(activate):
+                self._stack.enter_context(activate(self._ng_params))
             infos = hef.get_input_vstream_infos()
             self._in_name = infos[0].name if infos else None
             self._out_infos = hef.get_output_vstream_infos()
@@ -238,13 +250,36 @@ class HailoYolo8Detector(Detector):
                  hef_path, self._in_name, self.input_size,
                  "; ".join(desc) or "?", self.nms_order)
 
+    #: Consecutive infer failures before this detector stops calling the HAT.
+    #: A broken pipeline used to produce one native HailoRT error line PER
+    #: FRAME (~70 lines/second in the field log) while the mission silently saw
+    #: zero boxes; louder-once + stop is the honest behaviour.
+    DEGRADE_AFTER = 20
+
     def detect(self, frame_bgr):
+        if self._fails >= self.DEGRADE_AFTER:
+            return []
         try:
             with self._lock:
-                return self._detect_locked(frame_bgr)
+                boxes = self._detect_locked(frame_bgr)
+            self._fails = 0
+            return boxes
         except Exception as e:
-            log.debug("hailo detect failed: %r", e)
+            self._fails += 1
+            self._report_failure(e)
             return []
+
+    def _report_failure(self, e):
+        """Say what broke, in the log, at most a few times."""
+        n = self._fails
+        if n <= 3 or n in (10, self.DEGRADE_AFTER):
+            log.warning("hailo infer failed %d time(s): %r%s", n, e,
+                        "" if n < self.DEGRADE_AFTER else
+                        " — giving up on the HAT for this run; boxes will be "
+                        "missing (restart to retry). If the message mentions "
+                        "HAILO_NETWORK_GROUP_NOT_ACTIVATED the network group "
+                        "was not activated; if it mentions vstream, the HEF's "
+                        "input name/shape does not match what we feed it.")
 
     def _detect_locked(self, frame_bgr):
         ih, iw = frame_bgr.shape[:2]

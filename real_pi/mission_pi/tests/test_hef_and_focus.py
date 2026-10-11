@@ -50,43 +50,20 @@ def test_frame_stats_and_signature():
     # sigma~74 comes out at ~42 (sigma/sqrt(3)) — assert on that, not on 74
     check("a textured frame has high contrast", s3 > 30, (m3, s3))
 
-    sig = MC.signature(flat)
+    # The calibration-set internals (letterbox match, quality gate, dedupe,
+    # summary) are owned by tests/test_calib_set.py — one home per behaviour,
+    # so the two files cannot drift apart the way they just did. What stays
+    # here is the cross-file contract: the fingerprint size, and the fact that
+    # a frame is always a duplicate of itself.
+    key, mean = MC.signature(flat)
     check("the signature is a small fixed-size fingerprint",
-          sig.shape == (16, 16), sig.shape)
+          key.shape == (32 + 8 * 8,) and abs(mean - 128.0) < 1.0,
+          (key.shape, mean))
     check("the same image is a duplicate of itself",
-          MC.is_duplicate(sig, [sig]) is True)
-    other = MC.signature(noise)
-    check("a different image is not", MC.is_duplicate(other, [sig]) is False)
-
-
-def test_calib_collection_and_summary():
-    import tempfile
-    with tempfile.TemporaryDirectory() as td:
-        # three images: flat (dropped), dark (dropped), textured (kept)
-        import cv2
-        cv2.imwrite(os.path.join(td, "flat.jpg"), np.full((64, 64, 3), 120, np.uint8))
-        cv2.imwrite(os.path.join(td, "dark.jpg"), np.zeros((64, 64, 3), np.uint8))
-        cv2.imwrite(os.path.join(td, "texture.jpg"),
-                    np.random.RandomState(1).randint(0, 255, (64, 64, 3)).astype(np.uint8))
-        found = MC.collect_from_paths([td])
-        check("all images in a directory are found",
-              len(found) == 3, len(found))
-        check("a single file path also works",
-              len(MC.collect_from_paths([os.path.join(td, "flat.jpg")])) == 1)
-        check("a missing path is not a crash, just nothing",
-              MC.collect_from_paths([os.path.join(td, "nope")]) == [])
-
-        lines = MC.summarize([(100.0, 40.0), (101.0, 41.0)], 2, 400, "calib",
-                             640, {"duplicate": 398})
-        text = "\n".join(lines)
-        check("the summary warns when the set is under 128 images",
-              "< 128" in text, text)
-        check("it says what the letterbox is for",
-              "letterboxed to 640x640" in text, text)
-        check("it hands over the exact optimize command",
-              "hailo optimize" in text and "--calib-path calib/" in text, text)
-        check("it refuses to guess the arch",
-              "hailo8|hailo8l" in text and "fw-control identify" in text, text)
+          MC.too_similar(key, mean, [(key, mean)]) is True)
+    okey, omean = MC.signature(noise)
+    check("a different image is not",
+          MC.too_similar(okey, omean, [(key, mean)]) is False)
 
 
 # ------------------------------------------------------------- focus gate --
@@ -353,11 +330,29 @@ def _fake_hailo_platform(modern=True):
         def get_output_vstream_infos(self):
             return self.outs
 
+    #: Shared state so the fake can ENFORCE what the real device enforces:
+    #: writing to a vstream while the network group is not activated fails with
+    #: HAILO_NETWORK_GROUP_NOT_ACTIVATED(69) — the exact error that made the
+    #: HAT look idle in the field.
+    state = {"activated": False, "deactivated": False}
+
     class NG:
         name = "qr_yolov8n"
 
         def create_params(self):
             return "group-params"
+
+        def activate(self, params=None):
+            class Act:
+                def __enter__(self_):
+                    state["activated"] = True
+                    return self_
+
+                def __exit__(self_, *a):
+                    state["activated"] = False
+                    state["deactivated"] = True
+                    return False
+            return Act()
 
     class VDev:
         def __init__(self):
@@ -389,10 +384,21 @@ def _fake_hailo_platform(modern=True):
             Streams.closed = True
             return False
 
+        calls = 0
+        fail = False
+
         def infer(self, data):
+            Streams.calls += 1
             if self._infer_pipeline is None:
                 raise AttributeError("'NoneType' object has no attribute "
                                      "'infer' — InferVStreams was never entered")
+            if not state["activated"]:
+                raise RuntimeError(
+                    "HAILO_NETWORK_GROUP_NOT_ACTIVATED(69): Trying to write to "
+                    "vstream qr_yolov8n/input_layer1 before its network group "
+                    "is activated")
+            if Streams.fail:
+                raise RuntimeError("simulated device error")
             return {"qr_yolov8n/yolov8_nms_postprocess": Streams.next_output}
 
     class Params:
@@ -424,6 +430,7 @@ def _fake_hailo_platform(modern=True):
 
         mod.ConfigureParams = OldConfigureParams
         mod.HEF = Hef
+    mod.STATE = state
     return mod, Streams
 
 
@@ -453,6 +460,8 @@ def test_hailo_detector_enters_the_pipeline_and_reads_nms():
               det._streams.ng.name == "qr_yolov8n" and Streams.entered,
               Streams.entered)
         check("the pipeline is entered before any inference", Streams.entered)
+        check("the network group is ACTIVATED (not just configured)",
+              fake.STATE["activated"] is True, fake.STATE)
 
         # Exactly what HailoRT hands back for an NMS output: one array per
         # class, (K,5), Hailo order y_min,x_min,y_max,x_max,score, normalised.
@@ -494,7 +503,62 @@ def test_hailo_detector_enters_the_pipeline_and_reads_nms():
             sys.modules["hailo_platform"] = saved
 
     check("close() exits the pipeline (releases the device)", Streams.closed)
+    check("close() also DEACTIVATES the network group",
+          fake.STATE["deactivated"] is True and
+          fake.STATE["activated"] is False, fake.STATE)
     check("the detector says hailo, not onnx", detector.HailoYolo8Detector.name)
+
+
+def test_hailo_failures_are_loud_once_and_then_stop():
+    """A broken pipeline used to log one native HailoRT error PER FRAME while
+    the mission silently saw no boxes. Now: keep flying, say it out loud a few
+    times, then stop calling the HAT (and say that too)."""
+    import logging
+    import sys
+    import numpy as np
+    import detector
+
+    hef_path = os.path.join(PI, "models", "qr_yolov8n.hef")
+    fake, Streams = _fake_hailo_platform(modern=True)
+    saved = sys.modules.get("hailo_platform")
+    sys.modules["hailo_platform"] = fake
+    captured = []
+
+    class Cap(logging.Handler):
+        def emit(self, record):
+            captured.append(record.getMessage())
+
+    handler = Cap()
+    det = None
+    try:
+        det = detector.HailoYolo8Detector(hef_path, input_size=640)
+        Streams.calls = 0
+        Streams.fail = True
+        frame = np.zeros((480, 640, 3), np.uint8)
+        detector.log.addHandler(handler)
+        detector.log.setLevel(logging.WARNING)
+        for _ in range(detector.HailoYolo8Detector.DEGRADE_AFTER + 5):
+            # must never raise, and must never return a box out of a failure
+            assert det.detect(frame) == []
+        check("it stopped calling the HAT instead of erroring every frame",
+              0 < Streams.calls <= detector.HailoYolo8Detector.DEGRADE_AFTER,
+              Streams.calls)
+        text = "\n".join(captured)
+        check("it said in the log that infer failed", "hailo infer failed" in text)
+        check("and named the likely cause (activation vs vstream)",
+              "NETWORK_GROUP_NOT_ACTIVATED" in text and "vstream" in text, text)
+        check("it did not log every single failure",
+              len([m for m in captured if "hailo infer failed" in m]) <= 5,
+              len(captured))
+    finally:
+        detector.log.removeHandler(handler)
+        if det is not None:
+            det.close()
+        Streams.fail = False
+        if saved is None:
+            sys.modules.pop("hailo_platform", None)
+        else:
+            sys.modules["hailo_platform"] = saved
 
 
 def test_hailo_detector_survives_the_old_api_and_a_broken_runtime():
@@ -622,7 +686,6 @@ def test_model_path_resolution():
 
 if __name__ == "__main__":
     test_frame_stats_and_signature()
-    test_calib_collection_and_summary()
     test_focus_gate_matches_the_field_run()
     test_curve_verdict_on_the_real_numbers()
     test_focus_sweep_defaults_to_the_mission_config()
@@ -632,6 +695,7 @@ if __name__ == "__main__":
     test_hailo_configure_params_probe()
     test_hailo_decode_reads_every_layout()
     test_hailo_detector_enters_the_pipeline_and_reads_nms()
+    test_hailo_failures_are_loud_once_and_then_stop()
     test_hailo_detector_survives_the_old_api_and_a_broken_runtime()
     test_foreign_class_count_warning()
     test_shipped_nms_config_is_valid()
