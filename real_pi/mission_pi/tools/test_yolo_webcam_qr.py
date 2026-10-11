@@ -44,7 +44,7 @@ LIVE KEYS (window mode):
   f  hide/show rejected (fake) boxes        v  toggle require-decode
   k  conf +0.05                              l  conf -0.05
   t  toggle 3x3 tiling                       p  next preset
-  1-7 select preset by number                q / ESC quit
+  1-8 select preset by number                q / ESC quit
 
 Ground recommendation (field report): preset `dark` (a.k.a.
 dark_qr_boost) + --tiled for night; preset `kabaddi` at ground level.
@@ -64,7 +64,7 @@ try:
 except Exception:
     yaml = None
 
-PRESET_KEYS = "1234567"  # key -> preset list position
+PRESET_KEYS = "12345678"  # key -> preset list position
 
 
 #: Which tuning keys a boost profile is expected to move. Only used to PRINT
@@ -370,6 +370,13 @@ class CSISource:
         print("[camera] CSI %s (%s) model=%s size=%s autofocus=%s"
               % (pick.name, pick.facing, pick.model, self._size,
                  getattr(pick, "autofocus", None)))
+        _qb = getattr(pick, "qr_boost", None) or {}
+        print("[detector-input] %s  (config.yaml qr_boost.detect_raw)"
+              % ("RAW / gamma-corrected" if _qb.get("detect_raw")
+                 else "software-boosted (CLAHE+unsharp)"))
+        print("[exposure] dark frames are rescued automatically: a manual "
+              "profile hands exposure back to the AE (%s)"
+              % ("arms after %.0f s" % getattr(pick, "RESCUE_COOLDOWN", 5.0)))
 
     # -- cv2.VideoCapture lookalikes -------------------------------------
     def isOpened(self):
@@ -394,7 +401,9 @@ class CSISource:
         deadline = time.time() + 2.0
         while time.time() < deadline:
             try:
-                frame, _ts, _n = self.cam.latest()
+                # detect=True so the bench shows exactly what the DETECTOR
+                # gets (config.yaml qr_boost.detect_raw: raw vs CLAHE-boosted)
+                frame, _ts, _n = self.cam.latest(detect=True)
             except Exception:
                 frame = None
             if frame is not None:
@@ -435,7 +444,7 @@ def main():
                     help="detector conf floor (default: the preset's conf)")
     ap.add_argument("--iou", type=float, default=0.45, help="NMS iou (default 0.45)")
     ap.add_argument("--preset", default="day",
-                    help="qr_presets entry: day|far|dark|kabaddi|low|"
+                    help="qr_presets entry: day|far|dark|kabaddi|low|auto|"
                          "aggressive|bench (aliases: dark_qr_boost, night, "
                          "ground, 15m). 'none' = plain --conf, no preset")
     ap.add_argument("--require-decode", action="store_true",
@@ -603,7 +612,7 @@ def main():
             "| %.1f fps | focus %.0f"
             % (qf.min_conf, qf.min_side_px, qf.aspect_min, qf.aspect_max,
                raw_n, filt_n, fps, sharp),
-            "keys: f fakes  v req-decode  k/l conf  t tile  p 1-7 preset  q quit",
+            "keys: f fakes  v req-decode  k/l conf  t tile  p 1-8 preset  q quit",
         ]
         y = 26
         for ln in lines:
@@ -733,7 +742,7 @@ def main():
                     print("[bench] wrote %s" % path)
 
         if _show:
-            cv2.imshow("QR bench (f/v/k/l/t/p/1-7/q)", frame)
+            cv2.imshow("QR bench (f/v/k/l/t/p/1-8/q)", frame)
             k = cv2.waitKey(1) & 0xFF
             if k in (ord("q"), 27):
                 break

@@ -84,6 +84,14 @@ DEFAULT_PRESETS = {
         "require_decode_for_cue": False, "boost": "normal",
         "desc": "SITL/bench — full frame, fastest, no boost",
     },
+    # key 8 — fallback copy of config.yaml `qr_presets.auto`, so the built-in
+    # table still matches the shipped config (the field report's dark-room run:
+    # a preset may never leave the camera black — this one is auto exposure).
+    "auto": {
+        "conf_thr": 0.30, "tile_grid": [3, 3], "full_decode_every_n": 2,
+        "require_decode_for_cue": False, "boost": "qr_boost_auto",
+        "desc": "auto exposure + auto recovery: any light, never black",
+    },
 }
 
 # The user's other-session tool was launched with --preset dark_qr_boost;

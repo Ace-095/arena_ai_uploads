@@ -35,7 +35,8 @@ class ResolutionTest(unittest.TestCase):
             with self.subTest(facing=facing,front=front,detector=detname):
                 frame = np.zeros((480,640,3),np.uint8)
                 cam = SimpleNamespace(name='cam1',facing=facing,
-                    latest=lambda:(frame,time.time(),1),set_overlay=lambda *a:None)
+                    latest=lambda raw=False,detect=False:(frame,time.time(),1),
+                    set_overlay=lambda *a:None)
                 cfg = {'detector':{'tile_front':front,'tile_bottom':True,'tile_overlap':.1},
                        'qr_filter':{'require_decode_for_cue':True}}
                 det = SimpleNamespace(name=detname)

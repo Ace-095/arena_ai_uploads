@@ -279,6 +279,15 @@ def bring_up_thread(cfg, args, fc, rig, det_box, streams, mission, hub, bu):
                                              "msg": "%s QR boost %s — contrast high, sat low, sharp high, QR pops vs ground" % (cam_name, profile)})
                         except Exception as e:
                             log.warning("%s QR boost %r failed: %r", cam_name, profile, e)
+                        # Which frame the DETECTOR eats (see cameras.latest):
+                        # False (default) = the software-boosted one, True = the
+                        # raw/gamma frame the model was trained on.
+                        cam.qr_boost["detect_raw"] = bool(
+                            per_cam_qr.get("detect_raw",
+                                           qr_boost_cfg.get("detect_raw", False)))
+                        log.info("%s detector input: %s", cam_name,
+                                 "RAW (no CLAHE)" if cam.qr_boost["detect_raw"]
+                                 else "software-boosted frame")
                         sw_mode = per_cam_qr.get("software_mode") or qr_boost_cfg.get("software_mode", "qr_boost")
                         if sw_mode:
                             cam.qr_boost["qr_software_enhance"] = True

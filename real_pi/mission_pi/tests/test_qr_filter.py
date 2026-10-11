@@ -150,9 +150,30 @@ class _StubMission:
 
 
 class TestPresets(unittest.TestCase):
+    def test_config_yaml_agrees_with_the_builtin_table(self):
+        """The built-in table is the fallback for a missing/edited config.yaml,
+        so the two may never drift apart (this is exactly how the 'auto'
+        preset was nearly shipped without its fallback copy)."""
+        import os
+        import yaml
+        path = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "config.yaml")
+        if not os.path.exists(path):
+            self.skipTest("installed copy — no config.yaml next to the code")
+        cfg = (yaml.safe_load(open(path)) or {}).get("qr_presets") or {}
+        self.assertEqual(list(cfg), list(DEFAULT_PRESETS),
+                         "preset names/order differ")
+        for name, want in cfg.items():
+            got = DEFAULT_PRESETS[name]
+            for key in ("conf_thr", "tile_grid", "full_decode_every_n",
+                        "require_decode_for_cue", "boost"):
+                self.assertEqual(got.get(key), want.get(key),
+                                 "%s.%s differs (config vs built-in)" % (name, key))
+
     def test_builtin_table_shape(self):
         names = list(DEFAULT_PRESETS.keys())
-        self.assertEqual(len(names), 7)          # the 1-7 key order
+        self.assertEqual(len(names), 8)          # the 1-8 key order
+        self.assertEqual(names[-1], "auto")      # key 8 = any light
         self.assertEqual(names[:3], ["day", "far", "dark"])
         for p in DEFAULT_PRESETS.values():
             self.assertIn("conf_thr", p)

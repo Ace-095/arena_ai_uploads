@@ -266,7 +266,8 @@ class Mission:
         n = 0
         last_count = -1
         while not self._stop.is_set():
-            frame, ts, count = cam.latest()
+            # detect=True: config.yaml `qr_boost.detect_raw` picks the input
+            frame, ts, count = cam.latest(detect=True)
             if frame is None or count == last_count:
                 time.sleep(0.05)
                 continue

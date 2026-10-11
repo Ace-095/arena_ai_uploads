@@ -109,7 +109,7 @@ class DetectionResponseTest(unittest.TestCase):
         self.fc = RecordingFC()
         self.events = []
         self.cam = SimpleNamespace(name='cam2',facing='bottom',size=(1280,720),
-            hfov_deg=66.,rotation_deg=0,latest=lambda:(self.frame,self.clock.time(),1),
+            hfov_deg=66.,rotation_deg=0,latest=lambda raw=False,detect=False:(self.frame,self.clock.time(),1),
             set_overlay=lambda *a:None)
         cams = {'cam2':self.cam}
         self.rig = SimpleNamespace(cams=cams,get=lambda name:cams.get(name))

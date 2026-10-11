@@ -9,7 +9,15 @@ Hardware ISP tuning (Pi Cam3 + IMX477) + software enhancement (CLAHE, unsharp, c
 Profiles:
   - normal: default libcamera auto
   - qr_boost_day: high contrast, high sharpness, low saturation (ground desat), slightly dark, manual exposure
-  - qr_boost_lowlight: higher gain, slightly brighter
+  - qr_boost_lowlight: AUTO EXPOSURE with a long frame-duration budget (up to
+    100 ms) + high-quality NR — the night-ground profile. Manual exposure is
+    deliberately NOT used at night: AeEnable=false in a dark room = black.
+  - qr_boost_night: as above but 200 ms / 5 fps (very dark ground, static scene)
+  - qr_boost_auto: AE always; cannot go black whatever the light is
+
+  Tuning keys beyond exposure/gain: frame_duration_us (=> FrameDurationLimits,
+  the ceiling the AE may expose to), ae_exposure_mode (normal|long|short),
+  noise_reduction (off|fast|highquality), exposure_value (EV bias).
   - qr_boost_ground_suppress: desaturate green/brown, boost B/W
 """
 
@@ -35,6 +43,68 @@ except Exception:
 # Values are in contract tuning units (same as UI sliders):
 # exposure_us µs, gain_db dB, brightness -100..100, contrast 0..2, saturation 0..2, sharpness 0..2
 # These make QR black/white pop vs ground green/brown.
+
+#: Frame mean (0..255) below which the picture is too dark to see, let alone
+#: decode, and a MANUAL exposure profile has to be overridden. Field report
+#: 2026-10-13: pressing presets set the camera to {AeEnable: False,
+#: ExposureTime: 5000, AnalogueGain: 1.26} — a DAYLIGHT-GROUND setting — in a
+#: night room, and the window went black (frame_mean=4). libcamera's AeEnable
+#: false means manual exposure AND manual gain, so a manual profile in the dark
+#: cannot recover by itself: something has to hand exposure back to the AE.
+DARK_MEAN = 32.0
+#: Above this the frame is blown out, which destroys QR contrast just as badly.
+BLOWN_MEAN = 230.0
+#: Once the scene is this bright again, a rescued camera may go back to the
+#: profile the operator asked for (hysteresis: 32 -> 60, so it cannot flap).
+RESTORE_MEAN = 60.0
+
+#: What "give exposure back to the camera" means concretely: AE ON, a long
+#: FrameDurationLimits budget (AE clips its own exposure to that), the long
+#: exposure profile so AE trades time for gain (less noise), high-quality noise
+#: reduction, and a small brightness lift.
+RESCUE_TUNING = {
+    "adaptive": True,
+    "frame_duration_us": 100000,     # 10 fps: AE may expose up to 100 ms
+    "ae_exposure_mode": "long",
+    "noise_reduction": "highquality",
+    "brightness": 8.0,
+    "contrast": 1.5,
+    "saturation": 0.8,
+    "sharpness": 1.9,
+}
+
+
+def dark_rescue(tuning, mean, std=None):
+    """Manual profile + a dark (or blown) frame -> (overrides, reason)|(None,None).
+
+    Pure, so the decision is testable without a camera. Only MANUAL profiles are
+    rescued — an adaptive one is already exposing the scene correctly and must
+    not be fought with. The rescue never guesses a new manual exposure (that is
+    what produced the black picture); it hands exposure back to the AE and gives
+    it a long frame-duration budget to work with.
+    """
+    if not tuning or mean is None or mean < 0:
+        return None, None
+    if tuning.get("adaptive", True):
+        return None, None
+    if mean < DARK_MEAN:
+        why = ("the scene is dark (frame mean %.0f < %.0f) and this profile "
+               "forces manual exposure/gain %sms/%sx"
+               % (mean, DARK_MEAN, tuning.get("exposure_us"),
+                  tuning.get("gain_db")))
+    elif mean > BLOWN_MEAN:
+        why = ("the scene is blown out (frame mean %.0f > %.0f) and this "
+               "profile forces manual exposure %sms"
+               % (mean, BLOWN_MEAN, tuning.get("exposure_us")))
+    else:
+        return None, None
+    return dict(RESCUE_TUNING), why
+
+
+def recovered(mean):
+    """Is the scene bright enough to hand the operator's profile back?"""
+    return bool(mean is not None and mean >= RESTORE_MEAN)
+
 
 QR_BOOST_PROFILES = {
     # Normal — libcamera auto, for reference
@@ -75,17 +145,59 @@ QR_BOOST_PROFILES = {
         "af_mode": "continuous",
         "description": "Aggressive — contrast 2.0, sat 0.5, sharp 2.2, very dark — ground suppressed"
     },
-    # Low light / overcast
+    # Low light / overcast / night ground. AUTO EXPOSURE ON: at 8 ms manual it
+    # produced a black window indoors at night (frame_mean=4), because
+    # AeEnable=false is manual exposure AND manual gain. The frame-duration
+    # budget is what actually lets the sensor collect light (AE clips its own
+    # exposure to FrameDurationLimits), and the "long" exposure profile makes AE
+    # trade time for gain, which is less noisy for a static QR on the ground.
     "qr_boost_lowlight": {
-        "adaptive": False,
-        "exposure_us": 8000,
+        "adaptive": True,
+        "frame_duration_us": 100000,   # up to 100 ms of exposure (10 fps)
+        "ae_exposure_mode": "long",
+        "noise_reduction": "highquality",
+        "exposure_us": 8000,           # what a MANUAL fallback would use
         "gain_db": 6.0,
-        "brightness": 5.0,
-        "contrast": 1.6,
+        "brightness": 8.0,
+        "contrast": 1.5,
+        "saturation": 0.8,
+        "sharpness": 1.9,
+        "af_mode": "continuous",
+        "description": "Night/low light — AE on, up to 100 ms exposure, high-"
+                       "quality NR, contrast 1.5 (was 8 ms manual = black)"
+    },
+    # Very dark ground (no street light): 5 fps, only for a stationary scene.
+    "qr_boost_night": {
+        "adaptive": True,
+        "frame_duration_us": 200000,   # up to 200 ms of exposure (5 fps)
+        "ae_exposure_mode": "long",
+        "noise_reduction": "highquality",
+        "exposure_us": 30000,
+        "gain_db": 12.0,
+        "brightness": 10.0,
+        "contrast": 1.4,
         "saturation": 0.8,
         "sharpness": 1.8,
         "af_mode": "continuous",
-        "description": "Low light — brighter, higher gain, contrast 1.6"
+        "description": "Very dark ground — AE on, up to 200 ms exposure "
+                       "(5 fps, static scene only), max NR"
+    },
+    # General purpose: let the camera expose the scene itself, boost the ISP.
+    # Safest profile indoors — it cannot go black, whatever the light is.
+    "qr_boost_auto": {
+        "adaptive": True,
+        "frame_duration_us": 66666,    # 15 fps, up to 66 ms of exposure
+        "ae_exposure_mode": "normal",
+        "noise_reduction": "fast",
+        "exposure_us": 8000,
+        "gain_db": 6.0,
+        "brightness": 0.0,
+        "contrast": 1.6,
+        "saturation": 0.85,
+        "sharpness": 2.0,
+        "af_mode": "continuous",
+        "description": "Auto exposure + ISP sharpening — cannot be blinded by "
+                       "the light level"
     },
     # Bottom cam specific — fixed focus, infinity, ground suppress
     "bottom_qr_boost": {

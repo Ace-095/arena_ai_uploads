@@ -56,8 +56,9 @@ class FakeCam:
     def stop(self):
         self.stopped += 1
 
-    def latest(self):
+    def latest(self, raw=False, detect=False):
         # a real frame first, then None (to exercise the wait loop once)
+        # (raw/detect mirror cameras.Camera.latest — see qr_boost.detect_raw)
         self.frames += 1
         if self.frames == 1:
             return None, None, 0

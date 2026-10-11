@@ -185,9 +185,19 @@ class _BaseCamera:
     #: Contract tuning shape (api-contract.md Pi REST): the UI sliders speak
     #: these units. Defaults mirror the UI slider defaults so a fresh seed is
     #: a no-op round-trip.
+    #: `frame_duration_us` is the ceiling the auto-exposure may expose to
+    #: (FrameDurationLimits): with the default 33333 the AE can never expose
+    #: longer than 30 fps allows, which is what makes night scenes black no
+    #: matter what the gain does. The other three are ISP/AE hints the night
+    #: profiles set (long exposure mode, high-quality noise reduction, EV bias).
     TUNING_DEFAULTS = {"exposure_us": 8333, "gain_db": 6.0, "af_mode": "auto",
                        "adaptive": True, "brightness": 0.0, "contrast": 1.0,
-                       "saturation": 1.0, "sharpness": 1.0}
+                       "saturation": 1.0, "sharpness": 1.0,
+                       "frame_duration_us": 33333, "ae_exposure_mode": "normal",
+                       "noise_reduction": "fast", "exposure_value": 0.0}
+
+    #: Seconds between exposure-rescue actions (see rescue_dark_frame).
+    RESCUE_COOLDOWN = 5.0
 
     #: QR boost defaults — makes QR pop more than ground
     QR_BOOST_DEFAULTS = {"qr_boost_enabled": False, "qr_boost_mode": "qr_boost_day",
@@ -221,6 +231,10 @@ class _BaseCamera:
         # (close -> open). Bounded by a cooldown; reported in status().
         self.reopen_after_s = 10.0
         self.reopen_cooldown_s = 15.0
+        # exposure rescue state (see rescue_dark_frame)
+        self.frame_mean = -1.0        # last measured brightness (subsampled)
+        self._rescue_on = False       # AE currently owns exposure after a rescue
+        self._rescue_last = 0.0
         self.restarts = 0
         self._fail_since = None
         self._last_reopen = 0.0
@@ -341,13 +355,31 @@ class _BaseCamera:
                 self._frame_ts = time.time()
                 self._frames += 1
 
+            # Brightness of every frame is cheap on a subsample, and it is what
+            # keeps a manual (daylight) profile from leaving the camera blind at
+            # night — see rescue_dark_frame().
+            try:
+                self.frame_mean = float(raw[::12, ::12].mean())
+                line = self.rescue_dark_frame(self.frame_mean)
+                if line:
+                    log.warning("%s: %s", self.name, line)
+            except Exception as e:                 # never break the capture
+                log.debug("%s: brightness/rescue failed: %r", self.name, e)
+
     # -- consumers ------------------------------------------------------
-    def latest(self, raw=False):
+    def latest(self, raw=False, detect=False):
         """(frame_bgr_or_None, ts, count). Frame is a shared reference —
         consumers must not modify it in place.
-        If raw=True, returns un-enhanced frame (for stream debug)."""
+        raw=True    -> the frame before the software QR boost (debug/stream).
+        detect=True -> whichever frame the DETECTOR should see: config
+                       `qr_boost.detect_raw` decides between the raw
+                       (gamma-corrected) frame and the boosted one. The
+                       software boost is CLAHE + unsharp tuned for the EYE
+                       (and it amplifies night noise), so a model trained on
+                       ordinary frames can prefer the raw one — flip
+                       detect_raw in config.yaml and compare `nms_max=`."""
         with self._lock:
-            if raw:
+            if raw or (detect and bool(self.qr_boost.get("detect_raw"))):
                 return self._frame_raw, self._frame_ts, self._frames
             return self._frame, self._frame_ts, self._frames
 
@@ -379,6 +411,45 @@ class _BaseCamera:
         for k, v in self.qr_boost.items():
             t[k] = v
         return t
+
+    def rescue_dark_frame(self, mean, std=None, now=None):
+        """A MANUAL profile + a dark/blown frame -> hand exposure back to the AE.
+
+        Returns the line to show, or None. This is the fix for the 2026-10-13
+        field report: the presets impose manual daylight exposures (5 ms /
+        1.26x), which in a night room produced frame_mean=4 — a black window and
+        no detections, with nothing able to recover because AeEnable=false also
+        pins the GAIN. The rescue turns AE back on with a long frame-duration
+        budget (the only way the sensor can collect more light), and restores
+        the operator's profile by itself once the scene is bright again.
+        """
+        import time as _time
+        now = _time.time() if now is None else now
+        try:
+            from qr_camera_boost import dark_rescue, recovered
+        except Exception:                      # module missing: never break capture
+            return None
+        slow = (now - self._rescue_last) < self.RESCUE_COOLDOWN
+        if self._rescue_on:
+            if slow or not recovered(mean):
+                return None
+            self._rescue_on = False
+            self._rescue_last = now
+            want = self.qr_boost.get("qr_boost_mode")
+            if want:
+                self.apply_qr_profile(want)
+            return ("light is back (mean %.0f) — re-applying the '%s' "
+                    "camera profile" % (mean, want or "previous"))
+        over, why = dark_rescue(self.tuning, mean, std)
+        if not over or slow:
+            return None
+        self._rescue_last = now
+        self._rescue_on = True
+        self.apply_tuning(over)
+        return ("%s — AUTO EXPOSURE restored (up to %.0f ms, long-exposure "
+                "mode, high-quality NR). It stays on until the scene is "
+                "brighter (mean >= 60), then the profile comes back by itself."
+                % (why, float(over.get("frame_duration_us", 0)) / 1000.0))
 
     def apply_qr_profile(self, profile_name):
         """Apply a QR boost ISP profile (see qr_camera_boost.QR_BOOST_PROFILES)."""
@@ -782,6 +853,34 @@ class Camera(_BaseCamera):
                                        t["af_mode"], LC.AfModeEnum.Auto)
             except Exception:
                 pass
+        if tuning is not None and "frame_duration_us" in tuning:
+            # The ceiling the AE may expose to. Without this, a night profile
+            # cannot collect more light than 1/30 s no matter the gain.
+            v = int(max(1000, min(1000000, float(t["frame_duration_us"]))))
+            ctrls["FrameDurationLimits"] = (v, v)
+        if tuning is not None and "ae_exposure_mode" in tuning:
+            try:
+                from libcamera import controls as LC
+                ctrls["AeExposureMode"] = {
+                    "short": LC.AeExposureModeEnum.Short,
+                    "long": LC.AeExposureModeEnum.Long,
+                    "custom": LC.AeExposureModeEnum.Custom,
+                }.get(str(t["ae_exposure_mode"]).lower(),
+                      LC.AeExposureModeEnum.Normal)
+            except Exception:
+                pass
+        if tuning is not None and "noise_reduction" in tuning:
+            try:
+                from libcamera import controls as LC
+                ctrls["NoiseReductionMode"] = {
+                    "off": LC.NoiseReductionModeEnum.Off,
+                    "fast": LC.NoiseReductionModeEnum.Fast,
+                    "highquality": LC.NoiseReductionModeEnum.HighQuality,
+                }.get(str(t["noise_reduction"]).lower())
+            except Exception:
+                pass
+        if tuning is not None and "exposure_value" in tuning:
+            ctrls["ExposureValue"] = float(t["exposure_value"])
         if ctrls:
             try:
                 self._picam.set_controls(ctrls)

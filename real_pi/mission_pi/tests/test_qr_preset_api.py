@@ -134,9 +134,13 @@ def main():
         st, d = get(base + "/api/qr/presets")
         check("presets 200", st == 200, str(d))
         check("active=day at boot", d.get("active") == "day", str(d.get("active")))
-        check("7 presets, key order",
+        check("8 presets, key order",
               d.get("names") == ["day", "far", "dark", "kabaddi", "low",
-                                 "aggressive", "bench"], str(d.get("names")))
+                                 "aggressive", "bench", "auto"],
+              str(d.get("names")))
+        check("the auto preset is the any-light one",
+              (d.get("presets", {}).get("auto") or {}).get("boost")
+              == "qr_boost_auto", str((d.get("presets") or {}).get("auto")))
         f = d.get("filter") or {}
         check("filter defaults", f.get("min_conf") == 0.35
               and f.get("aspect_min") == 0.4 and f.get("aspect_max") == 2.5,
