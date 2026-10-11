@@ -77,6 +77,82 @@ def test_overlay_lines_are_found_and_comments_ignored():
           all("vc4" not in o for o in cfg3["overlays"]), repr(cfg3))
 
 
+USER_FILE = """\
+# For more options and information see
+dtparam=i2c_arm=off
+camera_auto_detect=1
+dtoverlay=vc4-kms-v3d
+arm_64bit=1
+[cm4]
+otg_mode=1
+[cm5]
+dtoverlay=dwc2,dr_mode=host
+[pi5]
+dtoverlay=nospi10
+
+[all],,
+"""
+
+
+def test_user_config_is_diagnosed_correctly():
+    """The exact config.txt from the field run: auto-detect still on, no
+    camera overlay, and a malformed [all],, header at the end."""
+    cfg = list_cams.parse_boot_config(USER_FILE)
+    check("field file: auto-detect read as 1", cfg["camera_auto_detect"] == "1",
+          repr(cfg["camera_auto_detect"]))
+    check("field file: no camera overlay found", cfg["overlays"] == [],
+          repr(cfg["overlays"]))
+    check("field file: the malformed header is caught",
+          cfg["malformed_sections"] == ["[all],,"],
+          repr(cfg["malformed_sections"]))
+    check("field file: real sections are listed",
+          {"cm4", "cm5", "pi5"} <= set(cfg["sections"]), repr(cfg["sections"]))
+    ok, lines = list_cams.boot_verdict(cfg, board="pi5")
+    text = "\n".join(lines)
+    check("field file: verdict fails", ok is False, text)
+    check("field file: verdict names the malformed header",
+          "malformed section header" in text, text)
+    check("field file: verdict asks for camera_auto_detect=0",
+          "set it to 0" in text, text)
+
+
+def test_overlay_under_the_wrong_section_is_caught():
+    """A correct-looking dtoverlay line in the wrong section never applies."""
+    cfg = list_cams.parse_boot_config(
+        "camera_auto_detect=0\n[cm4]\ndtoverlay=imx477,vcm\n")
+    ok, lines = list_cams.boot_verdict(cfg, board="pi5", dtbo_path="/nonexistent")
+    text = "\n".join(lines)
+    check("wrong section -> verdict fails", ok is False, text)
+    check("wrong section -> says it is skipped", "skipped" in text, text)
+
+    cfg2 = list_cams.parse_boot_config(
+        "camera_auto_detect=0\n[pi5]\ndtoverlay=imx477,vcm\n")
+    ok2, lines2 = list_cams.boot_verdict(cfg2, board="pi5",
+                                         dtbo_path="/nonexistent/x.dtbo")
+    text2 = "\n".join(lines2)
+    check("matching model section is accepted (only the dtbo may fail)",
+          "sits under [pi5]" not in text2 and "[pi5] — this board" in text2,
+          text2)
+
+    cfg3 = list_cams.parse_boot_config(
+        "camera_auto_detect=0\n[all]\ndtoverlay=imx477,vcm\n")
+    ok3, lines3 = list_cams.boot_verdict(cfg3, board="pi4",
+                                         dtbo_path="/nonexistent/x.dtbo")
+    check("[all] applies to every board",
+          all("sits under" not in l for l in lines3), "\n".join(lines3))
+
+
+def test_board_section_maps_models():
+    check("Pi 5 -> pi5",
+          list_cams.board_section("Raspberry Pi 5 Model B Rev 1.0") == "pi5")
+    check("CM4 -> cm4",
+          list_cams.board_section("Raspberry Pi Compute Module 4 Rev 1.0") == "cm4")
+    check("Zero 2 W -> zero2w",
+          list_cams.board_section("Raspberry Pi Zero 2 W Rev 1.0") == "zero2w")
+    check("unknown model -> None (never a guess)",
+          list_cams.board_section("Some Other SBC") is None)
+
+
 def test_empty_and_junk_input_never_raise():
     for text in (None, "", "garbage", "dtoverlay\ncamera_auto_detect=\n"):
         try:
@@ -129,7 +205,82 @@ def test_verdict_catches_the_real_field_failure():
           "dtoverlay=imx477,vcm" in text, text)
 
 
-def test_verdict_detects_the_stock_overlay_without_vcm(tmpdir="/tmp"):
+def test_dtoverlay_h_output_is_parsed():
+    """`dtoverlay -h imx477` is the authoritative vcm check (bare `strings`
+    hides 3-character param names). Its output shape is stable; parse it."""
+    arducam = """\
+Name:   imx477
+Info:   Overlay for the Sony IMX477 camera on the Raspberry Pi
+Usage:  dtoverlay=imx477,<param>=<val>
+Params: rotation                  Mounting rotation of the camera sensor
+
+        orientation               Orientation of the camera sensor
+
+        cam0                      Select the camera port
+
+        vcm                       Enable the VCM (voice coil motor) driver
+"""
+    stock = """\
+Name:   imx477
+Info:   Overlay for the Sony IMX477 camera on the Raspberry Pi
+Usage:  dtoverlay=imx477,<param>=<val>
+Params: rotation                  Mounting rotation of the camera sensor
+
+        orientation               Orientation of the camera sensor
+
+        cam0                      Select the camera port
+"""
+    p_a = list_cams.parse_dtoverlay_params(arducam)
+    p_s = list_cams.parse_dtoverlay_params(stock)
+    check("Arducam's params include vcm", "vcm" in p_a, repr(p_a))
+    check("other params are parsed too", {"rotation", "cam0"} <= p_a, repr(p_a))
+    check("the stock overlay has NO vcm", "vcm" not in p_s, repr(p_s))
+    check("headings are not mistaken for params",
+          not any(x.startswith(("Name", "Info", "Usage")) for x in p_a), repr(p_a))
+    check("empty output -> empty set",
+          list_cams.parse_dtoverlay_params("") == set())
+    check("garbage -> empty set",
+          list_cams.parse_dtoverlay_params("no such overlay") == set())
+
+
+def test_verdict_advice_does_not_use_the_three_letter_trap():
+    """Regression: the advice told people to run `strings <dtbo> | grep vcm`,
+    which prints NOTHING for a 3-character param name (GNU strings needs 4+
+    characters by default) — a false 'still stock' verdict."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        stock = _vcm_dtbo(td, with_vcm=False)
+        cfg = list_cams.parse_boot_config(
+            "camera_auto_detect=0\n[all]\ndtoverlay=imx477,vcm\n")
+        _ok, lines = list_cams.boot_verdict(cfg, dtbo_path=stock)
+        text = "\n".join(lines)
+        check("advice recommends dtoverlay -h",
+              "dtoverlay -h imx477" in text, text)
+        check("advice avoids the bare strings|grep trap",
+              "strings " not in text, text)
+
+
+def test_verdict_uses_dtoverlay_h_when_available():
+    """When `dtoverlay -h` can be read, it decides — even if a stale/stock
+    file sits at the path."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        stock = _vcm_dtbo(td, with_vcm=False)
+        cfg = list_cams.parse_boot_config(
+            "camera_auto_detect=0\n[all]\ndtoverlay=imx477,vcm\n")
+        real = list_cams.dtoverlay_h_params
+        list_cams.dtoverlay_h_params = lambda name: {"rotation", "cam0", "vcm"}
+        try:
+            ok, lines = list_cams.boot_verdict(cfg, dtbo_path=stock)
+        finally:
+            list_cams.dtoverlay_h_params = real
+        text = "\n".join(lines)
+        check("dtoverlay -h result wins over the file scan", ok is True, text)
+        check("the method is named in the OK line",
+              "dtoverlay -h imx477" in text, text)
+
+
+def test_verdict_detects_the_stock_overlay_without_vcm():
     """A correct config.txt + the STOCK dtbo is still broken: ,vcm cannot
     apply. This is what a half-finished Arducam install looks like."""
     import tempfile
@@ -147,7 +298,9 @@ def test_verdict_detects_the_stock_overlay_without_vcm(tmpdir="/tmp"):
         ok2, lines2 = list_cams.boot_verdict(cfg, dtbo_path=good)
         text2 = "\n".join(lines2)
         check("verdict passes with Arducam's dtbo", ok2 is True, text2)
-        check("verdict confirms vcm support", "supports vcm" in text2, text2)
+        check("verdict confirms vcm support",
+              "declares vcm" in text2 and "focus motor can work" in text2,
+              text2)
 
 
 def test_verdict_handles_missing_dtbo_and_other_cameras():
@@ -179,9 +332,15 @@ def test_boot_report_returns_a_dict_without_a_pi():
 if __name__ == "__main__":
     test_camera_auto_detect_is_read()
     test_overlay_lines_are_found_and_comments_ignored()
+    test_user_config_is_diagnosed_correctly()
+    test_overlay_under_the_wrong_section_is_caught()
+    test_board_section_maps_models()
     test_empty_and_junk_input_never_raise()
     test_report_prints_the_two_files_that_decide_success()
     test_verdict_catches_the_real_field_failure()
+    test_dtoverlay_h_output_is_parsed()
+    test_verdict_advice_does_not_use_the_three_letter_trap()
+    test_verdict_uses_dtoverlay_h_when_available()
     test_verdict_detects_the_stock_overlay_without_vcm()
     test_verdict_handles_missing_dtbo_and_other_cameras()
     test_vcm_scan_is_honest_about_unreadable_files()

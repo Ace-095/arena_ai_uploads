@@ -48,11 +48,22 @@ script picks by OS (Trixie is supported; the `dtc` warnings it prints about
 **Prove the install landed** — do not assume the script's "Complete!":
 
 ```bash
-ls -l /boot/firmware/overlays/imx477.dtbo        # timestamp = just now
-strings /boot/firmware/overlays/imx477.dtbo | grep -i vcm
-#   vcm appears  -> Arducam's overlay is installed (focus motor possible)
-#   no output    -> still the STOCK overlay: re-run build_and_install.sh
-#                   (or: sudo cp imx477.dtbo /boot/firmware/overlays/)
+ls -l /boot/firmware/overlays/imx477.dtbo     # timestamp should be "just now"
+dtoverlay -h imx477 | grep -i vcm             # authoritative: vcm listed?
+grep -ac vcm /boot/firmware/overlays/imx477.dtbo    # 1+ = present
+```
+
+⚠️ **Do not test this with `strings imx477.dtbo | grep -i vcm`.** GNU `strings`
+only prints runs of **4+ characters** by default, so the 3-character parameter
+name `vcm` never appears even when it is there — an empty result proves
+nothing. If you prefer `strings`, it must be `strings -n 3 … | grep -i vcm`.
+`dtoverlay -h` is the answer the boot loader itself would use.
+
+If the overlay really was not replaced, install it by hand:
+
+```bash
+cd ~/imx477_dtb/imx477_rpi_dtoverlay && ./build_and_install.sh
+sudo cp imx477.dtbo /boot/firmware/overlays/      # if the script's copy failed
 ```
 
 To undo (restore the stock dtbo): `dpkg -S /boot/firmware/overlays/imx477.dtbo`
@@ -66,10 +77,35 @@ also undoes manual overlays):
 # find and change:
 camera_auto_detect=0
 
-# under the [all] section:
+# under the [all] section (or any later [all] block):
 dtoverlay=imx477,vcm
 # ...and if the camera is on the CAM0 connector:
 # dtoverlay=imx477,vcm,cam0
+```
+
+Two things that quietly ruin this edit — check both before rebooting:
+
+* **The line must be inside an `[all]` section.** A line after a model
+  section such as `[pi5]` only applies to that model, and a **malformed
+  header** (e.g. `[all],,`) is not recognised: everything under it is skipped.
+  A trailing `[all]` block appended at the end of the file is legal and is the
+  safest place to put it.
+* **The camera must not be on the port you think it is.** Use `,cam0` for the
+  CAM0 connector and nothing (or `,cam1`) for CAM1. If the sensor does not
+  answer on the overlay's port, the boot log says so — `dmesg | grep -i imx477`.
+
+Over SSH, prefer one idempotent command over `nano` (a dropped link then
+cannot leave a half-edited file):
+
+```bash
+sudo cp -a /boot/firmware/config.txt /boot/firmware/config.txt.bak-$(date +%F)
+sudo sed -i 's/^camera_auto_detect=1/camera_auto_detect=0/' /boot/firmware/config.txt
+sudo sed -i 's/^\[all\],,*$/[all]/' /boot/firmware/config.txt     # fix a malformed header
+grep -q '^dtoverlay=imx477' /boot/firmware/config.txt || \
+  printf '\n[all]\ndtoverlay=imx477,vcm\n' | sudo tee -a /boot/firmware/config.txt
+# verify what you actually wrote:
+grep -nE 'camera_auto_detect|^\[|dtoverlay' /boot/firmware/config.txt | tail -12
+sudo reboot
 ```
 
 Reboot, then prove it in this order — stop at the first failure:
@@ -81,11 +117,16 @@ python3 tools/list_cams.py           # parses config.txt AND checks the installe
 python3 tools/cam_probe.py           # one snapshot per camera
 ```
 
-`tools/list_cams.py` prints a **verdict** for exactly this: whether
-`camera_auto_detect=0`, whether a camera `dtoverlay=` exists, and whether the
-installed `imx477.dtbo` really contains `vcm` (stock vs Arducam). If the boot
-config passes and libcamera still sees nothing, the cause is physical — and it
-says so: reseat the 15↔22-pin FPC (contacts the right way), try the other CAM
+`tools/list_cams.py` prints a **verdict** for exactly this. It checks, in
+order: `camera_auto_detect=0`; that no section header is malformed (a header
+like `[all],,` is not recognised, so every line under it is ignored and the
+overlay silently never loads); that each camera `dtoverlay=` line sits in a
+section that actually applies to this board (`[all]`/top-level, or the
+board's own section — a line under `[cm4]` on a Pi 5 is skipped); and whether
+the installed overlay declares `vcm` (`dtoverlay -h imx477`, with a raw byte
+scan as fallback — see the `strings` trap above). If the boot config passes
+and libcamera still sees nothing, the cause is physical — and it says so:
+reseat the 15↔22-pin FPC (contacts the right way), try the other CAM
 connector (update the `,cam0` suffix to match), check `dmesg`.
 
 ### 1.2 The two-camera trap (this is the one that bites)
