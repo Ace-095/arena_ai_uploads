@@ -180,6 +180,11 @@ fc:
 detector:
   kind: auto               # auto | hailo | yolo | classical | custom | none
   hef_path: models/qr_yolov8n.hef     # used by the Hailo rung (if present)
+  # Hailo NMS boxes are 5 values: y_min, x_min, y_max, x_max, score (HailoRT's
+  # own layout), normalised 0..1. If a run EVER draws boxes mirrored across the
+  # frame diagonal (QR low in the view, box shown to the left), set xyxy here —
+  # no code change, and the bench prints which order it used.
+  nms_order: yxyx
   prefer: [onnx, pt]       # CPU rung order (onnx first on the Pi 5)
   input_size: 640
   conf_thr: 0.25           # START value — the active preset (below) overrides

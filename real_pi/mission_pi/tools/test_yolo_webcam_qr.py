@@ -179,6 +179,8 @@ def build_detector(args, conf_thr, prefer, kind="yolo"):
         "iou_thr": args.iou,
         "input_size": 640,
         "prefer": prefer,
+        # How to read a Hailo NMS box (see config.yaml detector.nms_order).
+        "nms_order": getattr(args, "nms_order", "yxyx"),
     }
     if kind == "hailo":
         try:
@@ -350,6 +352,12 @@ def main():
                          "the way to SEE a headless run; one JPEG/second")
     ap.add_argument("--max-frames", type=int, default=0,
                     help="stop after N frames (0 = run until key/file end)")
+    ap.add_argument("--nms-order", dest="nms_order", default="yxyx",
+                    choices=["yxyx", "xyxy"],
+                    help="order of the 5 values in a Hailo NMS box "
+                         "(default yxyx = HailoRT's own layout: y_min, x_min, "
+                         "y_max, x_max, score; use xyxy only if boxes come out "
+                         "mirrored across the frame diagonal)")
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="DEBUG logging (per-frame detector detail)")
     args = ap.parse_args()

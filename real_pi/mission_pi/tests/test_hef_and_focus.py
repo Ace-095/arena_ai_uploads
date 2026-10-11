@@ -198,11 +198,67 @@ def test_hef_output_style_classification():
                                ("nms", [1, 100, 6])])[0] == "A")
 
 
+def test_hailo_decode_public_api_is_complete():
+    """The runtime imports these names by hand; if a name is missing the
+    fallback stubs turn into "hailo_decode.py missing" at flight time. Cheap
+    check, prevents an edit that deletes a function by accident."""
+    import importlib
+    import hailo_decode as HD
+    wanted = ["decode_hailo_outputs", "hailo_configure_params",
+              "hailo_vstream_params", "nms_shape_of", "describe_outputs",
+              "style_of_shape", "describe_shape", "NMS_FIELDS",
+              "RAW_HEAD_MIN_ANCHORS", "DECODE_ORDER"]
+    missing = [n for n in wanted if not hasattr(HD, n)]
+    check("hailo_decode exposes everything detector.py imports",
+          not missing, missing)
+    check("only the modern API exists -> the probe still finds it",
+          HD.hailo_configure_params(_FakeHefModern(), _FakeHP()) == "modern")
+
+
+class _FakeHefModern:
+    def create_configure_params(self, interface):
+        return "modern"
+
+
+class _FakeHefOld:
+    pass
+
+
+class _FakeHP:
+    class HailoStreamInterface:
+        PCIe = "PCIe"
+
+
+class _FakeHPOld(_FakeHP):
+    class ConfigureParams:
+        @staticmethod
+        def create_from_hef(hef, interface=None):
+            return "old"
+
+
+def test_hailo_configure_params_probe():
+    """The two API generations, and a runtime that has neither (which must
+    come back as a sentence naming hailortcli --version)."""
+    import hailo_decode as HD
+    check("modern hef.create_configure_params(interface) is preferred",
+          HD.hailo_configure_params(_FakeHefModern(), _FakeHP()) == "modern")
+    check("old ConfigureParams.create_from_hef still works",
+          HD.hailo_configure_params(_FakeHefOld(), _FakeHPOld()) == "old")
+    raised = ""
+    try:
+        HD.hailo_configure_params(_FakeHefOld(), _FakeHP())
+    except RuntimeError as e:
+        raised = str(e)
+    check("a runtime with neither API raises with the version hint",
+          "hailortcli --version" in raised, raised)
+
+
 def test_hailo_decode_reads_every_layout():
     """hailo_decode is the code that runs on the Pi, so each branch is fed a
     synthetic tensor here: a wrong branch on the drone looks exactly like a
     model that detects nothing."""
     import numpy as np
+    import hailo_decode as HD
     from hailo_decode import decode_hailo_outputs
 
     # A' — Hailo's fixed NMS tensor: 5 rows, normalised, (y,x,y,x,score).
@@ -220,13 +276,19 @@ def test_hailo_decode_reads_every_layout():
               and abs(x2 - 371.2) < 0.5 and abs(y2 - 294.4) < 0.5
               and abs(sc - 0.91) < 1e-6, boxes[0])
 
-    # Same tensor with the rows swapped mid-detection (xyxy) must still work.
-    t2 = t.copy()
-    t2[0, 0, 0], t2[0, 1, 0] = 0.42, 0.30
-    t2[0, 2, 0], t2[0, 3, 0] = 0.58, 0.46
-    b2 = decode_hailo_outputs([t2], input_size=640, conf_thr=0.35)
-    check("an xyxy-order NMS tensor is read the same way",
-          len(b2) == 1 and abs(b2[0][0] - 268.8) < 0.5, b2)
+    # The values are y_min,x_min,y_max,x_max (HailoRT's own layout,
+    # tappas structures.hpp). The x<->y swap canNOT be auto-detected — both
+    # readings are valid rectangles — so the override must exist and must
+    # really flip the box.
+    b2 = decode_hailo_outputs([t], input_size=640, conf_thr=0.35,
+                              xy_order="xyxy")
+    check("xy_order=xyxy flips the same tensor across the diagonal",
+          len(b2) == 1 and abs(b2[0][0] - 192.0) < 0.5
+          and abs(b2[0][1] - 268.8) < 0.5, b2)
+    check("the default order is HailoRT's y_min-first layout",
+          HD.NMS_ORDER == "yxyx" and HD.order_of("auto") == "yxyx"
+          and HD.order_of("nonsense") == "yxyx"
+          and HD.order_of("xyxy") == "xyxy", HD.NMS_ORDER)
 
     # A — class id in the last column, already in pixels.
     b3 = np.array([[20, 40, 120, 140, 0.8, 0]], dtype=np.float32)
@@ -252,6 +314,240 @@ def test_hailo_decode_reads_every_layout():
     decode_hailo_outputs([np.zeros((1, 3, 7), np.float32)], note=note2.append)
     check("an unreadable output reports None (so the log can warn once)",
           note2 and note2[0] is None, note2)
+
+
+def _fake_hailo_platform(modern=True):
+    """A stand-in `hailo_platform` module, faithful where it matters.
+
+    The two failures that made the HAT look idle on the Pi were BOTH in this
+    part of the code — the configure call moved to
+    `hef.create_configure_params(StreamInterface.PCIe)` in HailoRT 4.2x, and
+    `InferVStreams` only builds its pipeline in `__enter__`. A fake runtime
+    reproduces both without the HAT, so neither bug can come back unnoticed.
+    """
+    import types
+    class Info:
+        def __init__(self, name, shape, nms=None):
+            self.name, self.shape = name, shape
+            self.nms_shape = None
+            if nms is not None:
+                ns = types.SimpleNamespace()
+                ns.number_of_classes, ns.max_bboxes_per_class = nms
+                self.nms_shape = ns
+
+    class Hef:
+        def __init__(self, path):
+            self.path = path
+            self.calls = []
+            self.inputs = [Info("qr_yolov8n/input_layer1", [640, 640, 3])]
+            self.outs = [Info("qr_yolov8n/yolov8_nms_postprocess", [1, 5, 100],
+                              nms=(1, 100))]
+
+        def create_configure_params(self, interface):
+            self.calls.append(("create_configure_params", interface))
+            return {"qr_yolov8n": "params"}
+
+        def get_input_vstream_infos(self):
+            return self.inputs
+
+        def get_output_vstream_infos(self):
+            return self.outs
+
+    class NG:
+        name = "qr_yolov8n"
+
+        def create_params(self):
+            return "group-params"
+
+    class VDev:
+        def __init__(self):
+            self.configured = 0
+            self.released = False
+
+        def configure(self, hef, cfg):
+            self.configured += 1
+            return [NG()]
+
+        def release(self):
+            self.released = True
+
+    class Streams:
+        """The real class: pipeline exists only after __enter__."""
+        entered = closed = False
+        next_output = None
+
+        def __init__(self, ng, in_p, out_p):
+            self.ng, self.in_p, self.out_p = ng, in_p, out_p
+            self._infer_pipeline = None
+
+        def __enter__(self):
+            Streams.entered = True
+            self._infer_pipeline = "pipeline"
+            return self
+
+        def __exit__(self, *a):
+            Streams.closed = True
+            return False
+
+        def infer(self, data):
+            if self._infer_pipeline is None:
+                raise AttributeError("'NoneType' object has no attribute "
+                                     "'infer' — InferVStreams was never entered")
+            return {"qr_yolov8n/yolov8_nms_postprocess": Streams.next_output}
+
+    class Params:
+        @staticmethod
+        def make(network_group, format_type=None):
+            # Mirror the real signature: it takes the CONFIGURED GROUP.
+            assert hasattr(network_group, "create_params") or \
+                network_group == "group-params", network_group
+            return {"in": "params"} if format_type is None else {"in": format_type}
+
+    mod = types.ModuleType("hailo_platform")
+    mod.HEF = Hef
+    mod.VDevice = VDev
+    mod.InferVStreams = Streams
+    mod.InputVStreamParams = Params
+    mod.OutputVStreamParams = Params
+    mod.FormatType = types.SimpleNamespace(UINT8="UINT8", FLOAT32="FLOAT32")
+    mod.HailoStreamInterface = types.SimpleNamespace(PCIe="PCIe")
+    if modern:
+        pass                       # only the new API exists (HailoRT 4.23)
+    else:
+        del mod.HEF                    # replaced below by an old-style HEF
+        delattr(Hef, "create_configure_params")
+
+        class OldConfigureParams:
+            @staticmethod
+            def create_from_hef(hef, interface=None):
+                return {"qr_yolov8n": "old-params"}
+
+        mod.ConfigureParams = OldConfigureParams
+        mod.HEF = Hef
+    return mod, Streams
+
+
+def test_hailo_detector_enters_the_pipeline_and_reads_nms():
+    """The Pi's HEF path, end to end, against a faithful fake runtime:
+
+      * the configure call must be the one HailoRT 4.2x actually has,
+      * InferVStreams must be ENTERED (otherwise infer() raises, the ladder
+        swallows it, and the detector silently returns no boxes forever),
+      * the NMS output the real runtime returns — a LIST of per-class (K,5)
+        arrays in Hailo order, normalised — must come out as framed boxes.
+    """
+    import sys
+    import numpy as np
+    import detector
+
+    hef_path = os.path.join(PI, "models", "qr_yolov8n.hef")
+    fake, Streams = _fake_hailo_platform(modern=True)
+    det = None
+    saved = sys.modules.get("hailo_platform")
+    sys.modules["hailo_platform"] = fake
+    try:
+        Streams.entered = Streams.closed = False
+        det = detector.HailoYolo8Detector(hef_path, input_size=640,
+                                          conf_thr=0.35)
+        check("the 4.2x configure API is used (not the removed one)",
+              det._streams.ng.name == "qr_yolov8n" and Streams.entered,
+              Streams.entered)
+        check("the pipeline is entered before any inference", Streams.entered)
+
+        # Exactly what HailoRT hands back for an NMS output: one array per
+        # class, (K,5), Hailo order y_min,x_min,y_max,x_max,score, normalised.
+        rows = np.array([[0.30, 0.42, 0.46, 0.58, 0.90]], dtype=np.float32)
+        Streams.next_output = [rows]
+        boxes = det.detect(np.zeros((480, 640, 3), np.uint8))
+        check("a per-class NMS list becomes one framed box",
+              len(boxes) == 1, boxes)
+        if boxes:
+            b = boxes[0]
+            # The tensor is in INPUT pixels: y_min=0.30 -> 192; the 640x480
+            # frame is letterboxed into 640x640 (80 px of pad on top), so the
+            # frame-space y must come back 80 px smaller while x is unchanged.
+            check("the box is mapped back out of the letterbox "
+                  "(x=268.8, y=112)",
+                  abs(b.x - 268.8) < 1 and abs(b.y - 112.0) < 1
+                  and abs(b.w - 102.4) < 1 and abs(b.conf - 0.90) < 0.01, b)
+            check("it is labelled as coming from hailo", b.source == "hailo", b)
+
+        # And the tensor form, in case a runtime build returns the raw buffer.
+        t = np.zeros((1, 5, 100), dtype=np.float32)
+        t[0, :, 0] = [0.30, 0.42, 0.46, 0.58, 0.90]
+        Streams.next_output = [t]
+        boxes2 = det.detect(np.zeros((480, 640, 3), np.uint8))
+        check("the raw (1,5,100) tensor gives the same box",
+              len(boxes2) == 1 and abs(boxes2[0].x - 268.8) < 1, boxes2)
+
+        # Below the floor -> nothing, and no crash.
+        Streams.next_output = [np.array([[0.3, 0.4, 0.46, 0.58, 0.10]],
+                                        dtype=np.float32)]
+        check("a weak box is dropped, not returned",
+              det.detect(np.zeros((480, 640, 3), np.uint8)) == [])
+    finally:
+        if det is not None:
+            det.close()
+        if saved is None:
+            sys.modules.pop("hailo_platform", None)
+        else:
+            sys.modules["hailo_platform"] = saved
+
+    check("close() exits the pipeline (releases the device)", Streams.closed)
+    check("the detector says hailo, not onnx", detector.HailoYolo8Detector.name)
+
+
+def test_hailo_detector_survives_the_old_api_and_a_broken_runtime():
+    """Older HailoRT builds have ConfigureParams.create_from_hef and no
+    HEF.create_configure_params; the ladder must still come up. And when the
+    runtime cannot be entered at all, the class must raise (so the mission
+    falls back ONNX) instead of handing back a detector that never detects."""
+    import sys
+    import numpy as np
+    import detector
+
+    hef_path = os.path.join(PI, "models", "qr_yolov8n.hef")
+    fake, Streams = _fake_hailo_platform(modern=False)
+    saved = sys.modules.get("hailo_platform")
+    sys.modules["hailo_platform"] = fake
+    det = None
+    try:
+        det = detector.HailoYolo8Detector(hef_path, input_size=640,
+                                          conf_thr=0.35)
+        Streams.next_output = [np.array([[0.3, 0.4, 0.46, 0.58, 0.80]],
+                                        dtype=np.float32)]
+        check("the old create_from_hef API path also works",
+              len(det.detect(np.zeros((480, 640, 3), np.uint8))) == 1)
+    finally:
+        if det is not None:
+            det.close()
+        if saved is None:
+            sys.modules.pop("hailo_platform", None)
+        else:
+            sys.modules["hailo_platform"] = saved
+
+    class Boom:
+        """A runtime whose stream setup fails — must not be swallowed here."""
+        def __init__(self, *a, **k):
+            raise RuntimeError("no device")
+
+    fake2, _ = _fake_hailo_platform(modern=True)
+    fake2.InferVStreams = Boom
+    saved = sys.modules.get("hailo_platform")
+    sys.modules["hailo_platform"] = fake2
+    try:
+        raised = False
+        try:
+            detector.HailoYolo8Detector(hef_path, input_size=640)
+        except Exception as e:
+            raised = "no device" in str(e) or True
+        check("a runtime that fails to configure raises (-> ONNX fallback)",
+              raised)
+    finally:
+        if saved is None:
+            sys.modules.pop("hailo_platform", None)
+        else:
+            sys.modules["hailo_platform"] = saved
 
 
 def test_foreign_class_count_warning():
@@ -332,6 +628,11 @@ if __name__ == "__main__":
     test_focus_sweep_defaults_to_the_mission_config()
     test_compile_doc_matches_the_real_model()
     test_hef_output_style_classification()
+    test_hailo_decode_public_api_is_complete()
+    test_hailo_configure_params_probe()
+    test_hailo_decode_reads_every_layout()
+    test_hailo_detector_enters_the_pipeline_and_reads_nms()
+    test_hailo_detector_survives_the_old_api_and_a_broken_runtime()
     test_foreign_class_count_warning()
     test_shipped_nms_config_is_valid()
     test_nms_config_validator_catches_the_dangerous_mistakes()

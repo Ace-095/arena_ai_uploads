@@ -237,6 +237,23 @@ Re-train from field miss-frames whenever the bench/field shows drops
 (details in `training/README.md`). A later custom model drops into the
 `detector.kind: custom` slot — contract in `models/README.md`.
 
+### Box order (only if boxes ever look mirrored)
+
+A Hailo NMS box is five values — `y_min, x_min, y_max, x_max, score` — in
+HailoRT's own buffer layout (tappas `structures.hpp`, `hailo_bbox_t`), and the
+values are **normalised 0..1**, not pixels. The x↔y swap cannot be detected
+from the data (both readings are valid rectangles for any well-formed box), so
+it is an explicit knob instead of a guess:
+
+```
+config.yaml     detector.nms_order: yxyx      # or xyxy
+bench tool      --nms-order yxyx|xyxy
+```
+
+The tell that a unit needs `xyxy` is a box drawn mirrored across the frame
+diagonal (QR low in view, box shown to the left). The runtime logs the order it
+used (`hailo ready: … nms_order=yxyx`), and unit tests pin both readings.
+
 ### Test QR detection with the REAL camera + Hailo
 
 `test_yolo_webcam_qr.py` runs the mission's own detector + fake-QR filter +
@@ -248,6 +265,8 @@ libcamera device, so `--source 0` only ever finds USB webcams) and the
 hailortcli scan                                        # HAT must be listed
 python3 tools/test_yolo_webcam_qr.py --source csi:bottom --hailo \
     --hef models/qr_yolov8n.hef --preset day --require-decode --tiled
+python3 tools/test_yolo_webcam_qr.py --source csi:bottom --hailo --no-tile \
+    --save-frames /tmp/bench        # 1 inference/frame + annotated JPEGs
 python3 tools/test_yolo_webcam_qr.py --source csi --hailo --headless   # SSH/CI
 python3 tools/test_yolo_webcam_qr.py --source csi:bottom --onnx \
     --model models/qr_yolov8n.onnx   # CPU comparison, same frames

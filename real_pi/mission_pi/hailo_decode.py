@@ -25,8 +25,19 @@ find in the field.
 """
 import numpy as np
 
-#: Values per box in a Hailo NMS tensor (TAPPAS order, normalised 0..1).
+#: Values per box in a Hailo NMS tensor (normalised 0..1).
 NMS_FIELDS = 5
+#: ...in THIS order. Authoritative, from HailoRT's own buffer layout — tappas
+#: `core/hailo/libs/postprocesses/common/structures.hpp`:
+#:     typedef struct { uint16_t y_min, x_min, y_max, x_max, score; } hailo_bbox_t;
+#: (five float32 for a FLOAT32 vstream). So it is y_min first, NOT x_min, and
+#: the values are normalised, not pixels.
+#: `NMS_ORDER` is only overridable so a field mismatch costs a config edit
+#: instead of a code change: for any well-formed box BOTH readings are
+#: geometrically valid (x<->y swap), so nothing can auto-detect which is meant
+#: — the tell is that the box lands mirrored across the frame diagonal.
+NMS_ORDER = "yxyx"
+NMS_ORDERS = ("yxyx", "xyxy")
 #: A raw ultralytics head has thousands of anchors; NMS keeps <= ~1000 boxes.
 #: This count is the only thing that tells (1, 5, 8400) from (1, 5, 100).
 RAW_HEAD_MIN_ANCHORS = 1000
@@ -84,6 +95,46 @@ def describe_shape(name, shape):
 
 
 
+def hailo_configure_params(hef, hp=None):
+    """Build HailoRT configure params across API generations.
+
+    Modern (HailoRT 4.2x): `hef.create_configure_params(StreamInterface.PCIe)`.
+    Older: `ConfigureParams.create_from_hef(hef, interface=HailoStreamInterface.PCIe)`,
+    and older still took the string "PCIe". Newest first, and the last error is
+    reported if nothing works — a version bump must produce a sentence, not a
+    bare TypeError deep inside the mission (which is how the HAT sat idle while
+    the mission happily ran on ONNX).
+    """
+    if hp is None:
+        import hailo_platform as hp
+    iface = None
+    for name in ("HailoStreamInterface", "StreamInterface"):
+        iface = getattr(hp, name, None)
+        if iface is not None:
+            break
+    pcie = getattr(iface, "PCIe", None) if iface is not None else None
+    if pcie is None:
+        pcie = "PCIe"
+
+    tries = []
+    mk = getattr(hef, "create_configure_params", None)
+    if callable(mk):
+        tries.append(lambda: mk(pcie))
+    cp = getattr(hp, "ConfigureParams", None)
+    if cp is not None:
+        tries.append(lambda: cp.create_from_hef(hef, interface=pcie))
+        tries.append(lambda: cp.create_from_hef(hef, interface="PCIe"))
+        tries.append(lambda: cp.create_from_hef(hef))
+    last = None
+    for fn in tries:
+        try:
+            return fn()
+        except Exception as e:          # probing APIs is the point here
+            last = e
+    raise RuntimeError("no HailoRT API worked to configure the HEF (%r) — "
+                       "please report `hailortcli --version`" % (last,))
+
+
 def hailo_vstream_params(hp, ng, ng_params, use_input, format_type):
     """`InputVStreamParams.make` / `OutputVStreamParams.make` across versions.
 
@@ -118,42 +169,24 @@ def nms_shape_of(vstream_info):
 
 
 # ------------------------------------------------------------------ decoding --
-def _order_for(block):
-    """Pick 'yxyx' (Hailo order) or 'xyxy' for a (5, N) block, by geometry.
-
-    Hailo's NMS tensor is (y_min, x_min, y_max, x_max, score). Nothing in the
-    array says so, but a wrong guess produces boxes whose y1 > y2 for the
-    highest-scoring detections — so score both readings on the top detections
-    and keep the one that yields sane rectangles.
-    """
-    best, best_good = "yxyx", -1
-    for order in ("yxyx", "xyxy"):
-        good = 0
-        sc = block[4]
-        for j in np.argsort(-sc)[:5]:
-            if sc[j] <= 0:
-                break
-            if order == "yxyx":
-                y1, x1, y2, x2 = block[0, j], block[1, j], block[2, j], block[3, j]
-            else:
-                x1, y1, x2, y2 = block[0, j], block[1, j], block[2, j], block[3, j]
-            if y1 < y2 and x1 < x2:
-                good += 1
-        if good > best_good:
-            best, best_good = order, good
-    return best
+def order_of(value):
+    """Coerce a user/config value to one of NMS_ORDERS ('auto' -> NMS_ORDER)."""
+    v = str(value or "auto").strip().lower()
+    return v if v in NMS_ORDERS else NMS_ORDER
 
 
-def _rows_to_boxes(block, input_size, conf_thr, scale, px, py, iw, ih):
+def _rows_to_boxes(block, input_size, conf_thr, scale, px, py, iw, ih,
+                   order=NMS_ORDER):
     """(5, N) Hailo NMS block -> frame-space boxes [(x1,y1,x2,y2,score), ...].
 
     Coordinates are normalised to the network input; both normalised and
-    (in case a build emits pixels) input-pixel values are accepted.
+    (in case a build emits pixels) input-pixel values are accepted. `order` is
+    the documented Hailo layout unless a config override says otherwise.
     """
     boxes = []
     if block.shape[0] != NMS_FIELDS:
         return boxes
-    order = _order_for(block)
+    order = order_of(order)
     for j in range(block.shape[1]):
         sc = float(block[4, j])
         if sc < conf_thr:
@@ -213,7 +246,8 @@ def _raw_head_to_boxes(a, conf_thr, scale, px, py, iw, ih):
 
 
 def decode_hailo_outputs(outs, input_size=640, conf_thr=0.35, nms_fn=None,
-                         scale=1.0, px=0.0, py=0.0, iw=640, ih=640, note=None):
+                         scale=1.0, px=0.0, py=0.0, iw=640, ih=640, note=None,
+                         xy_order="auto"):
     """Any supported HEF output -> frame-space boxes; applies nms_fn at the end.
 
     Layouts, tried in the order the runtime prefers:
@@ -231,6 +265,9 @@ def decode_hailo_outputs(outs, input_size=640, conf_thr=0.35, nms_fn=None,
     """
     arg = dict(input_size=int(input_size), conf_thr=float(conf_thr),
                scale=scale, px=px, py=py, iw=iw, ih=ih)
+    if str(xy_order or "auto").lower() in NMS_ORDERS:
+        # only the rows-based layouts (A', and (N,5)) carry bare x/y pairs
+        arg["order"] = str(xy_order).lower()
     flat = []
     for o in outs or []:
         if isinstance(o, (list, tuple)):

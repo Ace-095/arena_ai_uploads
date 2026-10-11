@@ -23,6 +23,7 @@ for a fine-tuned 1-class YOLOv8n.
 YOLO on laptop: for SITL+Gazebo real test, use kind: yolo or custom yolo_ultralytics
 instead of classical — A3 at 10m/15m will actually be detected.
 """
+import contextlib
 import importlib
 import logging
 import os
@@ -40,6 +41,7 @@ try:
                                hailo_configure_params as _hailo_configure_params,
                                hailo_vstream_params as _hailo_vstream_params,
                                nms_shape_of as _nms_shape_of,
+                               order_of as _order_of,
                                describe_outputs as describe_hef_outputs)
 except Exception:                                    # run as a plain script
     try:
@@ -48,6 +50,7 @@ except Exception:                                    # run as a plain script
                                   hailo_configure_params as _hailo_configure_params,
                                   hailo_vstream_params as _hailo_vstream_params,
                                   nms_shape_of as _nms_shape_of,
+                                  order_of as _order_of,
                                   describe_outputs as describe_hef_outputs)
     except Exception:                                # no numpy at all
         _decode_hailo_outputs = None
@@ -60,6 +63,9 @@ except Exception:                                    # run as a plain script
 
         def _nms_shape_of(*a, **k):
             return None, None
+
+        def _order_of(value):
+            return str(value or "yxyx").lower()
 
         def describe_hef_outputs(*a, **k):
             return ["hailo_decode.py not importable — install numpy"]
@@ -165,7 +171,8 @@ class HailoYolo8Detector(Detector):
     """
     name = "hailo"
 
-    def __init__(self, hef_path, input_size=640, conf_thr=0.35, iou_thr=0.5):
+    def __init__(self, hef_path, input_size=640, conf_thr=0.35, iou_thr=0.5,
+                 nms_order="yxyx"):
         if not _HAVE_NP or not _HAVE_CV2:
             raise RuntimeError("hailo detector needs numpy + cv2")
         try:
@@ -183,23 +190,41 @@ class HailoYolo8Detector(Detector):
         self.input_size = int(input_size)
         self.conf_thr = float(conf_thr)
         self.iou_thr = float(iou_thr)
+        # How to read the five values of a Hailo NMS box: HailoRT's buffer
+        # layout is y_min, x_min, y_max, x_max, score. `detector.nms_order`
+        # in config.yaml flips it to xyxy if a run draws mirrored boxes.
+        self.nms_order = _order_of(nms_order)
         self._lock = threading.Lock()
         self._out_style = None
-        hef = HEF(hef_path)
-        self._vdev = VDevice()
-        # HailoRT 4.23 dropped ConfigureParams.create_from_hef in favour of
-        # hef.create_configure_params(StreamInterface.PCIe) — see hailo_decode.
-        cfg = _hailo_configure_params(hef, hp)
-        self._ng = self._vdev.configure(hef, cfg)[0]
-        self._ng_params = self._ng.create_params()
-        in_p = _hailo_vstream_params(hp, self._ng, self._ng_params, True,
-                                     FormatType.UINT8)
-        out_p = _hailo_vstream_params(hp, self._ng, self._ng_params, False,
-                                      FormatType.FLOAT32)
-        self._streams = InferVStreams(self._ng, in_p, out_p)
-        infos = hef.get_input_vstream_infos()
-        self._in_name = infos[0].name if infos else None
-        self._out_infos = hef.get_output_vstream_infos()
+        self._stack = contextlib.ExitStack()
+        try:
+            hef = HEF(hef_path)
+            self._vdev = VDevice()
+            # HailoRT 4.23 dropped ConfigureParams.create_from_hef in favour of
+            # hef.create_configure_params(StreamInterface.PCIe) — see
+            # hailo_decode.hailo_configure_params.
+            cfg = _hailo_configure_params(hef, hp)
+            self._ng = self._vdev.configure(hef, cfg)[0]
+            self._ng_params = self._ng.create_params()
+            in_p = _hailo_vstream_params(hp, self._ng, self._ng_params, True,
+                                         FormatType.UINT8)
+            out_p = _hailo_vstream_params(hp, self._ng, self._ng_params, False,
+                                          FormatType.FLOAT32)
+            # InferVStreams is a CONTEXT MANAGER: its __enter__ builds
+            # `self._infer_pipeline`, and infer() without it raises
+            # AttributeError — which the fallback ladder swallows, leaving a
+            # detector that silently returns no boxes for every frame. Enter it
+            # once, here, and keep it open until close().
+            self._streams = self._stack.enter_context(
+                InferVStreams(self._ng, in_p, out_p))
+            infos = hef.get_input_vstream_infos()
+            self._in_name = infos[0].name if infos else None
+            self._out_infos = hef.get_output_vstream_infos()
+        except Exception:
+            # Half-configured device would block the next rung (and a retry
+            # after a HailoRT error) — give it back before re-raising.
+            self.close()
+            raise
         # Log the runtime's own description of the outputs once, so a field log
         # always says which layout is in play (nms_shape beats shape guessing).
         desc = []
@@ -209,8 +234,9 @@ class HailoYolo8Detector(Detector):
             desc.append("%s%s%s" % (vi.name, shp,
                                     "" if nc is None else
                                     " nms(classes=%s,boxes=%s)" % (nc, mb)))
-        log.info("hailo ready: %s (in=%s size=%d) outs=%s",
-                 hef_path, self._in_name, self.input_size, "; ".join(desc) or "?")
+        log.info("hailo ready: %s (in=%s size=%d) outs=%s nms_order=%s",
+                 hef_path, self._in_name, self.input_size,
+                 "; ".join(desc) or "?", self.nms_order)
 
     def detect(self, frame_bgr):
         try:
@@ -241,7 +267,8 @@ class HailoYolo8Detector(Detector):
         boxes = _decode_hailo_outputs(
             outs, input_size=self.input_size, conf_thr=self.conf_thr,
             nms_fn=lambda bs: _host_nms(bs, self.iou_thr),
-            scale=scale, px=px, py=py, iw=iw, ih=ih, note=_note)
+            scale=scale, px=px, py=py, iw=iw, ih=ih, note=_note,
+            xy_order=self.nms_order)
         chosen = style[0] if style else None
         if chosen != self._out_style:
             self._out_style = chosen
@@ -255,14 +282,24 @@ class HailoYolo8Detector(Detector):
         return boxes
 
     def close(self):
-        try:
-            self._streams.close()
-        except Exception:
-            pass
-        try:
-            self._vdev.release()
-        except Exception:
-            pass
+        """Release the vstreams pipeline, then the device. Never raises.
+
+        Used both by the mission's shutdown and by __init__ when a later step
+        of the bring-up fails, so a half-configured device cannot block the
+        next rung of the fallback ladder.
+        """
+        stack = getattr(self, "_stack", None)
+        if stack is not None:
+            try:
+                stack.close()          # __exit__ -> InferVStreams.release()
+            except Exception:
+                pass
+        vdev = getattr(self, "_vdev", None)
+        if vdev is not None:
+            try:
+                vdev.release()
+            except Exception:
+                pass
 
 
 # --------------------------------------------------------------------------
@@ -404,7 +441,8 @@ def get_detector(cfg):
             try:
                 d = HailoYolo8Detector(hef, cfg.get("input_size", 640),
                                        cfg.get("conf_thr", 0.35),
-                                       cfg.get("iou_thr", 0.5))
+                                       cfg.get("iou_thr", 0.5),
+                                       cfg.get("nms_order", "yxyx"))
                 log.info("detector auto: HAILO %s", d.name)
                 return d
             except Exception as e:
@@ -426,7 +464,9 @@ def get_detector(cfg):
             raise RuntimeError("HEF not found: %r (put it in models/ — see "
                                "training/compile_hef.md)" % cfg.get("hef_path"))
         return HailoYolo8Detector(hef, cfg.get("input_size", 640),
-                                  cfg.get("conf_thr", 0.35), cfg.get("iou_thr", 0.5))
+                                  cfg.get("conf_thr", 0.35),
+                                  cfg.get("iou_thr", 0.5),
+                                  cfg.get("nms_order", "yxyx"))
     if kind in YOLO_KINDS:
         # An explicit format name pins the order, so `--detector onnx` on a
         # machine that also has a .pt cannot silently load torch instead —
