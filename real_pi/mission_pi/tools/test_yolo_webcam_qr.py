@@ -350,7 +350,17 @@ def main():
                          "the way to SEE a headless run; one JPEG/second")
     ap.add_argument("--max-frames", type=int, default=0,
                     help="stop after N frames (0 = run until key/file end)")
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="DEBUG logging (per-frame detector detail)")
     args = ap.parse_args()
+
+    # Without this the detector's own lines ("hailo ready: … outs=…",
+    # "hailo output layout: A'") never reach the operator — only warnings
+    # survive the default root logger, and which rung/layout is in use is
+    # exactly what a field log has to say.
+    import logging
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                        format="[%(name)s] %(message)s")
 
     # A window needs a display; Qt aborts the process, not an exception, when
     # there is none — so decide here (and say which branch was taken).
