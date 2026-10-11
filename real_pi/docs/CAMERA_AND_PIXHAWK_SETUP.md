@@ -236,7 +236,48 @@ What it is really checking, and what to do if it fails:
 
 ---
 
-## 3. Change checklist
+## 3. Prove QR detection on the real camera (Hailo)
+
+Before flying — and before trusting any 15 m number — check the pipeline end
+to end with the actual CSI camera and the AI HAT. The bench tool runs the
+mission's own detector, filter and presets; it can use the Pi's CSI camera
+directly (OpenCV cannot open a libcamera device, so a webcam index is useless
+here) and the Hailo rung:
+
+```bash
+cd ~/arena_ai_uploads/real_pi/mission_pi
+hailortcli scan                                  # HAT must be listed
+
+# live window (HDMI/monitor): bottom cam + Hailo + the 15 m tile path
+python3 tools/test_yolo_webcam_qr.py --source csi:bottom --hailo \
+    --hef models/qr_yolov8n.hef --preset day --require-decode --tiled
+
+# same test over SSH with no display: one line per second
+python3 tools/test_yolo_webcam_qr.py --source csi:bottom --hailo --headless
+
+# CPU comparison on the very same frames (is the HAT actually the win?)
+python3 tools/test_yolo_webcam_qr.py --source csi:bottom --onnx \
+    --model models/qr_yolov8n.onnx --preset day --require-decode --tiled
+
+# model-only check: stills from this camera through the Hailo .hef
+python3 tools/cam_probe.py --snap-dir snaps
+python3 tools/qr_bench.py --detector hailo --hef models/qr_yolov8n.hef --tiles snaps/*.jpg
+```
+
+Key meanings: `raw:N` = detector boxes, `filt:M` = boxes that survived the
+fake-QR filter, `payload=...` = a box that actually **decoded** — with
+`--require-decode` only those count, which is the ground rule. `--source csi`
+picks the downward camera automatically; `csi:front`, `csi:cam2`, `csi:1`
+pin it explicitly. If `--hailo` cannot reach the HAT or the `.hef`, it says
+so and falls back to the CPU ladder — it never crashes a bench run.
+
+The `.hef` is **not** in the repo: it comes from Hailo's Dataflow Compiler on
+an x86 machine (`training/compile_hef.md`, `models/README.md`). Without it,
+`detector.kind: auto` in `config.yaml` simply uses the ONNX rung on CPU.
+
+---
+
+## 4. Change checklist
 
 ```text
 [ ] /boot/firmware/config.txt : camera_auto_detect=0 (+ dtoverlay per camera)

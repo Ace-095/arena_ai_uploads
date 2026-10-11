@@ -237,6 +237,32 @@ Re-train from field miss-frames whenever the bench/field shows drops
 (details in `training/README.md`). A later custom model drops into the
 `detector.kind: custom` slot — contract in `models/README.md`.
 
+### Test QR detection with the REAL camera + Hailo
+
+`test_yolo_webcam_qr.py` runs the mission's own detector + fake-QR filter +
+preset table and can drive **the Pi's CSI camera** (OpenCV cannot open a
+libcamera device, so `--source 0` only ever finds USB webcams) and the
+**Hailo HAT** — same code paths the mission uses, no server needed:
+
+```
+hailortcli scan                                        # HAT must be listed
+python3 tools/test_yolo_webcam_qr.py --source csi:bottom --hailo \
+    --hef models/qr_yolov8n.hef --preset day --require-decode --tiled
+python3 tools/test_yolo_webcam_qr.py --source csi --hailo --headless   # SSH/CI
+python3 tools/test_yolo_webcam_qr.py --source csi:bottom --onnx \
+    --model models/qr_yolov8n.onnx   # CPU comparison, same frames
+```
+
+`--source csi[:role|:slot|:index]` = `csi:bottom` (default guess: the
+downward camera), `csi:front`, `csi:cam2`, `csi:1`. `--hailo` without the
+HAT/HEF prints why and falls back to the CPU ladder instead of crashing.
+For a pure model check on stills from that same camera:
+
+```
+python3 tools/cam_probe.py --snap-dir snaps
+python3 tools/qr_bench.py --detector hailo --hef models/qr_yolov8n.hef --tiles snaps/*.jpg
+```
+
 ## Geofence: the UI can set it, over the Pi's own FC link
 
 `GET/POST/DELETE /api/fence` uploads a single inclusion polygon with the

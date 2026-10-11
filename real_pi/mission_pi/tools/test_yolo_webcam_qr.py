@@ -24,9 +24,15 @@ USAGE (from the mission_pi/ directory or the repo root):
       --model models/qr_yolov8n.onnx --onnx \
       --preset dark --require-decode --tiled
 
+  # ON THE PI, with the real CSI camera (e.g. the Arducam UC-517) and the
+  # Hailo AI HAT — no webcam, no server:
+  python3 tools/test_yolo_webcam_qr.py --source csi:bottom --hailo \
+      --hef models/qr_yolov8n.hef --preset day --require-decode --tiled
+
   # headless bench run (no window; prints one summary line per second)
   python3 tools/test_yolo_webcam_qr.py --source /tmp/demo.mp4 \
       --model models/qr_yolov8n.onnx --headless
+  python3 tools/test_yolo_webcam_qr.py --source csi --hailo --headless
 
 LIVE KEYS (window mode):
   f  hide/show rejected (fake) boxes        v  toggle require-decode
@@ -67,23 +73,120 @@ def load_cfg(path):
     return {}
 
 
-def build_detector(args, conf_thr, prefer):
-    """Use the repo's detector ladder so the tool == the mission."""
+def build_detector(args, conf_thr, prefer, kind="yolo"):
+    """Use the repo's detector ladder so the tool == the mission.
+
+    kind="hailo" uses the AI HAT (.hef). A missing HAT/HEF degrades to the
+    same CPU ladder the mission would use — an explicit --hailo must never
+    turn a bench run into a traceback.
+    """
     from detector import get_detector
-    cfg = {
-        "kind": "yolo",
+    base = {
         "model_path": args.model or "",
         "conf_thr": conf_thr,
         "iou_thr": args.iou,
         "input_size": 640,
         "prefer": prefer,
     }
+    if kind == "hailo":
+        try:
+            return get_detector(dict(base, kind="hailo",
+                                     hef_path=getattr(args, "hef", "")))
+        except Exception as e:
+            print("[detector] HAILO unavailable (%r) — using the CPU ladder "
+                  "instead (hailortcli scan / the .hef path)" % e)
+    cfg = dict(base, kind="yolo")
     try:
         return get_detector(cfg)
     except Exception as e:
         print("[detector] YOLO unavailable (%r) — falling back to classical" % e)
         from detector import ClassicalDetector
         return ClassicalDetector()
+
+
+class CSISource:
+    """The Pi's OWN CSI camera, behind the tiny cv2.VideoCapture interface.
+
+    The UC-517 / any Pi CSI camera is a libcamera device that OpenCV cannot
+    open, so `--source 0` only ever finds USB webcams. This source runs the
+    mission's own camera code (same auto-detect, same tuning file, same
+    autofocus gate), which is what makes a bench number mean something for
+    the real aircraft.
+
+        --source csi             best guess: the bottom / downward camera
+        --source csi:bottom      by role  (front | bottom)
+        --source csi:cam2        by rig slot
+        --source csi:1           by libcamera index (tools/list_cams.py)
+    """
+
+    def __init__(self, spec, cfg=None):
+        from cameras import CameraRig
+        want = str(spec).split(":", 1)[1].strip().lower() if ":" in str(spec) else ""
+        self._rig = CameraRig(cfg or {})
+        cams = self._rig.detect() or {}
+        if not cams:
+            raise RuntimeError("no CSI camera detected — check the ribbon, "
+                               "the boot overlay (dtoverlay=imx477,vcm) and "
+                               "run tools/list_cams.py")
+        pick = None
+        if want.isdigit():
+            pick = next((c for c in cams.values()
+                         if str(getattr(c, "index", "")) == want), None)
+        elif want in ("front", "bottom"):
+            pick = next((c for c in cams.values()
+                         if str(getattr(c, "facing", "")) == want), None)
+        elif want in cams:
+            pick = cams[want]
+        if pick is None:
+            if want:
+                print("[camera] %r matched nothing in %s — using the best guess"
+                      % (want, sorted(cams)))
+            pick = next((c for c in cams.values()
+                         if str(getattr(c, "facing", "")) == "bottom"), None) \
+                or next(iter(cams.values()))
+        self.cam = pick
+        self._size = tuple(getattr(pick, "size", (0, 0)) or (0, 0))
+        pick.start()
+        print("[camera] CSI %s (%s) model=%s size=%s autofocus=%s"
+              % (pick.name, pick.facing, pick.model, self._size,
+                 getattr(pick, "autofocus", None)))
+
+    # -- cv2.VideoCapture lookalikes -------------------------------------
+    def isOpened(self):
+        return True
+
+    def get(self, prop):
+        try:
+            import cv2
+            if prop == cv2.CAP_PROP_FRAME_WIDTH:
+                return float(self._size[0] or 0)
+            if prop == cv2.CAP_PROP_FRAME_HEIGHT:
+                return float(self._size[1] or 0)
+        except Exception:
+            pass
+        return 0.0
+
+    def set(self, *a, **k):
+        return False                      # size/fps come from config.yaml
+
+    def read(self):
+        """(ok, BGR frame) — waits up to ~2 s for the camera thread."""
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            try:
+                frame, _ts, _n = self.cam.latest()
+            except Exception:
+                frame = None
+            if frame is not None:
+                return True, frame
+            time.sleep(0.02)
+        return False, None
+
+    def release(self):
+        try:
+            self.cam.stop()
+        except Exception:
+            pass
 
 
 def main():
@@ -101,6 +204,13 @@ def main():
                     help="prefer the .pt weights (ultralytics)")
     ap.add_argument("--classical", action="store_true",
                     help="no model — cv2/pyzbar detector (short range only)")
+    ap.add_argument("--hailo", action="store_true",
+                    help="detect with the Hailo AI HAT (needs hailo_platform "
+                         "+ the .hef); falls back to the CPU ladder if "
+                         "either is missing")
+    ap.add_argument("--hef", default="models/qr_yolov8n.hef",
+                    help="Hailo .hef model for --hailo "
+                         "(default: models/qr_yolov8n.hef)")
     ap.add_argument("--conf", type=float, default=None,
                     help="detector conf floor (default: the preset's conf)")
     ap.add_argument("--iou", type=float, default=0.45, help="NMS iou (default 0.45)")
@@ -159,6 +269,8 @@ def main():
     if args.classical:
         from detector import ClassicalDetector
         det = ClassicalDetector()
+    elif args.hailo:
+        det = build_detector(args, conf, None, kind="hailo")
     else:
         if args.pt:
             prefer = ["pt"]
@@ -180,11 +292,20 @@ def main():
     from decoder import decode_frame
     from detector import detect_tiles
     src = args.source
-    cap = cv2.VideoCapture(int(src) if src.isdigit() else src)
-    if not cap.isOpened():
-        print("ERROR: cannot open source %r (need cv2 with V4L2/GStreamer, "
-              "or a file/URL)" % src)
-        return 2
+    if str(src).lower().startswith("csi"):
+        # the Pi's own CSI camera (UC-517 …), not an OpenCV device
+        try:
+            cap = CSISource(src, cfg)
+        except Exception as e:
+            print("ERROR: CSI source unavailable: %r" % e)
+            return 2
+    else:
+        cap = cv2.VideoCapture(int(src) if src.isdigit() else src)
+        if not cap.isOpened():
+            print("ERROR: cannot open source %r (need cv2 with V4L2/GStreamer, "
+                  "or a file/URL). For the Pi's CSI camera use "
+                  "--source csi:bottom" % src)
+            return 2
     is_file = os.path.isfile(str(src))
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1280
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 720
