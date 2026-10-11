@@ -324,6 +324,10 @@ Details + the executed test matrix + the bench procedure:
   sweep when the tuning has no `rpi.af` algorithm (LensPosition is a no-op
   then — proven in the field), and flags a flat curve as "the lens did not
   move / there is nothing to focus on" instead of reporting a winner
+* `tools/hef_info.py` — is this `.hef` usable on THIS Pi? Prints the HEF's
+  architecture, its input/output tensors and which output style our parser
+  will use (NMS-in-HEF vs raw head; anything else means "no boxes ever"), and
+  validates a Hailo `nms_config.json` (`--nms-config`) against the model
 * `tools/make_calib_set.py` — build the Hailo DFC calibration set from our
   own frames (camera/video/dir), dropping dark, flat and near-duplicate
   frames and letterboxing to 640×640 exactly like the runtime; prints the

@@ -325,6 +325,26 @@ def _try_yolo_laptop(cfg):
         log.debug(f"yolo_onnx auto failed: {e}")
     return None
 
+def resolve_model_path(path, extra_dirs=()):
+    """Find a model file from a config value. -> path or None.
+
+    Config says `hef_path: models/qr_yolov8n.hef`, which is relative to
+    mission_pi/ — the app is sometimes launched from the repo root, and then a
+    bare os.path.isfile() says "missing" and `kind: auto` silently drops to the
+    ONNX rung. So try: as given (absolute or cwd-relative), then relative to
+    this module's directory, then any extra directories.
+    """
+    if not path:
+        return None
+    here = os.path.dirname(os.path.abspath(__file__))
+    cands = [path, os.path.join(here, path)] + [os.path.join(d, path)
+                                                for d in extra_dirs]
+    for c in cands:
+        if os.path.isfile(c):
+            return c
+    return None
+
+
 # Names that mean "the CPU YOLO ladder" (ONNX or PyTorch), and the ones that
 # additionally pin the format. `onnx`/`pt` are the names an operator actually
 # types on the bench, so they must not be rejected as "unknown detector.kind".
@@ -345,8 +365,8 @@ def get_detector(cfg):
         # real_pi ladder: Hailo AI HAT (.hef) -> ONNX -> .pt -> classical.
         # Every rung falls through to the next, so the Pi never ends up
         # with NO detector; main.py records the chosen rung in bring-up.
-        hef = cfg.get("hef_path", "")
-        if hef and os.path.isfile(hef):
+        hef = resolve_model_path(cfg.get("hef_path", ""))
+        if hef:
             try:
                 d = HailoYolo8Detector(hef, cfg.get("input_size", 640),
                                        cfg.get("conf_thr", 0.35),
@@ -356,7 +376,9 @@ def get_detector(cfg):
             except Exception as e:
                 log.warning("hailo unavailable (%r) — CPU YOLO fallback", e)
         else:
-            log.info("detector auto: no HEF at %r — CPU YOLO fallback", hef)
+            log.info("detector auto: no HEF at %r — CPU YOLO fallback "
+                     "(compile it: training/compile_hef.md)",
+                     cfg.get("hef_path", ""))
         y = _try_yolo_laptop(cfg)
         if y:
             log.info("detector auto: CPU YOLO %s", y.name)
@@ -365,7 +387,11 @@ def get_detector(cfg):
                     "(weak past ~8 m; put a model in models/ + deps)")
         return ClassicalDetector()
     if kind == "hailo":
-        return HailoYolo8Detector(cfg["hef_path"], cfg.get("input_size", 640),
+        hef = resolve_model_path(cfg.get("hef_path", ""))
+        if not hef:
+            raise RuntimeError("HEF not found: %r (put it in models/ — see "
+                               "training/compile_hef.md)" % cfg.get("hef_path"))
+        return HailoYolo8Detector(hef, cfg.get("input_size", 640),
                                   cfg.get("conf_thr", 0.35), cfg.get("iou_thr", 0.5))
     if kind in YOLO_KINDS:
         # An explicit format name pins the order, so `--detector onnx` on a

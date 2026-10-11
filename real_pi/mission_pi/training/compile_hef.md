@@ -130,6 +130,17 @@ zoo version calls it differently, `hailo parse --help` lists accepting
 
 ## 4. Verify before shipping — on x86, then on the Pi
 
+`training/nms_config.json` in this folder is the starting config for the
+zoo's `nms_postprocess` (1 class, `[640,640]`, `nms_scores_th: 0.25` — a low
+floor on purpose: the HEF's score threshold is applied BEFORE our own filter,
+so a high value deletes exactly the small, far-away QR the mission hunts).
+Reference it from the .alls if your zoo version wants a file, and check any
+config you write with:
+
+```bash
+python3 tools/hef_info.py --nms-config training/nms_config.json
+```
+
 ```bash
 # x86: does the HEF load and produce boxes?
 hailortcli run models/qr_yolov8n.hef --input <one of the calib/*.jpg>
@@ -143,6 +154,10 @@ On the Pi, in this order (each one tells you something different):
 ```bash
 cd ~/arena_ai_uploads/real_pi/mission_pi
 hailortcli scan                                   # HAT present?
+hailortcli fw-control identify                    # Device Architecture -> --hw-arch
+python3 tools/hef_info.py                         # does THIS Pi accept the HEF,
+                                                  # and can our parser read its
+                                                  # outputs? (fastest verdict)
 hailortcli run models/qr_yolov8n.hef              # HEF accepted by THIS runtime?
 python3 tools/list_cams.py                        # "models/qr_yolov8n.hef OK"
 python3 tools/qr_bench.py --detector hailo --hef models/qr_yolov8n.hef \

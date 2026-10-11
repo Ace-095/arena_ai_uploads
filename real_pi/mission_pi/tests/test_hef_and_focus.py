@@ -21,7 +21,9 @@ sys.path.insert(0, os.path.join(PI, "tools"))
 
 import numpy as np  # noqa: E402
 
+import detector as D  # noqa: E402
 import focus_sweep as FS  # noqa: E402
+import hef_info as HI  # noqa: E402
 import make_calib_set as MC  # noqa: E402
 import test_yolo_webcam_qr as B  # noqa: E402
 
@@ -165,6 +167,77 @@ def test_compile_doc_matches_the_real_model():
           "style A" in open(os.path.join(PI, "detector.py")).read() or True)
 
 
+# ------------------------------------------- HEF <-> parser contract --
+def test_hef_output_style_classification():
+    """The HEF's output shape decides whether the runtime ever returns a box.
+    Both supported styles must be recognised, and anything else must be called
+    out as fatal instead of silently yielding an empty detection list."""
+    a, detail_a = HI.classify_outputs(
+        [("qr_yolov8n/yolov8_nms_postprocess", [1, 100, 6])])
+    check("NMS-in-HEF output is style A", a == "A" and "Hailo does the NMS" in detail_a,
+          (a, detail_a))
+    b, detail_b = HI.classify_outputs([("output0", [1, 5, 8400])])
+    check("raw ultralytics head is style B", b == "B" and "Pi CPU" in detail_b,
+          (b, detail_b))
+    c, detail_c = HI.classify_outputs([("weird", [1, 84, 8400])])
+    check("an unsupported output is reported as NO boxes", c is None and "NO boxes" in detail_c,
+          (c, detail_c))
+    check("an empty output list is not a crash", HI.classify_outputs([])[0] is None)
+    check("a 1-D output is ignored, not mismatched",
+          HI.classify_outputs([("x", [6])])[0] is None)
+    check("style A is preferred even when listed second",
+          HI.classify_outputs([("raw", [1, 5, 8400]),
+                               ("nms", [1, 100, 6])])[0] == "A")
+
+
+def test_shipped_nms_config_is_valid():
+    """We ship training/nms_config.json as the starting point for the zoo's
+    nms_postprocess, so it must pass our own validator."""
+    import json
+    path = os.path.join(PI, "training", "nms_config.json")
+    check("the template exists", os.path.isfile(path))
+    with open(path) as f:
+        cfg = json.load(f)
+    ok, lines = HI.validate_nms_config(cfg)
+    check("the shipped nms config validates", ok is True, "\n".join(lines))
+    check("its score threshold is not above our detection floor",
+          cfg["nms_scores_th"] <= 0.35, cfg["nms_scores_th"])
+    check("it is 1-class and 640x640",
+          cfg["classes"] == 1 and cfg["image_dims"] == [640, 640], cfg)
+
+
+def test_nms_config_validator_catches_the_dangerous_mistakes():
+    bad = {"classes": 80, "image_dims": [1024, 1024], "nms_scores_th": 0.6}
+    ok, lines = HI.validate_nms_config(bad)
+    text = "\n".join(lines)
+    check("a multi-class config is rejected", ok is False and "classes=80" in text, text)
+    check("wrong image_dims are rejected", "image_dims=[1024, 1024]" in text, text)
+    check("a high score threshold is rejected with the reason",
+          "above our detection floor" in text, text)
+    ok2, _ = HI.validate_nms_config({"classes": 1, "image_dims": [640, 640],
+                                     "nms_scores_th": 0.1})
+    check("a low threshold is fine", ok2 is True)
+    check("non-dict input is refused", HI.validate_nms_config([])[0] is False)
+
+
+def test_model_path_resolution():
+    """`hef_path: models/qr_yolov8n.hef` must resolve from the mission dir even
+    when the app is launched from the repo root — otherwise kind:auto quietly
+    drops to the CPU rung with the HEF sitting right there."""
+    rel = "models/qr_yolov8n.onnx"
+    check("resolved from the mission dir", D.resolve_model_path(rel) is not None)
+    here = os.getcwd()
+    try:
+        os.chdir("/tmp")
+        got = D.resolve_model_path(rel)
+        check("resolved from an unrelated cwd", (got or "").endswith(rel), got)
+    finally:
+        os.chdir(here)
+    check("a missing file is None, not a guess",
+          D.resolve_model_path("models/definitely_absent.hef") is None)
+    check("an empty value is None", D.resolve_model_path("") is None)
+
+
 if __name__ == "__main__":
     test_frame_stats_and_signature()
     test_calib_collection_and_summary()
@@ -172,6 +245,10 @@ if __name__ == "__main__":
     test_curve_verdict_on_the_real_numbers()
     test_focus_sweep_defaults_to_the_mission_config()
     test_compile_doc_matches_the_real_model()
+    test_hef_output_style_classification()
+    test_shipped_nms_config_is_valid()
+    test_nms_config_validator_catches_the_dangerous_mistakes()
+    test_model_path_resolution()
     print("-" * 60)
     if FAILS:
         print("FAILED %d: %s" % (len(FAILS), ", ".join(FAILS)))

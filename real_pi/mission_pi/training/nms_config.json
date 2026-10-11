@@ -1,0 +1,30 @@
+{
+  "nms_scores_th": 0.25,
+  "nms_iou_th": 0.7,
+  "image_dims": [640, 640],
+  "max_proposals_per_class": 100,
+  "classes": 1,
+  "regression_length": 16,
+  "background_removal": false,
+  "background_removal_index": 0,
+  "bbox_decoders": [
+    {
+      "name": "qr_yolov8n/yolov8_nms_postprocess",
+      "stride": 32,
+      "reg_layer": "qr_yolov8n/conv41",
+      "cls_layer": "qr_yolov8n/conv42"
+    },
+    {
+      "name": "qr_yolov8n/yolov8_nms_postprocess",
+      "stride": 16,
+      "reg_layer": "qr_yolov8n/conv53",
+      "cls_layer": "qr_yolov8n/conv54"
+    },
+    {
+      "name": "qr_yolov8n/yolov8_nms_postprocess",
+      "stride": 8,
+      "reg_layer": "qr_yolov8n/conv63",
+      "cls_layer": "qr_yolov8n/conv64"
+    }
+  ]
+}
