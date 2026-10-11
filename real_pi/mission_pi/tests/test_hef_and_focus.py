@@ -509,6 +509,68 @@ def test_hailo_detector_enters_the_pipeline_and_reads_nms():
     check("the detector says hailo, not onnx", detector.HailoYolo8Detector.name)
 
 
+def test_the_tensor_is_reported_below_the_threshold():
+    """The 2026-10-12 run: 936 frames, zero boxes, and NOTHING in the log
+    saying whether the model sees anything at all. A HEF that fires nowhere and
+    a HEF whose boxes are all under our confidence floor were indistinguishable.
+    Now the layout is recorded whenever the SHAPE matches, and the tensor's own
+    peak score comes back in `stats` — below any threshold."""
+    import sys
+    import numpy as np
+    import detector
+    from hailo_decode import decode_hailo_outputs, tensor_peek
+
+    weak = np.zeros((1, 5, 100), np.float32)
+    weak[0, :, 0] = [0.30, 0.42, 0.46, 0.58, 0.09]      # under any floor
+    weak[0, :, 1] = [0.10, 0.20, 0.30, 0.40, 0.02]
+    note, stats = [], {}
+    boxes = decode_hailo_outputs([weak], input_size=640, conf_thr=0.35, iw=640,
+                                 ih=640, note=note.append, stats=stats)
+    check("no boxes over the floor -> no boxes", boxes == [], boxes)
+    check("but the layout is still reported, not hidden", note == ["A'"], note)
+    check("and the tensor's own peak says the model DID see something",
+          abs(stats.get("max_score", 0) - 0.09) < 1e-3
+          and stats.get("filled") == 2 and stats.get("style") == "A'", stats)
+
+    empty = np.zeros((1, 5, 100), np.float32)
+    n2, s2 = [], {}
+    check("an all-zero tensor is 'the model sees nothing' (max 0.0)",
+          decode_hailo_outputs([empty], conf_thr=0.35, iw=640, ih=640,
+                               note=n2.append, stats=s2) == []
+          and n2 == ["A'"] and s2.get("max_score") == 0.0
+          and s2.get("filled") == 0, (n2, s2))
+
+    n3, s3 = [], {}
+    check("a shape we cannot read still says so (a bug on OUR side)",
+          decode_hailo_outputs([np.zeros((1, 3, 7), np.float32)],
+                               note=n3.append, stats=s3) == []
+          and n3 == [None] and s3 == {}, (n3, s3))
+    check("tensor_peek never raises on nonsense",
+          tensor_peek("not an array", "A'") == {"max_score": -1.0,
+                                                "filled": 0})
+
+    # ...and the detector carries that through, so a bench line can print it.
+    hef_path = os.path.join(PI, "models", "qr_yolov8n.hef")
+    fake, Streams = _fake_hailo_platform(modern=True)
+    det = None
+    saved = sys.modules.get("hailo_platform")
+    sys.modules["hailo_platform"] = fake
+    try:
+        det = detector.HailoYolo8Detector(hef_path, input_size=640,
+                                          conf_thr=0.35)
+        out = det._parse([weak], 1.0, 0.0, 0.0, 640, 640)
+        check("the detector exposes what the HEF tensor held",
+              out == [] and abs(det.last_stats.get("max_score", 0) - 0.09) < 1e-3
+              and det._out_style == "A'", det.last_stats)
+    finally:
+        if det is not None:
+            det.close()
+        if saved is None:
+            sys.modules.pop("hailo_platform", None)
+        else:
+            sys.modules["hailo_platform"] = saved
+
+
 def test_hailo_failures_are_loud_once_and_then_stop():
     """A broken pipeline used to log one native HailoRT error PER FRAME while
     the mission silently saw no boxes. Now: keep flying, say it out loud a few
@@ -695,6 +757,7 @@ if __name__ == "__main__":
     test_hailo_configure_params_probe()
     test_hailo_decode_reads_every_layout()
     test_hailo_detector_enters_the_pipeline_and_reads_nms()
+    test_the_tensor_is_reported_below_the_threshold()
     test_hailo_failures_are_loud_once_and_then_stop()
     test_hailo_detector_survives_the_old_api_and_a_broken_runtime()
     test_foreign_class_count_warning()

@@ -67,6 +67,37 @@ except Exception:
 PRESET_KEYS = "1234567"  # key -> preset list position
 
 
+#: Which tuning keys a boost profile is expected to move. Only used to PRINT
+#: what changed — the application itself goes through the mission's own
+#: Camera.apply_qr_profile(), so the bench and the aircraft cannot diverge.
+BOOST_KEYS = ("exposure_us", "gain_db", "brightness", "contrast", "saturation",
+              "sharpness")
+
+
+def apply_preset_boost(cap, preset):
+    """Push qr_presets.<name>.boost onto the CSI camera -> a log line or None.
+
+    Until 2026-10-12 the bench applied a preset by changing conf/tiling only:
+    pressing 1-7 moved the detector but NOT the camera, so the window kept the
+    same exposure/contrast look whatever preset was selected — exactly what the
+    operator reported ("presets change but the window stays in that preset's
+    look"). The mission has always applied the boost through
+    Camera.apply_qr_profile(); the bench now uses the same call.
+    """
+    name = (preset or {}).get("boost")
+    cam = getattr(cap, "cam", None)          # only CSISource has a Camera
+    fn = getattr(cam, "apply_qr_profile", None)
+    if not name or not callable(fn):
+        return None
+    try:
+        t = fn(name) or {}
+    except Exception as e:
+        return ("[boost] %s FAILED: %r — the camera keeps its previous ISP "
+                "settings" % (name, e))
+    shown = ["%s=%s" % (k, t[k]) for k in BOOST_KEYS if k in t]
+    return "[boost] %s -> %s" % (name, ", ".join(shown) or "no change reported")
+
+
 def preset_index(key, n_presets):
     """Which preset does this keypress select? -> index or None.
 
@@ -536,6 +567,12 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, W)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, H)
     print("[camera] %dx%d source=%s tiled=%s" % (W, H, src, tiled))
+    _boost_line = apply_preset_boost(cap, preset)
+    if _boost_line:
+        print(_boost_line)
+    elif str(src).lower().startswith("csi") and (preset or {}).get("boost"):
+        print("[boost] %s NOT applied (this camera has no apply_qr_profile)"
+              % preset["boost"])
 
     hide_fakes = False
     n_frames = 0
@@ -651,40 +688,51 @@ def main():
                 cv2.putText(frame, "qr %.2f" % b.conf, (x, max(12, y - 4)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1,
                             cv2.LINE_AA)
-        hud(frame, len(raw), len(kept), payload_any, focus_score(frame))
+        fsharp = focus_score(frame)
+        hud(frame, len(raw), len(kept), payload_any, fsharp)
 
         maxconf = max([b.conf for b in raw], default=0.0)
-        if not _show:
-            if now - t_last_line >= 1.0:
-                t_last_line = now
-                # windowed fps: a cumulative average keeps DROPPING on screen
-                # and looks like the tool is dying instead of steady at 1 fps
-                win_dt = max(1e-3, now - t_line_prev)
-                win_fps = (n_frames - n_line_prev) / win_dt
-                n_line_prev, t_line_prev = n_frames, now
-                fmean, fstd = frame_stats(frame)
-                fsharp = focus_score(frame)
-                print("[bench] frame=%d raw=%d filt=%d maxconf=%.2f "
-                      "payload=%r frame_mean=%.0f frame_std=%.0f focus=%.0f "
-                      "fps=%.1f (%.0f ms/frame)"
-                      % (n_frames, n_raw, n_filt, maxconf, payload_any,
-                         fmean, fstd, fsharp, win_fps,
-                         1000.0 / max(1e-3, win_fps)))
-                if not hinted_vision:
-                    msg = vision_hint(fmean, fstd, fsharp)
-                    if msg:
-                        hinted_vision = True
-                        print(msg)
-                if (not hinted_empty and n_raw == 0 and n_frames >= 10
-                        and (now - t_true_start) >= 10.0):
-                    hinted_empty = True
-                    print(hint % (n_frames, now - t_true_start))
-                if args.save_frames:
-                    path = os.path.join(args.save_frames, "bench_%05d.jpg"
-                                        % n_frames)
-                    if cv2.imwrite(path, frame):
-                        print("[bench] wrote %s" % path)
-        else:
+        # ONE line per second in BOTH modes. In window mode this is the record of
+        # what the run actually saw: `nms_max=` is the HEF tensor's own best
+        # score BELOW our confidence floor, the only way to tell "the model
+        # detects nothing" from "everything is under the floor" — the
+        # 2026-10-12 run printed raw_boxes=0 for 936 frames with no explanation.
+        # `focus=` is what the lens ring gets adjusted against.
+        if now - t_last_line >= 1.0:
+            t_last_line = now
+            # windowed fps: a cumulative average keeps DROPPING on screen
+            # and looks like the tool is dying instead of steady at 1 fps
+            win_dt = max(1e-3, now - t_line_prev)
+            win_fps = (n_frames - n_line_prev) / win_dt
+            n_line_prev, t_line_prev = n_frames, now
+            fmean, fstd = frame_stats(frame)
+            st = getattr(det, "last_stats", None) or {}
+            peak = st.get("max_score", -1.0)
+            extra = ("nms_max=%.2f filled=%d "
+                     % (peak, st.get("filled", 0))
+                     if isinstance(peak, (int, float)) and peak >= 0 else "")
+            print("[bench] frame=%d raw=%d filt=%d maxconf=%.2f %s"
+                  "payload=%r frame_mean=%.0f frame_std=%.0f focus=%.0f "
+                  "fps=%.1f (%.0f ms/frame)"
+                  % (n_frames, n_raw, n_filt, maxconf, extra, payload_any,
+                     fmean, fstd, fsharp, win_fps,
+                     1000.0 / max(1e-3, win_fps)))
+            if not hinted_vision:
+                msg = vision_hint(fmean, fstd, fsharp)
+                if msg:
+                    hinted_vision = True
+                    print(msg)
+            if (not hinted_empty and n_raw == 0 and n_frames >= 10
+                    and (now - t_true_start) >= 10.0):
+                hinted_empty = True
+                print(hint % (n_frames, now - t_true_start))
+            if args.save_frames:
+                path = os.path.join(args.save_frames, "bench_%05d.jpg"
+                                    % n_frames)
+                if cv2.imwrite(path, frame):
+                    print("[bench] wrote %s" % path)
+
+        if _show:
             cv2.imshow("QR bench (f/v/k/l/t/p/1-7/q)", frame)
             k = cv2.waitKey(1) & 0xFF
             if k in (ord("q"), 27):
@@ -717,6 +765,9 @@ def main():
                     tiled = _apply_preset.get("tile_grid", [3, 3]) != [1, 1]
                 print("[key] preset -> %s (conf %.2f, req-decode %s, tile %s)"
                       % (active, conf, qf.require_decode_for_cue, tiled))
+                line = apply_preset_boost(cap, _apply_preset)
+                if line:
+                    print(line)
             elif preset_index(k, len(names) or 1) is not None:
                 idx = preset_index(k, len(names))
                 if idx is not None:
@@ -730,6 +781,9 @@ def main():
                         tiled = _apply_preset.get("tile_grid", [3, 3]) != [1, 1]
                     print("[key] preset -> %s (conf %.2f, req-decode %s, tile %s)"
                           % (active, conf, qf.require_decode_for_cue, tiled))
+                    line = apply_preset_boost(cap, _apply_preset)
+                    if line:
+                        print(line)
 
         if args.max_frames and n_frames >= args.max_frames:
             print("[bench] max-frames reached (%d)" % n_frames)

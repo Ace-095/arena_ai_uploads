@@ -393,6 +393,67 @@ def test_tuning_lookup_dedupes_and_looks_in_models():
           "not found" in text, text)
 
 
+def test_preset_boost_reaches_the_camera():
+    """Pressing 1-7 in the bench changed the detector's conf/tiling but NOT the
+    camera, so the window kept the same exposure and look whatever preset was
+    selected — the 2026-10-12 report ("presets change but the window stays in
+    that preset's look"). The mission applies qr_presets.<name>.boost through
+    Camera.apply_qr_profile(); the bench must use the SAME call."""
+
+    class FakeCam:
+        def __init__(self, raises=False):
+            self.calls = []
+            self.raises = raises
+
+        def apply_qr_profile(self, name):
+            self.calls.append(name)
+            if self.raises:
+                raise RuntimeError("profile not found")
+            return {"exposure_us": 5000, "contrast": 1.8, "sharpness": 2.0}
+
+    class FakeCap:
+        def __init__(self, cam=None):
+            if cam is not None:
+                self.cam = cam
+
+    cam = FakeCam()
+    line = B.apply_preset_boost(FakeCap(cam),
+                                {"boost": "qr_boost_day", "conf_thr": 0.35})
+    check("a preset's boost profile is applied to the camera",
+          cam.calls == ["qr_boost_day"], cam.calls)
+    check("and the line says which profile and what it moved",
+          line and "qr_boost_day" in line and "exposure_us=5000" in line
+          and "contrast=1.8" in line, line)
+    check("a USB/webcam source has no boost to apply",
+          B.apply_preset_boost(FakeCap(), {"boost": "qr_boost_day"}) is None)
+    check("a preset without a boost key is not an error",
+          B.apply_preset_boost(FakeCap(FakeCam()), {"conf_thr": 0.3}) is None
+          and B.apply_preset_boost(FakeCap(FakeCam()), None) is None)
+    bad = B.apply_preset_boost(FakeCap(FakeCam(raises=True)),
+                               {"boost": "nope"})
+    check("a failing boost is reported, never raised",
+          bad and "FAILED" in bad and "nope" in bad, bad)
+
+    # The profiles the presets name must actually exist, or the ISP silently
+    # keeps its old settings and only the HUD changes.
+    import qr_camera_boost as QB
+    cfg = {}
+    try:
+        import yaml
+        cfg = yaml.safe_load(open(os.path.join(PI, "config.yaml"))) or {}
+    except Exception as e:
+        check("config.yaml readable for the preset check", False, e)
+    presets = cfg.get("qr_presets") or {}
+    missing = [n for n, p in presets.items()
+               if (p or {}).get("boost")
+               and p["boost"] not in QB.QR_BOOST_PROFILES]
+    check("every preset's boost profile exists",
+          bool(presets) and not missing, missing)
+    check("the default preset (day) does apply a real profile",
+          (presets.get("day") or {}).get("boost") in QB.QR_BOOST_PROFILES,
+          presets.get("day"))
+
+
 def test_focus_score_and_vision_hint():
     """The 2026-10-12 report was "camera looks blurry not sharp at all idk
     why" — with nothing in the output saying whether the fault was the light,
@@ -455,6 +516,7 @@ def test_bench_stamps_which_code_it_is():
 if __name__ == "__main__":
     test_headless_decision()
     test_preset_keys_are_ints()
+    test_preset_boost_reaches_the_camera()
     test_focus_score_and_vision_hint()
     test_bench_stamps_which_code_it_is()
     test_detector_kind_aliases()

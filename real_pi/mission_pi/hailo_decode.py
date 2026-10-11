@@ -245,9 +245,43 @@ def _raw_head_to_boxes(a, conf_thr, scale, px, py, iw, ih):
     return boxes
 
 
+#: Score position per layout — every Hailo YOLO layout carries the box score
+#: in the same slot, which is what makes one reader enough.
+def tensor_peek(a, style):
+    """{'max_score': float, 'filled': int} for a tensor of a known style.
+
+    Added after the 2026-10-12 field run returned `raw_boxes=0` for 936 frames
+    with NO explanation available: a HEF that never fires and a HEF whose boxes
+    are all under our confidence floor look identical from the outside. This
+    reads the tensor itself, below any threshold, so the log can say which one
+    it is. `filled` counts rows with any score at all (> 0).
+    """
+    out = {"max_score": -1.0, "filled": 0}
+    try:
+        x = np.asarray(a, dtype=np.float32)
+        if style == "A":
+            sc = x.reshape(-1, 6)[:, 4]
+        elif style == "A'":
+            sc = x[0, 4::NMS_FIELDS] if x.ndim == 3 else x.reshape(-1)
+        elif style == "A''":
+            sc = x[..., 4].reshape(-1)
+        elif style == "A'-flat":
+            sc = x[..., 4].reshape(-1)
+        elif style == "B":
+            sc = x[0, 4].reshape(-1) if x.ndim == 3 else x.reshape(-1)
+        else:
+            return out
+        if sc.size:
+            out["max_score"] = float(sc.max())
+            out["filled"] = int((sc > 0).sum())
+    except Exception:
+        pass
+    return out
+
+
 def decode_hailo_outputs(outs, input_size=640, conf_thr=0.35, nms_fn=None,
                          scale=1.0, px=0.0, py=0.0, iw=640, ih=640, note=None,
-                         xy_order="auto"):
+                         xy_order="auto", stats=None):
     """Any supported HEF output -> frame-space boxes; applies nms_fn at the end.
 
     Layouts, tried in the order the runtime prefers:
@@ -261,7 +295,15 @@ def decode_hailo_outputs(outs, input_size=640, conf_thr=0.35, nms_fn=None,
     element carrying its class index.
 
     `note(style_or_None)` is called once with the branch that fired, so a field
-    log says WHICH layout was used instead of leaving it to guesswork.
+    log says WHICH layout was used instead of leaving it to guesswork. It is
+    called even when the branch yields NO boxes — the layout of a HEF does not
+    depend on whether it happens to detect something, and hiding that made a
+    silent zero-box run undiagnosable.
+
+    `stats` (optional dict, filled in place) receives
+    {"style", "max_score", "filled"} straight off the tensor, BELOW any
+    threshold, so "the model sees nothing" and "the boxes are under our floor"
+    can be told apart.
     """
     arg = dict(input_size=int(input_size), conf_thr=float(conf_thr),
                scale=scale, px=px, py=py, iw=iw, ih=ih)
@@ -283,11 +325,21 @@ def decode_hailo_outputs(outs, input_size=640, conf_thr=0.35, nms_fn=None,
     def _finish(style, boxes):
         if note:
             note(style)
+        if stats is not None:
+            stats["style"] = style
         return nms_fn(boxes) if (nms_fn and boxes) else boxes
+
+    def _peek(a, style):
+        """Remember what the tensor held, even when nothing passes."""
+        if stats is None:
+            return
+        stats.update(tensor_peek(a, style))
+        stats["style"] = style
 
     # ---- A: NMS with the class id in the last column ------------------------
     for a, _ci in flat:
         if a.ndim >= 2 and a.shape[-1] == 6:
+            _peek(a, "A")
             boxes = _box_rows_to_boxes(a.reshape(-1, 6), **arg)
             if boxes:
                 return _finish("A", boxes)
@@ -298,6 +350,7 @@ def decode_hailo_outputs(outs, input_size=640, conf_thr=0.35, nms_fn=None,
             boxes = []
             for ci in range(a.shape[1]):
                 boxes += _rows_to_boxes(a[0, ci].T, **arg)
+            _peek(a, "A''")
             if boxes:
                 return _finish("A''", boxes)
 
@@ -309,6 +362,7 @@ def decode_hailo_outputs(outs, input_size=640, conf_thr=0.35, nms_fn=None,
             boxes = _raw_head_to_boxes(a, **{k: arg[k] for k in
                                              ("conf_thr", "scale", "px", "py",
                                               "iw", "ih")})
+            _peek(a, "B")
             if boxes:
                 return _finish("B", boxes)
 
@@ -322,6 +376,7 @@ def decode_hailo_outputs(outs, input_size=640, conf_thr=0.35, nms_fn=None,
                 for ci in range(max(1, a.shape[1] // NMS_FIELDS)):
                     lo = ci * NMS_FIELDS
                     boxes += _rows_to_boxes(a[0][lo:lo + NMS_FIELDS], **arg)
+            _peek(a, "A'")
             if boxes:
                 return _finish("A'", boxes)
 
@@ -329,12 +384,16 @@ def decode_hailo_outputs(outs, input_size=640, conf_thr=0.35, nms_fn=None,
     for a, _ci in flat:
         if (a.ndim == 2 and a.shape[1] == NMS_FIELDS
                 and a.shape[0] <= RAW_HEAD_MIN_ANCHORS):
+            _peek(a, "A'-flat")
             boxes = _rows_to_boxes(a.T, **arg)
             if boxes:
                 return _finish("A'-flat", boxes)
 
+    # No boxes anywhere — but a layout may still have been RECOGNISED, and that
+    # is the difference between "the model sees nothing" (a real answer) and
+    # "we cannot read this HEF" (a bug on our side). Say which one it is.
     if note:
-        note(None)
+        note((stats or {}).get("style") or None)
     return []
 
 

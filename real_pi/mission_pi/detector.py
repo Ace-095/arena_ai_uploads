@@ -197,6 +197,7 @@ class HailoYolo8Detector(Detector):
         self._lock = threading.Lock()
         self._out_style = None
         self._fails = 0        # consecutive infer failures (see detect)
+        self.last_stats = {}   # what the HEF's tensor held (see _parse)
         self._stack = contextlib.ExitStack()
         try:
             hef = HEF(hef_path)
@@ -299,11 +300,16 @@ class HailoYolo8Detector(Detector):
         def _note(s):
             style.append(s)
 
+        # What the HEF's tensor actually contained, BELOW our own threshold.
+        # Without this, "the model detects nothing" and "everything is under
+        # the confidence floor" produce identical logs — the 2026-10-12 run
+        # returned raw_boxes=0 for 936 frames and there was no way to tell.
+        self.last_stats = {"style": None, "max_score": -1.0, "filled": 0}
         boxes = _decode_hailo_outputs(
             outs, input_size=self.input_size, conf_thr=self.conf_thr,
             nms_fn=lambda bs: _host_nms(bs, self.iou_thr),
             scale=scale, px=px, py=py, iw=iw, ih=ih, note=_note,
-            xy_order=self.nms_order)
+            xy_order=self.nms_order, stats=self.last_stats)
         chosen = style[0] if style else None
         if chosen != self._out_style:
             self._out_style = chosen
@@ -314,6 +320,13 @@ class HailoYolo8Detector(Detector):
                             "can come from this HEF until the parser learns "
                             "them (see tools/hef_info.py)",
                             [list(getattr(o, "shape", []) or []) for o in outs])
+        if not boxes and chosen:
+            # The layout is fine; report the tensor's own best score so the
+            # operator knows whether to lower conf_thr or to look at the lens.
+            log.debug("hailo: %s read OK but no box over conf %.2f "
+                      "(tensor max score %.2f, %d non-zero row(s))",
+                      chosen, self.conf_thr, self.last_stats["max_score"],
+                      self.last_stats["filled"])
         return boxes
 
     def close(self):
