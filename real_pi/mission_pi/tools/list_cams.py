@@ -212,38 +212,39 @@ def boot_verdict(cfg, dtbo_path=None, board=None):
     if wants_vcm:
         path = dtbo_path or next((p for p in DTBO_PATHS if os.path.isfile(p)),
                                 None)
-        # `dtoverlay -h` reads the overlay the system would actually load, so
-        # it is the answer we trust; the byte scan is the fallback.
+        # `dtoverlay -h` lists the parameters the boot loader will accept;
+        # the byte scan says whether the FILE is Arducam's at all. They can
+        # disagree (Arducam's newer overlays wire the lens unconditionally and
+        # do not advertise a parameter), so report what each one actually
+        # shows instead of collapsing them into one claim.
         names = dtoverlay_h_params("imx477")
-        if names is not None:
-            how = "`dtoverlay -h imx477`"
-            has = "vcm" in names
-        elif path is not None:
-            how = path
-            has = dtbo_supports_vcm(path)
-        else:
-            how, has = "overlays/imx477.dtbo", None
-        if has is False:
+        listed = None if names is None else ("vcm" in names)
+        in_file = dtbo_supports_vcm(path) if path else None
+        if listed is True:
+            lines.append("OK   `dtoverlay -h imx477` offers a vcm parameter — "
+                         "Arducam's overlay is installed and the focus motor "
+                         "can be driven")
+        elif in_file is True:
+            lines.append("OK*  the installed imx477 overlay is not the stock "
+                         "one (its file references vcm) but it does NOT "
+                         "advertise a 'vcm' parameter — likely a newer "
+                         "Arducam build that wires the lens unconditionally, "
+                         "in which case ',vcm' in config.txt is harmless but "
+                         "unnecessary. VERIFY the lens actually moves: see the "
+                         "focus check in docs/CAMERA_AND_PIXHAWK_SETUP.md §1.3")
+        elif in_file is False:
             ok = False
-            lines.append("BAD  the installed imx477 overlay is the STOCK "
-                         "Raspberry Pi one (no vcm parameter) — ',vcm' cannot "
-                         "apply, so the camera will not appear. Install "
-                         "Arducam's imx477_rpi_dtoverlay package, then "
-                         "re-check with: dtoverlay -h imx477 | grep -i vcm")
-            lines.append("     (the stock overlay otherwise works, but the "
-                         "focus motor is then dead)")
-        elif has is None:
-            if path is None or not os.path.isfile(path):
-                ok = False
-                lines.append("BAD  overlays/imx477.dtbo not found — install "
-                             "Arducam's imx477_rpi_dtoverlay package first")
-            else:
-                lines.append("note could not read %s — check permissions"
-                             % path)
+            lines.append("BAD  the installed overlay is the STOCK Raspberry Pi "
+                         "imx477 one (no vcm at all) — the camera may stream "
+                         "but the focus motor cannot be driven. Install "
+                         "Arducam's imx477_rpi_dtoverlay package, then check: "
+                         "dtoverlay -h imx477 | grep -i vcm")
+        elif path is None or not os.path.isfile(path):
+            ok = False
+            lines.append("BAD  overlays/imx477.dtbo not found — install "
+                         "Arducam's imx477_rpi_dtoverlay package first")
         else:
-            lines.append("OK   the imx477 overlay declares vcm (%s) — "
-                         "Arducam's overlay, so the focus motor can work"
-                         % how)
+            lines.append("note could not read %s — check permissions" % path)
 
     if not any("imx708" in o for o in overlays):
         lines.append("note with auto-detect off, any OTHER CSI camera (e.g. "

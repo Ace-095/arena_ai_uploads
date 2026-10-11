@@ -301,7 +301,12 @@ Details + the executed test matrix + the bench procedure:
   and **`--fence-check`**: firmware + MAVLink 2 + `FENCE_*` params + stored
   fence, with a `FENCE-READY` / not-ready verdict and a non-zero exit code, so
   a new (or clone) Pixhawk can be judged before the UI is asked to upload
-* `tools/cam_probe.py` — list CSI cams, save one snap each
+* `tools/cam_probe.py` — list CSI cams, save one snap each (`--config FILE`
+  probes with the mission's real size/tuning/focus, `--defaults` ignores it)
+* `tools/focus_sweep.py` — sweep the VCM lens through positions (dioptres,
+  printed as distances) and score sharpness, then print the exact
+  `autofocus: false` + `lens_position:` lines for `config.yaml`. Refuses with
+  a clear message when the camera has no focus control
 * `tools/qr_bench.py` — detector+decoder over images, boxes/payload/ms
 * `tools/link_doctor.py` — end-to-end Pi-link diagnosis (local or `--remote`)
 * `tools/fake_sitl.py` — SITL stand-in: tcp 5760/5762 + optional udp mirror

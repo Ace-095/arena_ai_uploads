@@ -119,6 +119,11 @@ cameras:
     aperture: 2.8
     autofocus: true          # VCM lens: needs tuning_file + the ,vcm overlay
     tuning_file: imx477_af.json   # Arducam AF tuning for the Pi 5 (pisp) IPA
+    # For a DOWNWARD camera one measured lens position beats continuous
+    # autofocus (contrast-detect AF hunts over low-texture ground). Positions
+    # are libcamera dioptres: 0 = infinity, 0.067 = 15 m. Set autofocus:false
+    # first, then measure with tools/focus_sweep.py — it prints this line.
+    # lens_position: 0.067
     # --- Waveshare IMX477 IR-CUT B (previous hardware; uncomment to revert) -
     # hfov_deg: 100.0
     # vfov_deg: 75.0

@@ -173,25 +173,66 @@ the role:
     tuning_file: imx477_af.json
 ```
 
-Behaviour (implemented in `cameras.py`, tested in
-`tests/test_cam_autodetect.py`):
-
-* `autofocus: true` → the role gets `AfMode = Continuous` **and** the tuning
-  file is loaded through `Picamera2.load_tuning_file()`.
-* `autofocus: false` → never touched (correct for the fixed-focus Waveshare
-  module, where AF controls do not exist).
-* key omitted → old behaviour: only `imx708` autofocuses by default.
-* a tuning file that cannot be loaded logs a warning and falls back to the
-  default tuning. **A missing file never crashes the mission.**
-
-A focused-at-15 m fixed setting is usually better than continuous AF for a
-downward camera on a moving drone (contrast-detect AF can hunt over low-texture
-ground). To pin focus after arming-up checks:
+**Is the focus motor actually driven?** Ask libcamera — this is the ground
+truth, and it settles any doubt about which overlay is installed:
 
 ```bash
-rpicam-still -t 0 --autofocus-mode manual --lens-position 5 \
-  --tuning-file /usr/share/libcamera/ipa/rpi/pisp/imx477_af.json
+python3 - <<'PY'
+from picamera2 import Picamera2
+p = Picamera2(0)
+print({k: v for k, v in p.camera_controls.items()
+       if any(s in k.lower() for s in ("af", "lens", "focus"))})
+PY
 ```
+
+* `{'AfMode': …, 'LensPosition': …}` → the VCM **is** wired: the overlay in
+  use is Arducam's, and both autofocus and manual focus are possible.
+* `{}` → no lens subdev: the kernel is driving the sensor only (stock
+  overlay, or a module without a motor). The camera still streams and QR
+  detection works; focus is whatever the lens is screwed to.
+
+`tools/focus_sweep.py` runs that check itself and exits with a clear message
+instead of pretending. **For the downward camera, prefer one measured
+position over autofocus** — the page below is how you get it:
+
+```bash
+# 1. set autofocus: false in config.yaml first, then:
+python3 tools/focus_sweep.py --source csi:bottom --positions 0:2:0.125
+#    (dioptres: 0 = infinity, 0.5 = 2 m. A fine pass around the winner:)
+python3 tools/focus_sweep.py --source csi:bottom --positions 0.02,0.04,0.06,0.08
+
+# it prints e.g.
+#   cameras.bottom:
+#     autofocus: false
+#     lens_position: 0.067
+#   ...which you paste into config.yaml.
+```
+
+Sanity on the physics: the stock 3.9 mm f/2.8 lens focused at the hyperfocal
+distance (~1.8 m) is acceptably sharp from ~0.9 m to infinity, so a downward
+camera at 15 m wants the lens at (nearly) infinity — `lens_position: 0` or a
+small dioptre value, never a close-focus setting. The VCM position is volatile
+across power cycles, which is exactly why it belongs in `config.yaml` and is
+re-applied at every camera open.
+
+Behaviour (implemented in `cameras.py`, tested in
+`tests/test_cam_autodetect.py` and `tests/test_focus_sweep.py`):
+
+* `autofocus: true` → the role gets `AfMode = Continuous` **and** the tuning
+  file is loaded (see below). If the camera rejects `AfMode` (no lens subdev)
+  the open **logs a warning naming the camera** and keeps streaming.
+* `autofocus: false` + `lens_position: <dioptres>` → that exact lens position
+  is applied at every open (the VCM forgets its position across power cycles,
+  so a measured value belongs in config).
+* `autofocus: false` and no `lens_position` → focus is never touched
+  (correct for the fixed-focus Waveshare module).
+* both set → autofocus wins and a warning says which key to drop; the pinned
+  position is **not** silently applied and then overridden.
+* key omitted → old behaviour: only `imx708` autofocuses by default.
+* `tuning_file` may be a **name** in libcamera's IPA dir (`imx477_af.json`)
+  or a **path** to one you ship yourself (repo-relative or absolute) — no
+  sudo, survives OS updates. Anything unloadable logs a warning and falls
+  back to the default tuning. **A missing file never crashes the mission.**
 
 ### 1.4 The lens numbers are the config that actually matters
 

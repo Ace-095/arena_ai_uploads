@@ -37,13 +37,15 @@ class FakeCSI(C._BaseCamera):
 
     def __init__(self, name, index, size, hfov_deg, facing,
                  rotation_deg=0, jpeg_quality=80, autofocus=None,
-                 tuning_file=None):
+                 tuning_file=None, lens_position=None):
         super().__init__(name, index, size, hfov_deg, facing, rotation_deg,
                          jpeg_quality)
         self.kind = "rpi"
         # recorded so the tests can prove config -> object wiring
         self.autofocus = None if autofocus is None else bool(autofocus)
         self.tuning_file = tuning_file
+        self.lens_position = (None if lens_position in (None, "")
+                              else float(lens_position))
         self._open_calls = 0
 
     def _open(self):

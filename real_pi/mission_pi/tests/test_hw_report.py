@@ -278,6 +278,8 @@ def test_verdict_uses_dtoverlay_h_when_available():
         check("dtoverlay -h result wins over the file scan", ok is True, text)
         check("the method is named in the OK line",
               "dtoverlay -h imx477" in text, text)
+        check("and it says the motor can be driven",
+              "focus motor can be driven" in text, text)
 
 
 def test_verdict_detects_the_stock_overlay_without_vcm():
@@ -288,19 +290,51 @@ def test_verdict_detects_the_stock_overlay_without_vcm():
         stock = _vcm_dtbo(td, with_vcm=False)
         cfg = list_cams.parse_boot_config(
             "camera_auto_detect=0\n[all]\ndtoverlay=imx477,vcm\n")
-        ok, lines = list_cams.boot_verdict(cfg, dtbo_path=stock)
+        real = list_cams.dtoverlay_h_params
+        list_cams.dtoverlay_h_params = lambda name: None
+        try:
+            ok, lines = list_cams.boot_verdict(cfg, dtbo_path=stock)
+            good = _vcm_dtbo(td, with_vcm=True)
+            ok2, lines2 = list_cams.boot_verdict(cfg, dtbo_path=good)
+        finally:
+            list_cams.dtoverlay_h_params = real
         text = "\n".join(lines)
         check("verdict fails with the stock dtbo + ,vcm", ok is False, text)
         check("verdict names it as the STOCK overlay",
               "STOCK" in text and "no vcm" in text, text)
-
-        good = _vcm_dtbo(td, with_vcm=True)
-        ok2, lines2 = list_cams.boot_verdict(cfg, dtbo_path=good)
         text2 = "\n".join(lines2)
         check("verdict passes with Arducam's dtbo", ok2 is True, text2)
-        check("verdict confirms vcm support",
-              "declares vcm" in text2 and "focus motor can work" in text2,
-              text2)
+        check("the file scan is named, since dtoverlay -h could not answer",
+              "vcm" in text2 and "stock" in text2.lower(), text2)
+
+
+def test_verdict_when_dtoverlay_h_and_the_file_disagree():
+    """The user's actual Pi, 2026-10-11: the camera streams, the dtbo file
+    references vcm, but `dtoverlay -h imx477` lists only the stock parameter
+    names. The verdict must NOT declare the camera broken (it demonstrably
+    works) and must not claim the motor is proven — it must say to verify."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        good = _vcm_dtbo(td, with_vcm=True)
+        cfg = list_cams.parse_boot_config(
+            "camera_auto_detect=0\n[all]\ndtoverlay=imx477,vcm\n")
+        real = list_cams.dtoverlay_h_params
+        list_cams.dtoverlay_h_params = lambda name: {
+            "rotation", "orientation", "media-controller", "cam0",
+            "always-on", "sync-source", "sync-sink", "link-frequency"}
+        try:
+            ok, lines = list_cams.boot_verdict(cfg, dtbo_path=good)
+        finally:
+            list_cams.dtoverlay_h_params = real
+        text = "\n".join(lines)
+        check("an unexplained-but-working overlay is not a failure",
+              ok is True, text)
+        check("the disagreement is stated plainly",
+              "does NOT advertise" in text, text)
+        check("the stock-obsolete line is NOT printed as BAD",
+              "BAD" not in text, text)
+        check("it tells the operator to verify the lens, not to reinstall",
+              "VERIFY" in text, text)
 
 
 def test_verdict_handles_missing_dtbo_and_other_cameras():
@@ -342,6 +376,7 @@ if __name__ == "__main__":
     test_verdict_advice_does_not_use_the_three_letter_trap()
     test_verdict_uses_dtoverlay_h_when_available()
     test_verdict_detects_the_stock_overlay_without_vcm()
+    test_verdict_when_dtoverlay_h_and_the_file_disagree()
     test_verdict_handles_missing_dtbo_and_other_cameras()
     test_vcm_scan_is_honest_about_unreadable_files()
     test_boot_report_returns_a_dict_without_a_pi()

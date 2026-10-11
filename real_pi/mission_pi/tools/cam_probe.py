@@ -15,8 +15,28 @@ from cameras import CameraRig  # noqa
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--snap-dir", default="snaps")
+    ap.add_argument("--config", default="config.yaml",
+                    help="config.yaml to probe WITH (default: config.yaml) — "
+                         "snapshots then use the mission's real size, tuning "
+                         "file and focus settings instead of defaults")
+    ap.add_argument("--defaults", action="store_true",
+                    help="ignore config.yaml and probe with built-in defaults")
     args = ap.parse_args()
-    rig = CameraRig({})
+
+    cfg = {}
+    if not args.defaults:
+        if os.path.isfile(args.config):
+            try:
+                import yaml
+                with open(args.config) as f:
+                    cfg = yaml.safe_load(f) or {}
+                print("config: %s" % args.config)
+            except Exception as e:
+                print("config %s unreadable (%r) — using defaults"
+                      % (args.config, e))
+        else:
+            print("config %s not found — using defaults" % args.config)
+    rig = CameraRig(cfg)
     rig.detect()
     if not rig.cams:
         print("no cameras found (picamera2 + CSI ribbons seated?)")

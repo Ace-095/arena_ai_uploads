@@ -403,7 +403,7 @@ class Camera(_BaseCamera):
 
     def __init__(self, name, index, size, hfov_deg, facing,
                  rotation_deg=0, jpeg_quality=80, autofocus=None,
-                 tuning_file=None):
+                 tuning_file=None, lens_position=None):
         super().__init__(name, index, size, hfov_deg, facing,
                          rotation_deg, jpeg_quality)
         self._picam = None
@@ -418,6 +418,18 @@ class Camera(_BaseCamera):
         #   /usr/share/libcamera/ipa/rpi/pisp/imx477_af.json
         # Without it the camera opens fine but has no focus controls.
         self.tuning_file = str(tuning_file).strip() if tuning_file else None
+        # Pinned manual focus, in dioptres (libcamera's LensPosition unit:
+        # 0 = infinity, 1 = 1 m, 0.067 = 15 m). A downward camera looking at
+        # the ground from a fixed altitude does not want continuous autofocus
+        # hunting over low-texture ground — one measured position is better
+        # and reproducible. Ignored while autofocus is requested (logged).
+        try:
+            self.lens_position = (None if lens_position in (None, "")
+                                  else float(lens_position))
+        except (TypeError, ValueError):
+            log.warning("%s lens_position %r is not a number — ignoring",
+                        name, lens_position)
+            self.lens_position = None
 
     def wants_autofocus(self):
         """Explicit config wins; otherwise only the Pi Cam 3 (imx708)."""
@@ -425,11 +437,57 @@ class Camera(_BaseCamera):
             return self.autofocus
         return "imx708" in (self.model or "")
 
+    def wants_lens_position(self):
+        """The LensPosition to apply at open, or None to leave the lens as-is.
+
+        Autofocus wins when both are configured: the position would be
+        overwritten by the AF loop, so applying it would be a lie. `_open()`
+        logs the conflict once.
+        """
+        if self.lens_position is None:
+            return None
+        if self.wants_autofocus():
+            return None
+        return self.lens_position
+
     def _load_tuning(self):
+        """Tuning file as a dict, or None. Never raises.
+
+        `tuning_file` may be the NAME of a file the libcamera IPA dir already
+        has (imx477_af.json) OR a PATH to one we ship ourselves — an AF tuning
+        that lives in the repo needs no sudo and survives OS updates.
+        """
         if not self.tuning_file:
             return None
+        import json
+        spec = self.tuning_file
+        candidates = []
+        if os.path.isabs(spec):
+            candidates.append(spec)
+        else:
+            candidates.append(os.path.join(os.path.dirname(
+                os.path.abspath(__file__)), spec))
+            candidates.append(os.path.join(os.getcwd(), spec))
+        if "/" in spec or spec.lower().endswith(".json"):
+            for path in candidates:
+                if os.path.isfile(path):
+                    try:
+                        with open(path) as f:
+                            tuning = json.load(f)
+                        log.info("%s using tuning file %s", self.name, path)
+                        return tuning
+                    except Exception as e:
+                        log.warning("%s tuning file %s unreadable (%r) — "
+                                    "using the default tuning; autofocus "
+                                    "controls may be absent",
+                                    self.name, path, e)
+                        return None
+            log.warning("%s tuning file %r not found (looked in %s) — using "
+                        "the default tuning; autofocus controls may be absent",
+                        self.name, spec, ", ".join(candidates))
+            return None
         try:
-            tuning = Picamera2.load_tuning_file(self.tuning_file)
+            tuning = Picamera2.load_tuning_file(spec)
         except Exception as e:
             # Not fatal: a missing tuning file must degrade to the default
             # tuning (camera still streams), never stop the mission.
@@ -451,16 +509,39 @@ class Camera(_BaseCamera):
         self._picam.configure(cfg)
         controls = {"AeEnable": True}
         if self.wants_autofocus():
+            if self.lens_position is not None:
+                log.warning("%s has BOTH autofocus and lens_position=%s — "
+                            "autofocus wins; drop one of them in config.yaml",
+                            self.name, self.lens_position)
             try:
                 from libcamera import controls as CTRLS
                 controls["AfMode"] = CTRLS.AfModeEnum.Continuous
             except Exception as e:
                 log.debug("%s: autofocus requested but unavailable: %r",
                           self.name, e)
+        else:
+            pos = self.wants_lens_position()
+            if pos is not None:
+                controls["LensPosition"] = float(pos)
         try:
             self._picam.set_controls(controls)
         except Exception as e:
-            log.debug("%s controls failed: %r", self.name, e)
+            # Requesting autofocus on a camera whose lens the kernel does not
+            # drive is a real configuration/hardware mismatch — it must be
+            # visible, not a debug line. Everything else stays quiet.
+            if "AfMode" in controls:
+                log.warning("%s: autofocus requested but the camera rejected "
+                            "it (%r) — the VCM/lens is not available. Use "
+                            "cameras.%s.lens_position or autofocus: false. "
+                            "Check the overlay (`dtoverlay -h imx477`) and "
+                            "run tools/focus_sweep.py.",
+                            self.name, e, self.facing or "?")
+            elif "LensPosition" in controls:
+                log.warning("%s: lens_position=%s rejected (%r) — no manual "
+                            "focus control on this camera",
+                            self.name, controls.get("LensPosition"), e)
+            else:
+                log.debug("%s controls failed: %r", self.name, e)
         self._picam.start()
         time.sleep(0.8)  # let AE/AWB settle
 
@@ -1032,7 +1113,8 @@ class CameraRig:
                                ccfg.get("rotation_deg", 0),
                                ccfg.get("jpeg_quality", 80),
                                autofocus=ccfg.get("autofocus"),
-                               tuning_file=ccfg.get("tuning_file"))
+                               tuning_file=ccfg.get("tuning_file"),
+                               lens_position=ccfg.get("lens_position"))
                     c.model = model
                     c.device_desc = "csi %s (idx %d)" % (model, idx)
                     return c
