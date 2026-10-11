@@ -432,6 +432,9 @@ class _BaseCamera:
         """
         import time as _time
         now = _time.time() if now is None else now
+        if mean is not None and mean >= 0:
+            # the restore below calls apply_qr_profile, which reads frame_mean
+            self.frame_mean = float(mean)
         try:
             from qr_camera_boost import dark_rescue, recovered
         except Exception:                      # module missing: never break capture
@@ -468,9 +471,28 @@ class _BaseCamera:
                 return self.get_tuning()
             # Map profile to contract tuning
             tuning = {k: v for k, v in prof.items() if k in self.TUNING_DEFAULTS}
-            # QR boost meta
+            # QR boost meta — the operator's CHOICE is always remembered, so the
+            # rescue can hand it back when the light returns.
             self.qr_boost["qr_boost_enabled"] = profile_name != "normal"
             self.qr_boost["qr_boost_mode"] = profile_name
+            # A MANUAL profile in the dark (manual pins exposure AND gain) goes
+            # black, and with the rescue already on it stayed black for good
+            # (2026-10-13). So while the room is dark, keep auto exposure on and
+            # apply the chosen profile once the light is back (rescue_dark_frame).
+            if not tuning.get("adaptive", True):
+                from qr_camera_boost import DARK_MEAN, RESCUE_TUNING, recovered
+                mean = self.frame_mean
+                dark = 0.0 <= mean < DARK_MEAN
+                if dark or (self._rescue_on and not recovered(mean)):
+                    import time as _time
+                    self._rescue_on = True
+                    self._rescue_last = _time.time()
+                    log.warning("%s preset '%s' is MANUAL and the room is dark "
+                                "(mean %.0f): auto exposure keeps the picture "
+                                "until the light is back, then the preset is "
+                                "applied", self.name, profile_name, mean)
+                    return self.apply_tuning(dict(RESCUE_TUNING))
+            self._rescue_on = False
             # Apply ISP tuning via backend
             return self.apply_tuning(tuning)
         except Exception as e:

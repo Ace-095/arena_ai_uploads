@@ -254,12 +254,62 @@ def test_detector_input_is_configurable():
         QB.enhance_qr_frame = real
 
 
+def test_manual_preset_in_the_dark_stays_on_auto():
+    """2026-10-13 bug: pressing day/far/aggressive while the room was dark
+    re-applied the MANUAL profile and the frame went black again (mean 4), and
+    because the rescue was still flagged on, nothing ever restored it. A manual
+    preset chosen in the dark must keep auto exposure until the light is back,
+    then the chosen preset must apply by itself."""
+    import time as _time
+    had = getattr(C, "_HAVE_PICAM", False)
+
+    class FakePicam(object):
+        def __init__(self):
+            self.ctrls = {}
+
+        def set_controls(self, ctrls):
+            self.ctrls.update(ctrls)
+
+    try:
+        C._HAVE_PICAM = True
+        cam = C.Camera("cam2", 0, (640, 480), 60.0, "bottom")
+        cam._picam = FakePicam()
+        cam.frame_mean = 4.0                      # the room is dark right now
+        for preset in ("qr_boost_day", "qr_boost_far", "qr_boost_aggressive"):
+            if preset not in QB.QR_BOOST_PROFILES:
+                continue
+            cam.apply_qr_profile(preset)
+            check("%s chosen in the dark keeps AUTO exposure" % preset,
+                  cam.tuning["adaptive"] is True
+                  and cam._picam.ctrls.get("AeEnable") is True,
+                  cam.tuning.get("adaptive"))
+            check("%s is remembered as the operator's choice" % preset,
+                  cam.qr_boost.get("qr_boost_mode") == preset)
+            cam.frame_mean = 4.0
+        cam.apply_qr_profile("qr_boost_day")
+        cam.frame_mean = 4.0
+        check("a dark frame during the rescue does not undo it",
+              cam.rescue_dark_frame(4.0, now=_time.time() + 60) is None
+              and cam.tuning["adaptive"] is True)
+        line = cam.rescue_dark_frame(90.0, now=_time.time() + 120)
+        check("light back -> the chosen manual preset is applied again",
+              line and "re-applying" in line and "qr_boost_day" in line
+              and cam.tuning["adaptive"] is False, line)
+        cam.frame_mean = 90.0
+        cam.apply_qr_profile("qr_boost_day")
+        check("a manual preset in a bright room is applied as-is",
+              cam.tuning["adaptive"] is False and cam._rescue_on is False)
+    finally:
+        C._HAVE_PICAM = had
+
+
 if __name__ == "__main__":
     test_profiles_stay_compatible()
     test_dark_rescue_decision()
     test_new_tuning_keys_reach_libcamera()
     test_camera_rescues_itself_and_comes_back()
     test_detector_input_is_configurable()
+    test_manual_preset_in_the_dark_stays_on_auto()
     print("-" * 60)
     if FAILS:
         print("FAILED %d: %s" % (len(FAILS), ", ".join(FAILS)))
