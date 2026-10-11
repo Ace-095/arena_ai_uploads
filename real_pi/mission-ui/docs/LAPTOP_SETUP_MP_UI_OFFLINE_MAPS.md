@@ -71,12 +71,13 @@ comes from MP — never from the Pi.
    `SIM_GUIDE.md`, then continue below unchanged — the mirror doesn't care
    whether the vehicle is real or simulated.
 
-> The fence the mission flies is the **MP-side polygon fence**
-> (inclusion, `MAV_CMD_NAV_FENCE_POLYGON_VERTEX_INCLUSION` = 5001,
-> `FENCE_ENABLE=1`, `FENCE_ACTION=1` RTL). The bridge uploads exactly this
-> when you APPLY FENCE from the UI (§5) — but before flight day, open MP's
-> **SETUP → Geofence** tab once and confirm your firmware shows polygon
-> fence support (ArduCopter 4.x does).
+> The fence the mission flies is the **polygon inclusion fence**
+> (`MAV_CMD_NAV_FENCE_POLYGON_VERTEX_INCLUSION` = 5001), stored on the flight
+> controller through the **Pi**, not through MP: see §5. `FENCE_ENABLE=1` and
+> `FENCE_ACTION=1` (RTL) still have to be set on the aircraft — the UI reads
+> them and displays them but never writes them. Before flight day, open MP's
+> **SETUP → Geofence** tab once and confirm your firmware shows polygon fence
+> support (ArduCopter 4.x does).
 
 ---
 
@@ -145,16 +146,22 @@ is auto-watched), `--verbose`.
 ## 5. Connect the Pi, draw the fence, verify
 
 1. **Pi link:** in the UI's Pi box paste `http://<pi-ip>:8000` → Connect.
-   The Pi field router/LTE LAN must be up; the UI only *receives* on this
-   link (telemetry envelopes + camera frames) — the sole write path is
-   camera tuning sliders. No Pi on the bench? `--mock` (§4) simulates it.
+   The Pi field router/LTE LAN must be up. This link carries telemetry and
+   camera frames *in*, and the fence, altitude and camera tuning *out* — and
+   it is verified before it may write anything: the GEOFENCE card must read
+   `writer: DIRECT Pi → Pixhawk` after you press Connect. If it says
+   `BLOCKED — no Pi link`, the fence buttons will refuse (by design: this page
+   is served by the laptop bridge, which has no flight-controller link).
+   No Pi on the bench? `--mock` (§4) simulates it.
 2. **Fence:** pick the offline tile source (§8) → *Draw* the polygon →
-   **APPLY FENCE → MP** → confirm the dialog. Success = status
-   `loaded && confirmed` (the bridge reads the fence *back* from the FC and
-   compares every vertex to ~1 cm). Then **open MP's Fence/Geofence tab and
-   eyeball the polygon** — belt and suspenders before every flight.
-   MP-uploaded fences are adopted automatically: *refresh fence from FC*
-   pulls whatever MP/the FC currently holds into the UI.
+   **UPLOAD FENCE → FC**. That goes browser → Pi → Pixhawk over the Pi's own
+   MAVLink link, and the Pi then **downloads the fence back and compares every
+   vertex (~1 cm)**; success = `loaded && confirmed` on the GEOFENCE card.
+   Mission Planner is not required to write it. Afterwards **open MP's
+   Fence/Geofence tab and eyeball the polygon** — belt and suspenders before
+   every flight. Fences written by MP (or anything else) are adopted on
+   *refresh from FC*, which always shows the controller's fence, not the
+   drawing. Disarm first: fence edits while armed are refused.
 3. **RTL/LAND buttons** send `DO_SET_MODE` through the MP link — the UI's
    only flight commands. Arming, takeoff and mission control stay in MP.
 4. **QR arrives on 4 independent routes** (first payload wins the display,

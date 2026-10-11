@@ -1166,6 +1166,16 @@ class Server:
             return 200, "image/png", data, {}
 
         # --- bridge endpoints (always on) ---
+        if p == "/health":
+            # The UI asks the serving origin what it IS before letting it write
+            # a safety fence. This is the bridge, not mission_pi: answering
+            # honestly keeps a fence write from being sent to a server that has
+            # no direct flight-controller link (it used to 404 and look like
+            # "the UI fence does not work").
+            return self.json({"ok": True, "status": "ok",
+                              "service": "mp_bridge", "role": "mp-forwarder",
+                              "mock": False, "ts": time.time(),
+                              "mavlink": getattr(self.mav, "state_dict", lambda: {})()})
         if p == "/api/mp/state":
             return self.json(self.bridge_state())
         if p == "/api/mp/tiles-info":
@@ -1302,7 +1312,8 @@ class Server:
     async def mock_route(self, method, p, jbody):
         m = self.mock
         if p == "/health":
-            return self.json({"status": "ok", "mock": True})
+            return self.json({"status": "ok", "mock": True,
+                              "service": "mp_bridge", "role": "mp-forwarder"})
         if p == "/api/fsm/status":
             return self.json({"state": m.phase, "previous": m.prev_phase, "armable": m.vehicle.armed,
                               "link_healthy": True,

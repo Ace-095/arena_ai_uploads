@@ -26,14 +26,39 @@ python3 bridge/mp_bridge.py --mock --origin 15.3647,75.1240
 
 ## Real setup (competition laptop)
 
-1. **MP forwarding** (the one MP-side step): connect MP to the vehicle →
-   right-click vehicle → *MAVLink Forwarding* → add `127.0.0.1:14551` → tick
-   **Write access**. The UI's MAV lamp goes green; fence/RTL flow out this way.
+1. **MP forwarding**: connect MP to the vehicle → right-click vehicle →
+   *MAVLink Forwarding* → add `127.0.0.1:14551` → tick **Write access**. The
+   UI's MAV lamp goes green; **RTL/LAND** flow out this way. The *fence* does
+   not — see the next point.
 2. **Bridge**: `python3 bridge/mp_bridge.py [--port 8100] [--mav-port 14551]
    [--watch "C:\path\to\MP log"] [--mbtiles venue.mbtiles]`.
 3. **UI**: open `http://127.0.0.1:8100`, paste the Pi URL (`http://<pi-ip>:8000`)
-   → connect (or press **Probe** — see below). Draw fence → *APPLY FENCE → MP* →
-   confirm the polygon in MP's Fence tab before flight.
+   → connect (or press **Probe** — see below). Draw the polygon → *UPLOAD
+   FENCE → FC*. Confirm the polygon in MP's Fence tab afterwards if you want a
+   second opinion.
+
+### Fence: written by the Pi, never through Mission Planner
+
+The geofence goes **browser → Pi → Pixhawk** over the Pi's own MAVLink link,
+and the flight controller is re-read and compared before the UI says anything
+succeeded. MP is optional for viewing/downloading the fence; it is not required
+to write it, and the *fence* buttons deliberately do not use the MP relay.
+
+The GEOFENCE card shows the active writer and the UI refuses rather than guess:
+
+| GEOFENCE card says | Meaning |
+|---|---|
+| `DIRECT Pi → Pixhawk` | `<pi>/api/fence` will be used — upload, readback verify, clear |
+| `BLOCKED — no Pi link` | No verified Pi link: the buttons refuse and say why |
+| `BRIDGE → Mission Planner (not direct)` | You ticked *allow MP bridge fallback*; the fence goes via MP forwarding |
+
+The UI finds out which server it is talking to from `GET /health`
+(`service: "mission_pi"` vs `service: "mp_bridge"`), because this page is
+normally served by the **bridge on the laptop** — treating that origin as "the
+Pi" is what once sent fence writes to a URL the bridge does not implement.
+
+Full protocol details, the executed test matrix and the bench procedure are in
+[`../docs/GEOFENCE_UI_TO_PIXHAWK.md`](../docs/GEOFENCE_UI_TO_PIXHAWK.md).
 
 ### Pi link: probe, then fall back instead of failing
 

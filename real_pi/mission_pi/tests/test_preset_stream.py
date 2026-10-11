@@ -110,9 +110,12 @@ def make_frames_dir():
     make_demo_frames if present, else plain synthetic frames)."""
     out = "/tmp/preset_stream_frames"
     os.makedirs(out, exist_ok=True)
+    # numpy must be imported for the FALLBACK path too: with `qrcode` missing
+    # the except branch below used np without ever binding it (UnboundLocalError
+    # instead of the intended plain-frame fallback).
+    import numpy as np
     try:
         import qrcode
-        import numpy as np
         qr = qrcode.make("MISSION-QR-001")
         q = np.array(qr.convert("L"))
         q = cv2.resize(q, (240, 240), interpolation=cv2.INTER_NEAREST)

@@ -89,8 +89,9 @@ class CommandsTest(unittest.TestCase):
         from fastapi import Request
         @app.post('/__test/fault')
         async def fault(req: Request):
-            cls.fc.fail = (await req.json()).get('fail')
-            return {'ok': True}
+            body = await req.json()
+            cls.fc.fail = body.get('fault', body.get('fail'))
+            return {'ok': True, 'fault': cls.fc.fail}
         sock = socket.socket()
         sock.bind(('127.0.0.1', 0))
         cls.port = sock.getsockname()[1]
@@ -215,16 +216,26 @@ class CommandsTest(unittest.TestCase):
         self.assertGreater(len(times), 15)
         self.assertLess(gap, .65)
 
-    def test_ui_dom_clicks_to_live_pi(self):
-        script = PI.parent/'mission-ui/tests/test_commands_dom.cjs'
+    def _node_ui_test(self, name, *args, timeout=60):
+        script = PI.parent/'mission-ui/tests'/name
         probe = subprocess.run(['node','-e', "require('jsdom')"], capture_output=True,
                                cwd=script.parent.parent)
         if probe.returncode:
             self.skipTest('optional UI DOM test: npm install in real_pi/mission-ui')
-        r = subprocess.run(['node',str(script),self.base], capture_output=True, text=True,
-                           timeout=40, cwd=script.parent.parent)
+        r = subprocess.run(['node',str(script),*args], capture_output=True, text=True,
+                           timeout=timeout, cwd=script.parent.parent)
         print(r.stdout)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        return r.stdout
+
+    def test_ui_dom_clicks_to_live_pi(self):
+        self._node_ui_test('test_commands_dom.cjs', self.base, timeout=40)
+
+    def test_ui_picks_the_fence_writer_from_health_not_the_url(self):
+        """Bridge-served UI must refuse the write; Pi-served UI may do it."""
+        out = self._node_ui_test('test_writer_detection_dom.cjs')
+        self.assertIn('bridge-served UI', out)
+        self.assertIn('Pi-served UI', out)
 
 
 if __name__ == '__main__':

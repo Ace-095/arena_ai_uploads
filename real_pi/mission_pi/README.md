@@ -211,6 +211,30 @@ Re-train from field miss-frames whenever the bench/field shows drops
 (details in `training/README.md`). A later custom model drops into the
 `detector.kind: custom` slot — contract in `models/README.md`.
 
+## Geofence: the UI can set it, over the Pi's own FC link
+
+`GET/POST/DELETE /api/fence` uploads a single inclusion polygon with the
+ArduPilot **fence mission protocol** (`MISSION_COUNT` →
+`MISSION_REQUEST[_INT]` → `MISSION_ITEM[_INT]`, cmd **5001**, `param1` = vertex
+count), then **downloads the fence back from the Pixhawk and compares it**
+before reporting success. Disarmed only; `409` while armed (re-checked inside
+the mission lock), `503` with no FC link, `400` for non-polygon geometry.
+`FENCE_ENABLE` / `FENCE_TYPE` / `FENCE_ACTION` are **read and displayed, never
+written** — the UI must not quietly arm or disarm a safety boundary.
+
+Mission Planner is not needed to write the fence. The browser refuses to guess
+which server may write it: it asks the origin's `/health` for
+`service: "mission_pi"` and only then offers `DIRECT Pi → Pixhawk`; otherwise
+the buttons are blocked (or the MP relay is used, deliberately, via the
+*allow MP bridge fallback* tick).
+
+Details + the executed test matrix + the bench procedure:
+[`../docs/GEOFENCE_UI_TO_PIXHAWK.md`](../docs/GEOFENCE_UI_TO_PIXHAWK.md).
+
+```bash
+./tools/run_tests.sh fence    # protocol + end-to-end + browser-click tests
+```
+
 ## Bench tools
 
 * `tools/fc_probe.py` — FC heartbeat/mode/pos/home/batt, `--fence`, `--plan`
@@ -218,7 +242,13 @@ Re-train from field miss-frames whenever the bench/field shows drops
 * `tools/qr_bench.py` — detector+decoder over images, boxes/payload/ms
 * `tools/link_doctor.py` — end-to-end Pi-link diagnosis (local or `--remote`)
 * `tools/fake_sitl.py` — SITL stand-in: tcp 5760/5762 + optional udp mirror
-  (`--udp`), `--auto --loop` flies a demo mission by itself
+  (`--udp`), `--auto --loop` flies a demo mission by itself. Also a **writable
+  fence machine**: it accepts/validates/stores mission-type FENCE transfers, so
+  the whole UI → Pi → FC fence path can be exercised with no hardware, and
+  `--fence-fault reject|discard|corrupt|stall` makes it lie to prove the UI
+  reports failure honestly
+* `tools/run_tests.sh` — runs every test in `tests/` (unittest modules *and*
+  the self-checking scripts, which `pytest tests/` cannot run)
 * `tools/make_demo_frames.py` — synthesises `demo_frames/` for `config.demo.yaml`
 * `tools/make_qr_panel.py`, `tools/gz_cam_bridge.py` — A3 panel, Gazebo → MJPEG
 
@@ -245,9 +275,13 @@ mission_pi/
   training/          dataset gen + fine-tune + HEF compile docs
   models/            weight slots + custom-model contract
   sim/               Gazebo world + iris_dualcam + QR panels
-  tools/             fc/cam/qr probes, link_doctor, fake_sitl, gz_cam_bridge
-  tests/             stdlib unit tests (bring-up, server-first, link
-                     supervision, streams, mission reset, geo, consensus, ...)
+  fence.py           single-inclusion-polygon validation + readback compare
+  tools/             fc/cam/qr probes, link_doctor, fake_sitl (writable
+                     fence FC + fault injection), run_tests.sh, gz_cam_bridge
+  tests/             unit + wire-protocol + end-to-end tests (bring-up,
+                     server-first, link supervision, streams, mission reset,
+                     geo, consensus, fence protocol, fence e2e on fake_sitl,
+                     UI command API + browser DOM clicks, ...)
 ```
 
 Hehe was used as reference for ideas only (consensus shape, STATUSTEXT

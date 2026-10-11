@@ -20,6 +20,20 @@ const esc = (s) => String(s).replace(/[&<>\"]/g, (c) => ({ '&': '&amp;', '<': '&
 const S = {
   piUrl: '', isMock: false, bridgeOk: false,
   pi: { connected: false },
+  // Which server is serving THIS page, and therefore who may write the fence.
+  //   'pi'     = mission_pi answered /health(service=mission_pi) here
+  //   'bridge' = the laptop bridge (Mission Planner forwarder) served us
+  //   null     = not established yet -> fence writes are refused, never guessed
+  originRole: null,
+  // True only after /health proved this URL is mission_pi (service marker or
+  // an unmistakably-Pi payload). Never set from a URL guess.
+  piVerified: false,
+  piHealth: null,
+  // Fence writer actually in use: 'pi' | 'mp' | null (null = blocked).
+  fenceWriter: null,
+  // Writing a safety fence through Mission Planner is a deliberate choice,
+  // never a silent fallback (the Pi path exists precisely so MP is not needed).
+  allowMpFenceFallback: false,
   camsAvail: { cam1: true, cam2: true }, camsProbed: false,
   mav: null, fence: null, polygon: null, plan: null, fsm: null,
   qr: { payload: '', streak: 0, required: 3, confirmed: false },
@@ -120,6 +134,25 @@ function renderFence(d) {
   if ($('fRadius')) $('fRadius').textContent = d.max_radius_m != null ? d.max_radius_m + ' m' : '—';
   if ($('fOrigin')) $('fOrigin').textContent = (d.origin_lat != null)
     ? (d.origin_lat.toFixed(5) + ', ' + d.origin_lon.toFixed(5)) : '—';
+  if ($('fEnforce')) {
+    // Storing vertices is NOT the same as the fence being armed to act on a
+    // breach. Say so instead of implying the vehicle is protected.
+    const p = d.fc_params || null;
+    if (!p) {
+      $('fEnforce').textContent = 'unknown (not read)';
+      $('fEnforce').style.color = '';
+    } else {
+      const scope = p.FENCE_TYPE != null ? p.FENCE_TYPE : null;
+      const on = p.FENCE_ENABLE ? 'ENABLED' : 'disabled (FENCE_ENABLE=0)';
+      $('fEnforce').textContent = on
+        + (p.FENCE_ACTION != null ? ' · action ' + p.FENCE_ACTION : '')
+        + (p.FENCE_ALT_MAX != null ? ' · ceil ' + p.FENCE_ALT_MAX + ' m' : '')
+        + (scope != null ? ' · type ' + scope : '');
+      $('fEnforce').style.color = p.FENCE_ENABLE ? '#5fd97a' : '#ffb020';
+      $('fEnforce').title = 'Read from the FC, never written by this UI. '
+        + 'Vertices stored on the FC do not by themselves enforce a breach.';
+    }
+  }
   if (d.reason && d.reason !== S._lastFenceReason) {
     S._lastFenceReason = d.reason;
     log(d.confirmed ? 'INFO' : 'WARN', 'fence: ' + d.reason);
@@ -397,30 +430,98 @@ function postJson(url, body) {
   });
 }
 
-// Exactly ONE writer. A second bridge upload is not a visualization call:
-// it starts another MAVLink mission transfer and can race the Pi.
+// ------------------------------------------------------- fence writer ----
+// The fence is a SAFETY artefact with exactly ONE writer at a time. Which
+// writer that is must be a fact the UI has verified, not an inference from
+// whatever URL happens to be in the Pi box -- that guessing is what sent
+// fence writes to the laptop bridge's missing /api/fence and looked like
+// "the UI fence does not work".
+function fencePiBase() {
+  // Only a URL we have actually probed as mission_pi may receive fence writes.
+  const base = (S.piUrl || '').replace(/\/$/, '');
+  if (base && S.piVerified) return base;
+  if (S.originRole === 'pi') return window.location.origin;
+  return '';
+}
+
+function renderFenceWriter() {
+  const el = $('fWriter');
+  const hint = $('fenceWriterHint');
+  const piBase = fencePiBase();
+  if (piBase) {
+    S.fenceWriter = 'pi';
+    if (el) { el.textContent = 'DIRECT Pi → Pixhawk'; el.style.color = '#5fd97a'; }
+    if (hint) hint.textContent = 'Browser → ' + piBase + '/api/fence → Pi FCLink → Pixhawk, '
+      + 'then the FC is re-read and compared. Mission Planner is not in this path.';
+  } else if (S.allowMpFenceFallback) {
+    S.fenceWriter = 'mp';
+    if (el) { el.textContent = 'BRIDGE → Mission Planner (not direct)'; el.style.color = '#ffb020'; }
+    if (hint) hint.textContent = 'You allowed the Mission Planner bridge fallback. This does NOT go '
+      + 'through the Pi; MP must be running with MAVLink forwarding. Paste the Pi URL to use the direct path.';
+  } else {
+    S.fenceWriter = null;
+    if (el) { el.textContent = 'BLOCKED — no Pi link'; el.style.color = '#ff6b6b'; }
+    if (hint) hint.textContent = 'No verified Pi link, so the fence buttons will refuse. Paste the Pi '
+      + 'URL (http://<pi-ip>:8000) and press connect, or tick the MP-fallback box deliberately.';
+  }
+  const fb = $('chkMpFenceFallback');
+  if (fb) fb.checked = S.allowMpFenceFallback;
+  return S.fenceWriter;
+}
+
+// Which endpoint this fence action will use, and WHY. Returns {url, writer}
+// or throws with an operator-readable reason — it never silently falls back.
+function resolveFenceTarget() {
+  const piBase = fencePiBase();
+  if (piBase) return { url: piBase + '/api/fence', writer: 'pi' };
+  if (S.allowMpFenceFallback) return { url: '/api/mp/fence', writer: 'mp' };
+  const why = S.originRole === 'bridge'
+    ? 'This page was served by the laptop bridge (Mission Planner), not by the Pi. '
+      + 'The bridge has no direct FC link, so it cannot store a fence on the Pixhawk.'
+    : 'No Pi link is verified yet.';
+  throw new Error(why + ' Paste the Pi URL (http://<pi-ip>:8000), press connect, '
+    + 'or tick "allow MP bridge fallback" to write through Mission Planner instead.');
+}
+
 let fenceBusy = false;
 async function runFenceAction(action, vertices) {
   if (fenceBusy) return;
+  let target;
+  try {
+    target = resolveFenceTarget();
+  } catch (e) {
+    renderFenceWriter();
+    if ($('pConverted')) $('pConverted').textContent = 'REFUSED — ' + e.message;
+    log('ERROR', 'fence ' + action + ' refused: ' + e.message);
+    return;
+  }
   fenceBusy = true;
   const ids = ['btnFenceApply', 'btnPolyApply', 'btnFenceClear', 'btnFenceRefresh'];
   ids.forEach(id => { if ($(id)) $(id).disabled = true; });
-  const base = (S.piUrl || '').replace(/\/$/, '');
-  const url = base ? base + '/api/fence' : '/api/mp/fence';
   try {
     let st;
-    if (action === 'upload') st = await postJson(url, { vertices });
+    if (action === 'upload') st = await postJson(target.url, { vertices });
     else {
-      const r = await fetch(url, { method: action === 'clear' ? 'DELETE' : 'GET', cache: 'no-store' });
+      const r = await fetch(target.url, { method: action === 'clear' ? 'DELETE' : 'GET', cache: 'no-store' });
       if (!r.ok) throw new Error('HTTP ' + r.status + ': ' + (await r.text()).slice(0, 200));
       st = await r.json();
     }
     if (!st.confirmed) throw new Error(st.reason || st.fc_error || 'FC readback NOT confirmed');
+    if (target.writer === 'pi' && st.source && st.source !== 'pi') {
+      throw new Error('expected the Pi to answer (got source=' + st.source + ') — refusing to call this verified');
+    }
     renderFence(st);
+    const via = target.writer === 'pi'
+      ? 'direct Pi → Pixhawk (' + (st.fc_device || 'FC') + ')'
+      : 'bridge → Mission Planner';
     if ($('pConverted')) $('pConverted').textContent = action === 'clear'
-      ? 'cleared (FC readback)' : 'FC verified: ' + st.vertex_count + ' vertices';
-    log('INFO', 'fence ' + action + ': FC readback verified. Refresh/download Fence in MP if needed.');
+      ? 'cleared (FC readback via ' + via + ')'
+      : 'FC verified: ' + st.vertex_count + ' vertices (via ' + via + ')';
+    log('INFO', 'fence ' + action + ': FC readback verified via ' + via
+      + '. Mission Planner is not required to write it.');
   } catch (e) {
+    // The FC is the source of truth: a failed transaction must not leave the
+    // UI showing the polygon we merely drew.
     renderFence({ ...(S.fence || {}), loaded: false, confirmed: false, reason: e.message });
     if ($('pConverted')) $('pConverted').textContent = 'NOT confirmed — ' + e.message;
     log('ERROR', 'fence ' + action + ' failed: ' + e.message);
@@ -495,8 +596,16 @@ function boot() {
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob); a.download = 'mission-ui.log'; a.click();
   });
+  // Deliberately NOT pre-filled with location.origin: when the bridge serves
+  // this page the origin is the LAPTOP, and pasting it in here is what made
+  // fence writes go to a server that has no flight-controller link. The Pi URL
+  // is filled in only after classifyOrigin() proves the origin really is a Pi
+  // (or from the explicit ?pi= parameter).
   const piUrlInput = $('piUrl');
-  if (piUrlInput) piUrlInput.value = window.location.origin;
+  if (piUrlInput && !piUrlInput.value) {
+    const inUrl = (window.location.search.match(/[?&]pi=([^&]+)/) || [])[1];
+    if (inUrl) piUrlInput.value = decodeURIComponent(inUrl).replace(/\/$/, '');
+  }
 
   // ---- map ----
   fetch('/api/mp/tiles-info').then((r) => r.json()).then((info) => {
@@ -902,6 +1011,10 @@ function boot() {
     const hint = $('piHint');
     if (!el) return;
     if (!res) { el.textContent = '—'; return; }
+    // Record what this URL actually IS before anything else can use it.
+    S.piVerified = !!(res.ok && res.isPi);
+    S.piHealth = (res.ok && res.health) || null;
+    renderFenceWriter();
     if (res.ok) {
       const h = res.health || {};
       const bu = h.bringup || {};
@@ -945,6 +1058,13 @@ function boot() {
         ? ('open · ' + s.url)
         : ('down · retry ' + s.retry + (s.polling ? ' · polling HTTP' : ''));
       setLamp('lampPi', s.connected);
+      // An open websocket to /ws/telemetry proves mission_pi is at the other
+      // end — unless the URL is the bridge we know served this page (its mock
+      // mode also opens a socket, and that must never own the fence).
+      const isKnownBridge = S.originRole === 'bridge' &&
+        (S.piUrl || '') === window.location.origin;
+      if (s.connected && !isKnownBridge) S.piVerified = true;
+      renderFenceWriter();
       const btnPiConn = $('btnPiConnect');
       if (btnPiConn) btnPiConn.textContent = s.connected ? 'disconnect' : 'connect';
       if (s.connected && !was) {
@@ -957,6 +1077,16 @@ function boot() {
     onProbe: renderPiProbe,
     onEnvelope,
     onLog: log,
+  });
+
+  const chkFallback = $('chkMpFenceFallback');
+  if (chkFallback) chkFallback.addEventListener('change', () => {
+    S.allowMpFenceFallback = !!chkFallback.checked;
+    renderFenceWriter();
+    log(S.allowMpFenceFallback ? 'WARN' : 'INFO',
+      S.allowMpFenceFallback
+        ? 'MP bridge fence fallback ENABLED — fence writes will go through Mission Planner, not the Pi'
+        : 'MP bridge fence fallback disabled — the fence is only written through the Pi');
   });
 
   const btnPiProbe = $('btnPiProbe');
@@ -987,12 +1117,31 @@ function boot() {
       btnPiConnect.textContent = 'connect';
       return;
     }
-    S.piUrl = v;
+    if (v !== S.piUrl) {
+      // A different host: nothing about the old verification carries over.
+      S.piVerified = false;
+      S.piHealth = null;
+      S.piUrl = v;
+      renderFenceWriter();
+    }
     if ($('piUrl')) $('piUrl').value = S.piUrl;
     S.camsProbed = false;
     S.camsAvail = { cam1: true, cam2: true };
     applyCamVisibility();
     pi.connect(S.piUrl);
+    // Verify BEFORE trusting it with the fence: a URL that answers with
+    // something that is not mission_pi must never become the fence writer.
+    // (After connect() so the probe asks about the URL we just set.)
+    const p = pi.probe ? pi.probe() : Promise.resolve(null);
+    Promise.resolve(p).then((res) => {
+      if (res && res.ok && res.isPi) {
+        log('INFO', 'verified mission_pi at ' + S.piUrl + ' — this link can write the fence directly to the FC');
+      } else if (res && res.ok) {
+        log('ERROR', 'something answers ' + S.piUrl + ' but it is NOT mission_pi — fence writes will be refused');
+      } else if (res) {
+        log('ERROR', 'Pi probe failed: ' + (res.error || 'unknown') + ' — fence writes will be refused');
+      }
+    });
   });
 
   bridge = window.MissionLinks.initBridge({
@@ -1072,17 +1221,78 @@ function boot() {
     if (!on) btnFollow.classList.remove('on');
   });
 
-  // ---- mock auto-connect ----
-  S.piUrl = window.location.origin;
-  const piUrlEl = $('piUrl'); if (piUrlEl) piUrlEl.value = S.piUrl;
-  fetch('/api/mp/state').then((r) => r.json()).then((st) => {
+  // ---- who served this page? decides the fence writer, honestly ----
+  // The bridge serves this same UI from the LAPTOP. Assuming the origin is
+  // the Pi made "UPLOAD FENCE → FC" POST to <laptop>/api/fence, which the
+  // bridge does not implement (404) — indistinguishable, from the operator's
+  // seat, from "the UI fence does not work".
+  classifyOrigin().then(() => {
     const piWsEl = $('piWs');
-    if (st && st.mock) pi.connect(S.piUrl);
-    else if (piWsEl) piWsEl.textContent = 'not connected — paste Pi URL';
-    log('INFO', 'mission-ui v2 + arena/test1 boot: bridge SSE on ' + S.piUrl +
-        (st && st.mock ? ' (+ mock Pi WS)' : ' (real mode: Pi link manual)') +
-        ' · polygon→fence, config.yaml max height, FOV coverage');
-  }).catch(() => { pi.connect(S.piUrl); });
+    const piUrlEl = $('piUrl');
+    const inUrl = (window.location.search.match(/[?&]pi=([^&]+)/) || [])[1];
+    if (inUrl) {                                   // ?pi=http://<pi-ip>:8000
+      S.piUrl = decodeURIComponent(inUrl).replace(/\/$/, '');
+      if (piUrlEl) piUrlEl.value = S.piUrl;
+      log('INFO', 'Pi URL taken from the ?pi= URL parameter: ' + S.piUrl);
+      pi.connect(S.piUrl);
+      // verify it straight away so the fence badge is truthful either way
+      Promise.resolve(pi.probe ? pi.probe() : null).then((res) => {
+        if (res && res.ok && res.isPi) S.piVerified = true;
+        else if (res && res.ok) log('ERROR', '?pi= ' + S.piUrl + ' answers but is NOT mission_pi');
+        renderFenceWriter();
+      });
+    }
+    if (S.originRole === 'pi') {
+      S.piUrl = window.location.origin;
+      S.piVerified = true;
+      if (piUrlEl) piUrlEl.value = S.piUrl;
+      if (piWsEl) piWsEl.textContent = 'connecting to ' + S.piUrl + ' …';
+      pi.connect(S.piUrl);
+      log('INFO', 'served BY the Pi (' + S.piUrl + ') — fence writes go '
+        + 'directly to the Pixhawk through it');
+    } else if (S.originRole === 'bridge') {
+      // The bridge also has a mock mode that emulates the Pi for demos. Talk to
+      // it, but never let it count as a verified Pi for fence writes.
+      fetch('/api/mp/state').then((r) => r.json()).then((st) => {
+        if (st && st.mock) {
+          S.piUrl = window.location.origin;
+          if (piUrlEl) piUrlEl.value = S.piUrl;
+          pi.connect(S.piUrl);
+          if (piWsEl) piWsEl.textContent = 'mock Pi on ' + S.piUrl + ' (demo only)';
+        } else if (piWsEl) {
+          piWsEl.textContent = 'not connected — paste the Pi URL';
+        }
+      }).catch(() => {
+        if (piWsEl) piWsEl.textContent = 'not connected — paste the Pi URL';
+      });
+      log('INFO', 'served by the laptop bridge (Mission Planner). The fence can only be '
+        + 'written through the Pi once its URL is connected — the bridge alone cannot '
+        + 'store a fence on the Pixhawk.');
+    } else {
+      if (piWsEl) piWsEl.textContent = 'not connected — paste the Pi URL';
+    }
+    renderFenceWriter();
+    log('INFO', 'fence writer: ' + (S.fenceWriter === 'pi'
+      ? 'DIRECT Pi → Pixhawk'
+      : S.fenceWriter === 'mp' ? 'bridge → Mission Planner (explicit fallback)'
+        : 'BLOCKED — no verified Pi link'));
+  });
+}
+
+async function classifyOrigin() {
+  // One unauthenticated GET decides whether this origin can own the fence.
+  try {
+    const r = await fetch('/health', { cache: 'no-store' });
+    const h = await r.json();
+    if (h && h.service === 'mission_pi') S.originRole = 'pi';
+    else if (h && h.mock) S.originRole = 'bridge';
+    else if (h && (h.cams || h.bringup || h.link != null)) S.originRole = 'pi';
+    else S.originRole = 'unknown';
+    S.piHealth = h || null;
+  } catch (e) {
+    S.originRole = 'unknown';           // file:// or a dead server
+  }
+  return S.originRole;
 }
 
 document.addEventListener('DOMContentLoaded', boot);

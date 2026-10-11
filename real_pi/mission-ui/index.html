@@ -104,7 +104,7 @@
     </div>
 
     <div class="card" id="cardPi">
-      <h2>PI LINK <span class="hint-inline">(receive-only)</span></h2>
+      <h2>PI LINK <span class="hint-inline">(fence + altitude + camera out · telemetry in)</span></h2>
       <div class="kv"><span>ws status</span><b id="piWs">—</b></div>
       <div class="kv"><span>http probe</span><b id="piHealth">—</b></div>
       <div class="kv"><span>mode</span><b id="piMode">—</b></div>
@@ -114,7 +114,7 @@
         <button id="btnPiConnect" class="btn small">connect</button>
         <button id="btnPiProbe" class="btn small" title="HTTP check of /health — says why the socket will not open">probe</button>
       </div>
-      <p class="hint" id="piHint">Paste the URL mission_pi prints on startup (http://&lt;pi-ip&gt;:8000). The selected Pi receives fence, altitude, camera and preset commands. RTL/LAND still use the MP bridge link.</p>
+      <p class="hint" id="piHint">Paste the URL mission_pi prints on startup (http://&lt;pi-ip&gt;:8000), then press connect — the link is verified before it may write anything. The Pi receives the fence, altitude, camera and preset commands and forwards the fence to the Pixhawk over its own MAVLink link. RTL/LAND still use the MP bridge link.</p>
     </div>
 
     <div class="card" id="cardFsm">
@@ -127,7 +127,8 @@
     </div>
 
     <div class="card" id="cardFence">
-      <h2>GEOFENCE <span class="hint-inline">(→ MP → FC · inclusion)</span></h2>
+      <h2>GEOFENCE <span class="hint-inline" id="fWriterSub">(inclusion fence)</span></h2>
+      <div class="kv"><span>writer</span><b id="fWriter">—</b></div>
       <div class="row wrap">
         <button id="btnDraw" class="btn small toggle">draw fence</button>
         <button id="btnUndo" class="btn small">undo</button>
@@ -148,6 +149,7 @@
       <div class="kv"><span>area</span><b id="fArea">—</b></div>
       <div class="kv"><span>max radius</span><b id="fRadius">—</b></div>
       <div class="kv"><span>origin</span><b id="fOrigin">—</b></div>
+      <div class="kv"><span>enforcement</span><b id="fEnforce">—</b></div>
       <div class="kv"><span>drawing</span><b id="fDrawing">0 pts</b></div>
       <div class="kv"><span>draw area</span><b id="drawArea">—</b></div>
       <div class="row wrap">
@@ -156,7 +158,12 @@
         <button id="btnFenceRefresh" class="btn small">refresh from FC</button>
       </div>
       <button id="btnExportLap" class="btn small">export .lap</button>
-      <p class="hint">Disarmed only: upload through the selected Pi, then verify FC readback. This does NOT enable enforcement or change FENCE_ENABLE, FENCE_ACTION or FENCE_TYPE. Verify those separately in Mission Planner; download/refresh its Fence view if needed.</p>
+      <p class="hint" id="fenceWriterHint">—</p>
+      <p class="hint">Disarmed only. The upload goes browser → Pi → Pixhawk over the Pi's own MAVLink link, then the Pixhawk is re-read and compared; success is only reported on a matching readback. This does NOT enable enforcement or change FENCE_ENABLE, FENCE_ACTION or FENCE_TYPE — verify those separately (Mission Planner may be used to observe/download the fence, it is not required to write it).</p>
+      <label class="inline" title="Only tick this if you deliberately want the old Mission Planner relay instead of the direct Pi link">
+        <input id="chkMpFenceFallback" type="checkbox">
+        allow MP bridge fallback (not direct to Pixhawk)
+      </label>
     </div>
 
     <div class="card" id="cardTelem">

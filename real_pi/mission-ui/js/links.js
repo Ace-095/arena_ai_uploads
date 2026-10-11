@@ -52,7 +52,15 @@ function initPiLink(o) {
         if (to) clearTimeout(to);
         if (!r.ok) throw new Error('HTTP ' + r.status);
         return r.json().then((h) => ({
-          ok: true, ms: Date.now() - t0, health: h, isPi: !!(h && (h.cams || h.bringup || h.ws || h.link != null)),
+          ok: true, ms: Date.now() - t0, health: h,
+          // service is the explicit contract (mission_pi >= 2026-10); the
+          // older shape check stays so an un-updated Pi still verifies.
+          isPi: !!(h && (h.service === 'mission_pi' || h.cams || h.bringup
+                         || h.ws || h.link != null)),
+          // Who answered: 'pi' | 'mp_bridge' | 'unknown'. The UI must know the
+          // difference before it writes a safety fence.
+          role: (h && h.service) ? h.service
+            : (h && h.mock) ? 'mp_bridge' : 'unknown',
         }));
       })
       .catch((e) => {

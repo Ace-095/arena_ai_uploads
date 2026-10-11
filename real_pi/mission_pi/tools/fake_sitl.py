@@ -160,6 +160,20 @@ class FakeVehicle:
                        "RTL_ALT": (1500.0, M.MAV_PARAM_TYPE_INT32),
                        "BATT_MONITOR": (4.0, M.MAV_PARAM_TYPE_UINT8)}
         self.intervals = {}                         # msgid -> hz (client-set)
+        # -- fence WRITE (the UI -> Pi -> Pixhawk path) -------------------
+        # A read-only fake would let a broken uploader look healthy, because
+        # "nothing changed" reads the same as "nothing was sent". This fake
+        # therefore accepts mission-type FENCE transfers the way ArduPilot
+        # does — MISSION_COUNT -> MISSION_REQUEST_INT/ITEM -> MISSION_ACK —
+        # and validates every item strictly (cmd 5001, param1 == count).
+        # fence_fault makes the fake lie on purpose so the UI's honesty can
+        # be tested: 'reject' | 'discard' | 'corrupt' | 'stall'.
+        self.fence_fault = None
+        self.fence_writes = 0                       # committed writes
+        self.fence_clears = 0
+        self.last_fence_error = None
+        self.concurrent_uploads = 0                 # 2 MISSION_COUNTs at once
+        self._fence_up = None                       # in-flight upload
 
     # -- plan helpers ----------------------------------------------------
     def _fill_plan(self):
@@ -281,6 +295,12 @@ class FakeVehicle:
             return self._mission_count(c, m)
         if t in ("MISSION_REQUEST_INT", "MISSION_REQUEST"):
             return self._mission_item(c, m)
+        if t == "MISSION_COUNT":
+            return self._fence_upload_start(c, m)
+        if t in ("MISSION_ITEM_INT", "MISSION_ITEM"):
+            return self._fence_upload_item(c, m)
+        if t == "MISSION_CLEAR_ALL":
+            return self._fence_clear(c, m)
         if t == "MISSION_ACK":
             return
         if t == "PARAM_REQUEST_READ":
@@ -373,6 +393,138 @@ class FakeVehicle:
             c.send(self._battery_msg())
         elif msgid == 74:                               # VFR_HUD
             c.send(self._vfr_msg())
+
+    # -- fence WRITE: what the Pi sends when the UI presses "UPLOAD FENCE" --
+    def _mack(self, c, m, result, mtype=None):
+        return _mk(M.MAVLink_mission_ack_message,
+                   target_system=m.get_srcSystem(),
+                   target_component=m.get_srcComponent(),
+                   type=int(result),
+                   mission_type=int(mtype if mtype is not None
+                                    else getattr(m, "mission_type", 0)))
+
+    def _mrequest(self, c, m, seq, mtype, use_int=True):
+        cls = (M.MAVLink_mission_request_int_message if use_int
+               else M.MAVLink_mission_request_message)
+        return _mk(cls, target_system=m.get_srcSystem(),
+                   target_component=m.get_srcComponent(),
+                   seq=int(seq), mission_type=int(mtype))
+
+    def _fence_upload_start(self, c, m):
+        """MISSION_COUNT from the uploader: ask for vertex 0 (or stall)."""
+        mtype = int(getattr(m, "mission_type", 0))
+        n = int(getattr(m, "count", 0))
+        if mtype != M.MAV_MISSION_TYPE_FENCE:
+            # Never let a stray write flatten the demo flight plan.
+            c.send(self._mack(c, m, M.MAV_MISSION_UNSUPPORTED, mtype))
+            c.note("mission write refused: only mission_type=FENCE is writable")
+            return
+        if n <= 0:
+            c.send(self._mack(c, m, M.MAV_MISSION_ERROR, mtype))
+            return
+        with self.lock:
+            if self._fence_up is not None:
+                # Two writers on the wire at once. ArduPilot can only hold one
+                # fence, so this is the race the UI/server must prevent.
+                self.concurrent_uploads += 1
+                c.note("CONCURRENT fence upload: a transfer is already in flight")
+        if self.fence_fault == "reject":
+            self.last_fence_error = "count rejected (fault: reject)"
+            c.send(self._mack(c, m, M.MAV_MISSION_DENIED, mtype))
+            return
+        if self.fence_fault == "stall":
+            self.last_fence_error = "no MISSION_REQUEST (fault: stall)"
+            c.note("fault: stalling fence upload after MISSION_COUNT(%d)" % n)
+            return
+        with self.lock:
+            self._fence_up = {"n": n, "items": {}, "mtype": mtype}
+        c.note("fence upload: %d vertices incoming" % n)
+        c.send(self._mrequest(c, m, 0, mtype, use_int=True))
+
+    def _fence_upload_item(self, c, m):
+        """One vertex. Strict: exactly what ArduPilot requires, no favours."""
+        with self.lock:
+            up = self._fence_up
+        mtype = int(getattr(m, "mission_type", 0))
+        if up is None:
+            c.send(self._mack(c, m, M.MAV_MISSION_ERROR, mtype))
+            c.note("vertex with no MISSION_COUNT in flight")
+            return
+        n, seq = up["n"], int(getattr(m, "seq", -1))
+        if not 0 <= seq < n:
+            self.last_fence_error = "seq %s out of range" % seq
+            c.send(self._mack(c, m, M.MAV_MISSION_INVALID_SEQUENCE, mtype))
+            return
+        cmd = int(getattr(m, "command", -1))
+        if cmd != int(M.MAV_CMD_NAV_FENCE_POLYGON_VERTEX_INCLUSION):
+            self.last_fence_error = "command %s is not a fence vertex" % cmd
+            c.send(self._mack(c, m, M.MAV_MISSION_UNSUPPORTED, mtype))
+            return
+        # ArduPilot rejects a polygon whose every item does not repeat the
+        # TOTAL vertex count in param1 — the classic "fence uploads but the
+        # FC ignores it" bug.
+        if int(round(float(getattr(m, "param1", 0)))) != n:
+            self.last_fence_error = "param1 %r != count %d" % (getattr(m, "param1", None), n)
+            c.send(self._mack(c, m, M.MAV_MISSION_INVALID_PARAM1, mtype))
+            return
+        is_int = m.get_type() == "MISSION_ITEM_INT"
+        if is_int:
+            if int(getattr(m, "frame", -1)) != int(M.MAV_FRAME_GLOBAL_INT):
+                self.last_fence_error = "MISSION_ITEM_INT without MAV_FRAME_GLOBAL_INT"
+                c.send(self._mack(c, m, M.MAV_MISSION_UNSUPPORTED, mtype))
+                return
+            lat, lon = m.x / 1e7, m.y / 1e7
+        else:
+            lat, lon = float(m.x), float(m.y)
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            self.last_fence_error = "vertex %d out of WGS84 range" % seq
+            c.send(self._mack(c, m, M.MAV_MISSION_ERROR, mtype))
+            return
+        up["items"][seq] = (float(lat), float(lon))
+        missing = [i for i in range(n) if i not in up["items"]]
+        if missing:
+            c.send(self._mrequest(c, m, missing[0], mtype, use_int=is_int))
+            return
+        # complete polygon
+        verts = [up["items"][i] for i in range(n)]
+        if self.fence_fault == "discard":
+            # ACK accepted but keep the OLD fence: only a readback comparison
+            # can tell the truth here. This is the fake that proves the UI
+            # does not trust MISSION_ACK alone.
+            self.last_fence_error = "acked then discarded (fault: discard)"
+            c.note("fault: ACKing %d vertices WITHOUT storing them" % n)
+        elif self.fence_fault == "corrupt":
+            verts = [(round(a + 0.00005, 7), b) for a, b in verts]   # ~5.5 m east
+            self.last_fence_error = "stored shifted geometry (fault: corrupt)"
+            c.note("fault: storing SHIFTED geometry (%d verts)" % n)
+        else:
+            with self.lock:
+                self.fence = list(verts)
+                self.fence_writes += 1
+            c.note("fence stored: %d vertices, %d writes total" % (n, self.fence_writes))
+            print("[fake] FENCE UPLOADED: %d vertices (write #%d)" % (n, self.fence_writes))
+        with self.lock:
+            self._fence_up = None
+        c.send(self._mack(c, m, M.MAV_MISSION_ACCEPTED, mtype))
+
+    def _fence_clear(self, c, m):
+        mtype = int(getattr(m, "mission_type", 0))
+        if mtype != M.MAV_MISSION_TYPE_FENCE:
+            c.send(self._mack(c, m, M.MAV_MISSION_UNSUPPORTED, mtype))
+            return
+        if self.fence_fault == "reject":
+            self.last_fence_error = "clear rejected (fault: reject)"
+            c.send(self._mack(c, m, M.MAV_MISSION_DENIED, mtype))
+            return
+        if self.fence_fault == "discard":
+            self.last_fence_error = "acked clear but kept fence (fault: discard)"
+            c.send(self._mack(c, m, M.MAV_MISSION_ACCEPTED, mtype))
+            return
+        with self.lock:
+            self.fence = []
+            self.fence_clears += 1
+        print("[fake] FENCE CLEARED (clear #%d)" % self.fence_clears)
+        c.send(self._mack(c, m, M.MAV_MISSION_ACCEPTED, mtype))
 
     def _mission_count(self, c, m):
         mtype = getattr(m, "mission_type", 0)
@@ -757,6 +909,44 @@ def _client_loop(c):
     c.close()
 
 
+def start_ticker(veh, hz=10.0, hb_every=1.0):
+    """Run the vehicle: physics tick + the 1 Hz telemetry burst.
+
+    Split out of main() so a test can spin up a live vehicle on an ephemeral
+    port (`serve_port(veh, 0)`) and still get heartbeats — without them
+    fc_link.find_fc() correctly refuses to adopt the link.
+    """
+    stop = threading.Event()
+
+    def beat():
+        last_hb = last_tick = 0.0
+        while not stop.is_set():
+            now = time.time()
+            dt = now - last_tick if last_tick else 0.1
+            last_tick = now
+            try:
+                veh.tick(min(0.5, max(0.001, dt)))
+            except Exception as e:
+                print("[fake] tick failed: %r" % (e,))
+            if now - last_hb >= hb_every:
+                last_hb = now
+                veh.broadcast(veh.heartbeat_msg())
+                veh.broadcast(_mk(M.MAVLink_sys_status_message,
+                                  onboard_control_sensors_present=0x3F,
+                                  onboard_control_sensors_enabled=0x3F,
+                                  onboard_control_sensors_health=0x3F,
+                                  load=120, voltage_battery=16600,
+                                  current_battery=444, battery_remaining=96,
+                                  drop_rate_comm=0, errors_comm=0))
+                veh.broadcast(veh._home_msg())
+                veh.broadcast(_mk(M.MAVLink_mission_current_message,
+                                  seq=veh.mission_seq))
+            stop.wait(1.0 / max(1.0, hz))
+
+    threading.Thread(target=beat, daemon=True, name="fake-ticker").start()
+    return stop
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="tiny fake MAVLink vehicle")
     ap.add_argument("--ports", default="5760,5762",
@@ -775,6 +965,13 @@ def main(argv=None):
                     help="after landing, reset at home and fly the sortie "
                          "again (endless demo for an open UI)")
     ap.add_argument("--no-keys", action="store_true", help="no keyboard control")
+    ap.add_argument("--fence-fault", default=None,
+                    choices=["reject", "discard", "corrupt", "stall"],
+                    help="make the fence WRITE path lie on purpose, to prove "
+                         "the UI reports honest failure: reject=MISSION_ACK "
+                         "DENIED, discard=ACK accepted but vertices dropped, "
+                         "corrupt=store shifted geometry, stall=never send "
+                         "MISSION_REQUEST")
     args = ap.parse_args(argv)
 
     try:
@@ -784,6 +981,9 @@ def main(argv=None):
         return 2
     veh = FakeVehicle((la, lo), fence_m=args.fence, speed=args.speed)
     veh.loop = bool(args.loop)
+    veh.fence_fault = args.fence_fault
+    if args.fence_fault:
+        print("[fake] !! fence-write fault injected: %s" % args.fence_fault)
     print("[fake] home %.6f,%.6f  fence %s  plan: %s (sprayer seq %s)"
           % (la, lo,
              ("%dm square, %d verts" % (args.fence, len(veh.fence)))
@@ -798,35 +998,7 @@ def main(argv=None):
         except Exception as e:
             print("[fake] --udp ignored (%r) — want HOST:PORT, e.g. 127.0.0.1:14551" % (e,))
 
-    stop = threading.Event()
-
-    def beat():
-        last_hb = last_tick = 0.0
-        while not stop.is_set():
-            now = time.time()
-            dt = now - last_tick if last_tick else 0.1
-            last_tick = now
-            try:
-                veh.tick(min(0.5, max(0.001, dt)))
-            except Exception as e:
-                print("[fake] tick failed: %r" % (e,))
-            if now - last_hb >= 1.0:
-                last_hb = now
-                hb = veh.heartbeat_msg()
-                veh.broadcast(hb)
-                veh.broadcast(_mk(M.MAVLink_sys_status_message,
-                                  onboard_control_sensors_present=0x3F,
-                                  onboard_control_sensors_enabled=0x3F,
-                                  onboard_control_sensors_health=0x3F,
-                                  load=120, voltage_battery=16600,
-                                  current_battery=444, battery_remaining=96,
-                                  drop_rate_comm=0, errors_comm=0))
-                veh.broadcast(veh._home_msg())
-                veh.broadcast(_mk(M.MAVLink_mission_current_message,
-                                  seq=veh.mission_seq))
-            stop.wait(0.1)
-
-    threading.Thread(target=beat, daemon=True).start()
+    stop = start_ticker(veh)
 
     if args.auto:
         def auto():

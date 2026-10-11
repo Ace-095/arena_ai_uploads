@@ -274,6 +274,11 @@ def create_app(rig, mission, fc, streams=None, bringup=None, pulse_s=2.0,
         except Exception:
             link = False
         out = {"ok": True, "status": "ok", "ts": time.time(),
+               # The UI has to decide whether the origin serving it IS this Pi
+               # (direct Pi -> Pixhawk fence writer) or the laptop bridge (a
+               # Mission Planner forwarder). Without this marker it guessed by
+               # URL and sent fence writes to the bridge, which 404s them.
+               "service": "mission_pi", "role": "fence-writer",
                "uptime_s": round(time.time() - t0, 1),
                "link": link, "cams": cams,
                "ws_clients": hub.n_clients, "ws": hub.stats(),
@@ -605,7 +610,12 @@ def create_app(rig, mission, fc, streams=None, bringup=None, pulse_s=2.0,
 
     def fence_state(vertices, confirmed=False, reason="", **extra):
         verts = [tuple(v) for v in vertices]
-        return {"ok": confirmed, "source": "pi", "loaded": bool(verts),
+        return {"ok": confirmed, "source": "pi",
+                # Direct-Pi provenance, so the UI can badge the writer instead
+                # of guessing from a URL.
+                "writer": "pi", "direct": True,
+                "fc_device": getattr(fc, "device", None) if fc else None,
+                "loaded": bool(verts),
                 "confirmed": confirmed, "reason": reason,
                 "count": len(verts), "vertex_count": len(verts),
                 "fence": verts, "fc_fence": verts if confirmed else [],
@@ -613,32 +623,71 @@ def create_app(rig, mission, fc, streams=None, bringup=None, pulse_s=2.0,
                 "vertices_latlon": [{"lat": a, "lon": b} for a, b in verts],
                 **extra}
 
+    def read_fence_params():
+        """READ-ONLY FENCE_* parameters, so the UI can tell "vertices stored"
+        from "fence actually armed to act on a breach". Never written here:
+        enabling or re-arming a safety fence is an operator decision, and a
+        failed read must not break the fence request.
+        """
+        out = {}
+        if not fc or not fc.link_ok():
+            return out
+        for name in ("FENCE_ENABLE", "FENCE_TYPE", "FENCE_ACTION",
+                     "FENCE_ALT_MAX", "FENCE_MARGIN"):
+            try:
+                v = fc.get_param(name, timeout=0.6)
+            except Exception:
+                continue
+            if v is not None:
+                out[name] = float(v)
+        return out
+
     def fence_transaction(vertices=None, clear=False):
         if not fc or not fc.link_ok():
-            return 503, fence_state([], reason="No FC link; fence NOT changed", detail="No FC link")
+            return 503, fence_state([], reason="No FC link; fence NOT changed",
+                                    detail="No FC link on the Pi")
         # Do not edit the FC safety boundary during flight from this UI.
         if (clear or vertices is not None) and getattr(fc, "armed", False):
             return 409, fence_state([], reason="Disarm before editing fence", detail="FC is armed")
+        editing = clear or vertices is not None
+        wrote = False
         try:
             with getattr(fc, "_mission_lock", nullcontext()):
+                # Re-check under the lock: the FC can arm between the check
+                # above and the transfer starting, and a fence edit on an
+                # armed vehicle is exactly what must never happen.
+                if editing and getattr(fc, "armed", False):
+                    return 409, fence_state([], reason="Disarm before editing fence",
+                                            detail="FC armed mid-transaction")
                 if clear:
                     if not fc.clear_fence():
                         raise RuntimeError("FC did not acknowledge fence clear")
+                    wrote = True
                 elif vertices is not None:
                     fc.upload_fence(vertices, timeout=10.0)
+                    wrote = True
                 actual = fc.read_fence(timeout=4.0)
                 wanted = [] if clear else vertices
                 if wanted is not None and not fence_matches(wanted, actual):
-                    raise RuntimeError("FC readback mismatch; refresh fence before continuing")
+                    raise RuntimeError(
+                        "FC did not store the fence we sent (readback differs) — "
+                        "nothing was confirmed")
                 if mission is not None:
                     mission.fence = list(actual)
             state = fence_state(actual, True, "FC readback verified (not an arming/enforcement check)",
-                                fc_uploaded=vertices is not None, cleared=clear)
+                                fc_uploaded=vertices is not None, cleared=clear,
+                                fc_params=read_fence_params())
             hub.push("fence", state)
             return 200, state
         except Exception as e:
             # Never replace mission.fence with an unconfirmed UI drawing.
-            return 502, fence_state([], reason=str(e), detail=str(e), fc_uploaded=False)
+            hint = ""
+            if wrote:
+                hint = (" — the FC may now hold a fence that could NOT be verified; "
+                        "re-read the fence before relying on anything")
+            return 502, fence_state([], reason=str(e) + hint, detail=str(e),
+                                    fc_uploaded=False, cleared=False,
+                                    fc_params=read_fence_params())
 
     async def run_fence(vertices=None, clear=False):
         if fence_lock.locked():
