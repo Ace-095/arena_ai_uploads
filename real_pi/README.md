@@ -30,6 +30,16 @@ See [what happens after a YOLO detection](docs/detection-to-flight-behavior.md):
 
 See [QR resolution, command fixes, measured tests and hardware limits](docs/qr-resolution-and-command-tests.md). This documents the verified fence upload/readback path, camera/UI fixes, synthetic classical-vs-YOLO results, and the required disarmed hardware checks. Software-bench results are not flight-safety or zero-latency guarantees.
 
+## Perception layer: tracking + a perception state machine (read-only)
+
+See [perception pipeline](docs/PERCEPTION_PIPELINE.md). Adds temporal box tracking, a
+`SEARCHING → … → RESULT_REPORTED` FSM, quality gating, perspective-corrected ROI
+decoding and a metric harness, read-only over `GET /api/perception`. It is purely
+**additive**: `mission.py` and all flight logic are untouched, the layer never
+commands the vehicle (`drives_flight: false`), and it can be switched off entirely
+with `perception.enabled: false`. Benchmarks in that document are synthetic/CPU-host
+numbers, **not** flight evidence.
+
 ## What was fixed / added for real flight
 
 ### 1. Video via the Pi no longer "always stuck"  (`mission_pi/streamm1.py`, `server.py`)

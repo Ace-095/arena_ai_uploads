@@ -307,6 +307,72 @@ qr_presets:
     desc: "auto exposure + auto recovery: daylight, dusk or a dark room — try this when you do not want to think about the light"
 
 # ----------------------------------------------------------------------------
+# PERCEPTION LAYER — temporal tracking + a perception state machine.
+#
+# ADDITIVE AND OBSERVATION-ONLY. This section configures a read-only layer
+# that observes the frames, boxes and payloads the mission ALREADY computes
+# and turns them into a stabilised, structured perception result:
+#
+#   SEARCHING -> CANDIDATE_DETECTED -> TARGET_TRACKING -> QR_DECODING
+#             -> PAYLOAD_VALIDATED -> RESULT_REPORTED
+#
+# It never commands the vehicle, never alters a box or a payload on its way
+# back out, and `mission.py` is untouched. Read it live at GET /api/perception.
+# Set `enabled: false` and restart to switch the whole layer off.
+#
+# WHY: every stage before this was per-frame. Two boxes in two frames were not
+# known to be the same object, so a single blurred frame was indistinguishable
+# from "the target is gone", and a jittering box kept moving the decoder's ROI.
+# `tracker.py` fixes the first, this state machine the second.
+#
+# The numbers below are STARTING POINTS for a bench calibration, not measured
+# constants — `blur_min` in particular is scene- and lens-dependent. Measure
+# with:  python3 tools/perception_bench.py make --out /tmp/qrbench
+#        python3 tools/perception_bench.py run  --corpus /tmp/qrbench --md r.md
+# ----------------------------------------------------------------------------
+perception:
+  enabled: true              # false = the tap is never installed (no-op)
+  # --- image quality gate -----------------------------------------------
+  # Judged on TWO patches on purpose: blur on the QR ROI (that is the detail
+  # that matters), exposure on a downscaled centre crop of the SCENE (a QR is
+  # ~50% black, so a percentile test on the ROI always reports "dark").
+  blur_min: 18.0             # Laplacian variance floor (CALIBRATE on your lens)
+  luma_min: 25.0             # mean grey below this = underexposed
+  luma_max: 235.0            # above this = blown highlights
+  dark_pct_min: 8.0          # 5th-percentile grey floor
+  exposure_s: 0.002          # ASSUMED shutter, for the blur ESTIMATE only
+  max_motion_blur_px: 3.0    # speed x exposure x px/m budget
+  require_quality_for_decode: true   # do not spend decode CPU on a blurred frame
+  # --- tracker (temporal association + smoothing) ------------------------
+  min_hits: 2                # frames a target must persist before it is trusted
+  max_misses: 8              # dropped frames tolerated before the track dies
+  max_age_s: 2.0             # ...or this much wall time
+  stale_s: 0.5               # a target unseen this long is "stale", not present
+  smooth: 0.5                # box EMA; a real size change SNAPS instead (approach stair)
+  # --- decode cadence ----------------------------------------------------
+  decode_every_n: 2          # the tap gets the mission's decodes; this only
+                             # applies when decode_own is on (bench/standalone)
+  decode_own: false          # true = the pipeline decodes the ROI itself
+                             # (used by tools/perception_bench.py, not the flight loop)
+  min_roi_side_px: 28        # below this a decode attempt cannot succeed — skip it
+  roi_margin: 0.35
+  roi_upsample: 3.0
+  perspective_fix: true      # warp a tilted panel back to square before decoding
+  # --- payload trust -----------------------------------------------------
+  required_streak: 2         # frames agreeing before a payload is PUBLISHED
+  miss_tolerance: 1
+  validate: true
+  payload_min_len: 1
+  payload_max_len: 128
+  payload_pattern: ""        # optional regex, e.g. "^MISSION-"
+  duplicate_window_s: 30.0   # a payload is reported once per window
+  # --- recovery ----------------------------------------------------------
+  lost_grace_s: 1.5          # a gap this short is a dropped frame, not a loss
+  error_recover_s: 5.0       # detector/Hailo errors: return to SEARCHING after this
+  max_consecutive_errors: 5  # ...and only latch ERROR after this many in a row
+  history: 60                # transitions kept for the log
+
+# ----------------------------------------------------------------------------
 # Decode confirm — how many CONSECUTIVE identical decodes confirm a payload
 # (drives mission completion). The MP message itself does NOT wait for this:
 # see `relay` below — QR_SEEN goes out on the very first decode.

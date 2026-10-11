@@ -216,7 +216,12 @@ def bring_up_thread(cfg, args, fc, rig, det_box, streams, mission, hub, bu):
     # 1) detector -------------------------------------------------------
     try:
         from detector import get_detector
+        from perception_tap import wrap_detector
         det = get_detector(cfg.get("detector", {}))
+        # The tap wraps the detector so a NON-tiled detect() is observed too
+        # (the tiled path is observed at detect_tiles). `name` is forwarded
+        # verbatim, so the tiling decision in Mission._worker is unchanged.
+        det = wrap_detector(det)
         det_box[0] = det
         mission.detector = det
         say("detector", "ok", det.name)
@@ -489,6 +494,14 @@ def main():
     det_box = [None]
     streams = StreamManager(rig, cfg.get("stream", {}))   # adopts cams later
     mission = Mission(fc, rig, det_box[0], hub=None, cfg=cfg)
+
+    # ---- perception tap: read-only, additive, config-gated ---------------
+    # It observes detector.detect_tiles / decoder.decode_frame and returns
+    # their results untouched. mission.py is NOT involved, and with
+    # `perception.enabled: false` nothing is installed at all.
+    import perception_tap
+    if perception_tap.install(cfg) is not None:
+        print("[perception] tap on (read-only) - GET /api/perception")
 
     # ---- 2) SERVER FIRST: the UI must be able to reach us no matter what --
     if not bu_mod.port_free(port, host if host != "0.0.0.0" else "0.0.0.0"):

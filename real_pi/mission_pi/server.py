@@ -554,6 +554,22 @@ def create_app(rig, mission, fc, streams=None, bringup=None, pulse_s=2.0,
     async def qr_status():
         return _qr_snapshot()
 
+    # ---- perception layer (read-only; see perception.py) ----------------
+    # ADDITIVE: a new endpoint, no change to any existing route or to the
+    # flight path. `drives_flight` is always false — this is a perception
+    # output, and NOT evidence that it is safe to descend near a target.
+    @app.get("/api/perception")
+    async def perception_status():
+        try:
+            import perception_tap
+            snap = perception_tap.snapshot()
+        except Exception as e:
+            return {"state": "ERROR", "detail": repr(e),
+                    "perception_only": True, "drives_flight": False}
+        snap.setdefault("perception_only", True)
+        snap.setdefault("drives_flight", False)
+        return snap
+
     # ---- real_pi QR environment presets (fake-QR / window-grill fix) ----
     @app.get("/api/qr/presets")
     async def qr_presets():
