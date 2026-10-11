@@ -70,6 +70,38 @@ def classify_outputs(shapes):
                   "(1,5,8400) head.")
 
 
+#: Class counts that mean "this is somebody else's network": the stock Hailo
+#: zoo / Ultralytics YOLOv8n ships 80 COCO classes, where class 0 is 'person'.
+#: Our runtime filter keeps class 0 only, so a COCO HEF can never report 'qr' —
+#: it would look like a model that detects nothing (or everything but QR).
+FOREIGN_CLASS_COUNTS = (80, 84)
+
+
+def class_count_hint(shapes):
+    """A warning string when the HEF looks multi-class/foreign, else None.
+
+    Pure: shape 80 or 84 in an NMS tensor, or an (1, C, N, 6) tensor with C > 1.
+    """
+    for name, shape in shapes or []:
+        shp = [int(d) for d in (shape or ()) if d is not None]
+        if not shp:
+            continue
+        for d in shp[:-1]:
+            if d in FOREIGN_CLASS_COUNTS:
+                return ("%s has a dimension of %d — that is the COCO class "
+                        "count (80) or its +4 regression form (84). This HEF "
+                        "is very likely a stock YOLOv8n/COCO network, not our "
+                        "1-class 'qr' model: our filter keeps class 0 only, so "
+                        "it would never report a QR. Compile from "
+                        "models/qr_yolov8n.onnx (training/compile_hef.md)."
+                        % (name, d))
+        if len(shp) == 4 and shp[-1] == STYLE_A_LAST_DIM and shp[1] > 1:
+            return ("%s suggests %d classes — our model has exactly 1 ('qr'); "
+                    "the runtime keeps class 0 only."
+                    % (name, shp[1]))
+    return None
+
+
 def validate_nms_config(cfg):
     """Check a Hailo nms_config.json against THIS project. -> (ok, lines).
 
@@ -198,6 +230,9 @@ def inspect_hef(path, input_size=640):
     else:
         ok = False
         print("BAD  %s" % detail)
+    foreign = class_count_hint(outs)
+    if foreign:
+        print("WARN %s" % foreign)
     print("[hef] runtime verdict: %s" % ("USABLE with detector.py"
                                          if ok else "NOT USABLE as-is"))
     return 0 if ok else 3

@@ -190,6 +190,23 @@ def test_hef_output_style_classification():
                                ("nms", [1, 100, 6])])[0] == "A")
 
 
+def test_foreign_class_count_warning():
+    """A stock zoo/prebuilt YOLOv8n HEF is an 80-class COCO network whose
+    class 0 is 'person' — our filter keeps class 0 only, so it could never
+    report 'qr'. The tool must say that instead of letting it look like a bad
+    model after a wasted flight."""
+    hint = HI.class_count_hint([("qr/yolov8_nms_postprocess", [1, 80, 100, 6])])
+    check("an 80-class NMS output is called out", hint and "COCO" in hint,
+          hint)
+    check("a 4-D output with more than one class is called out",
+          "classes" in (HI.class_count_hint([("x", [1, 3, 100, 6])]) or ""),
+          HI.class_count_hint([("x", [1, 3, 100, 6])]))
+    check("our own 1-class shapes are NOT flagged",
+          HI.class_count_hint([("x", [1, 100, 6])]) is None and
+          HI.class_count_hint([("output0", [1, 5, 8400])]) is None)
+    check("empty input is not a crash", HI.class_count_hint([]) is None)
+
+
 def test_shipped_nms_config_is_valid():
     """We ship training/nms_config.json as the starting point for the zoo's
     nms_postprocess, so it must pass our own validator."""
@@ -246,6 +263,7 @@ if __name__ == "__main__":
     test_focus_sweep_defaults_to_the_mission_config()
     test_compile_doc_matches_the_real_model()
     test_hef_output_style_classification()
+    test_foreign_class_count_warning()
     test_shipped_nms_config_is_valid()
     test_nms_config_validator_catches_the_dangerous_mistakes()
     test_model_path_resolution()
