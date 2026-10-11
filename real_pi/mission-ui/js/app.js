@@ -375,13 +375,72 @@ function probeCameras() {
     return r.json();
   }).then((st) => {
     const avail = { cam1: !!(st && st.cam1), cam2: !!(st && st.cam2) };
-    if (!avail.cam1 && !avail.cam2) return null;
+    if (!avail.cam1 && !avail.cam2) {
+      // Say it out loud rather than leaving two dead tiles and "—".
+      S.camsProbed = true;
+      S.camsAvail = avail;
+      renderDetectedCams(st || {});
+      log('WARN', 'no cameras detected on the Pi (check the CSI cables / scan cams)');
+      return null;
+    }
     S.camsProbed = true;
     S.camsAvail = avail;
     applyCamVisibility();
+    renderDetectedCams(st);
     log('INFO', 'cameras on Pi: ' + (avail.cam1 ? 'cam1 ' : '') + (avail.cam2 ? 'cam2' : ''));
     return st;
   }).catch(() => null);
+}
+
+// What the Pi actually auto-detected, in the operator's words: sensor, role and
+// which physical port/node it came from. The whole point of auto-detect is that
+// the answer is hardware-dependent — this is the panel that says which camera
+// became "bottom" (the 15 m QR one) without opening a terminal.
+function renderDetectedCams(st) {
+  const el = $('camDetected');
+  const parts = [];
+  const label = (id, c) => {
+    if (!c) return null;
+    // "model" is whatever the Pi found: "imx477", "imx708_af", a USB desc…
+    const m = String(c.model || c.device_desc || '?').replace(/\s+/g, ' ').trim();
+    const fov = (c.hfov_deg != null) ? ' ' + c.hfov_deg + '°' : '';
+    const role = c.facing ? ' (' + c.facing + ')' : '';
+    return id + role + ' ' + m + fov;
+  };
+  ['cam1', 'cam2'].forEach((id) => {
+    const s = label(id, st && st[id]);
+    if (s) parts.push(s);
+  });
+  // tab labels follow the hardware instead of the datasheet in index.html
+  [['cam1', '1'], ['cam2', '2']].forEach(([id, n]) => {
+    const t = $('tabCam' + n);
+    const c = st && st[id];
+    if (!t || !c) return;
+    const m = String(c.model || '').replace(/[^A-Za-z0-9_.+-]/g, ' ').trim().split(/\s+/)[0] || 'cam';
+    t.textContent = 'CAM' + n + ' · ' + m + (c.hfov_deg != null ? ' ' + c.hfov_deg + '°' : '');
+  });
+  if (el) {
+    const missing = !(st && st.cam1) ? 'no front camera detected'
+      : (!(st && st.cam2) ? 'no bottom camera detected' : '');
+    el.textContent = parts.length
+      ? 'detected: ' + parts.join(' · ') + (missing ? ' — ' + missing : '')
+      : 'no cameras detected on the Pi';
+  }
+  const btn = $('btnCamScan');
+  if (btn) btn.disabled = false;
+}
+
+function scanCameras() {
+  if (!S.piUrl) { log('WARN', 'camera scan: paste the Pi URL first'); return Promise.resolve(null); }
+  const btn = $('btnCamScan');
+  if (btn) btn.disabled = true;
+  return postJson(S.piUrl + '/api/cameras/rescan', {}).then((r) => {
+    log('INFO', 'camera scan: changed = '
+      + ((r && r.changed && r.changed.length) ? r.changed.join(',') : 'none'));
+    return probeCameras();
+  }).catch((e) => {
+    log('WARN', 'camera scan failed: ' + e.message);
+  }).finally(() => { if (btn) btn.disabled = false; });
 }
 
 function applyCamVisibility() {
@@ -1212,6 +1271,8 @@ function boot() {
     const c2 = $('camCtls2'); if (c2) c2.classList.remove('hidden');
     const c1 = $('camCtls1'); if (c1) c1.classList.add('hidden');
   });
+  const btnScan = $('btnCamScan');
+  if (btnScan) btnScan.addEventListener('click', () => { scanCameras(); });
 
   CAMS.forEach((c) => {
     ['Exp', 'Gain', 'Bri', 'Con', 'Sat', 'Sha'].forEach((name) => {

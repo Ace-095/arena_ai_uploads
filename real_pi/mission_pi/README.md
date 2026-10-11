@@ -36,7 +36,14 @@ wins; a stale or duplicate index only warns and falls back to the sensor
 match), `autofocus` (`true`/`false`/unset = sensor default) and `tuning_file`
 (a missing file warns and uses the default tuning — the camera still streams).
 `tools/list_cams.py` prints the real sensor strings + indices on your Pi and
-what the config picks, so role assignment is verified, not assumed.
+what the config picks, so role assignment is verified, not assumed. The UI's
+`scan cams` button does the same thing live (`POST /api/cameras/rescan`) and
+prints `detected: cam1 (front) … · cam2 (bottom) …`, so "which camera became
+the bottom one?" is answerable without a terminal. Auto-detect is meant to work
+with whatever is plugged in: a single camera of ANY kind (CSI or USB) takes the
+configured `single_cam_role`, and a rescan keeps a camera that is still
+streaming even if the probe missed it (dropped only once its frames really
+stop — `cameras.rescan_keep_grace_s`).
 
 Why router/LTE: the Pi streams + pushes events to whatever can reach
 its HTTP port. A portable field router gives Pi + laptop one LAN (LTE

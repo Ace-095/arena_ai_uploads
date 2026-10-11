@@ -16,6 +16,25 @@ async function main() {
   $('piUrl').value = base;
   await click('btnPiConnect');
   assert.match($('fWriter').textContent, /DIRECT Pi/, 'writer badge must say the Pi owns the fence');
+
+  // --- camera auto-detect is visible, and re-scannable, from the UI -------
+  // The operator's question on real hardware is "which camera did it pick and
+  // which one is the downward/bottom one?" — that must be readable here, not
+  // only in a terminal. The panel is filled from the Pi's own /api/cameras.
+  assert.match($('camDetected').textContent, /detected:/,
+               'the panel must list what the Pi auto-detected');
+  assert.match($('camDetected').textContent, /cam1 \(front\)/);
+  assert.match($('camDetected').textContent, /cam2 \(bottom\)/);
+  assert.match($('tabCam2').textContent, /^CAM2 · /,
+               'tab labels follow the hardware, not the datasheet');
+  calls.length = 0;
+  await click('btnCamScan');
+  assert.equal(calls.filter(c => c.url.endsWith('/api/cameras/rescan')).length, 1,
+               'scan cams must ask the Pi to re-detect');
+  assert.equal(calls.filter(c => c.url.endsWith('/api/cameras')).length >= 1, true,
+               'after a scan the panel must be re-read');
+  assert.match($('camDetected').textContent, /detected:/,
+               'the detected list must survive a rescan');
   calls.length = 0;
   await click('btnFenceApply');
   assert.equal(writes().length, 1, 'ONE fence writer, not Pi + MP');

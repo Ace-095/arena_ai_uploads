@@ -55,6 +55,11 @@ cameras:
   auto_detect: true
   auto_rescan_s: 30          # 0 = disable the timer (manual rescan only)
   single_cam_role: bottom    # if exactly ONE camera is found, it is THIS role
+  # A camera that a rescan cannot see is only DROPPED once it has stopped
+  # delivering frames for this many seconds — one failed probe (libcamera
+  # busy, a USB/I2C glitch) must not blank a live feed mid-flight. A camera
+  # that is really unplugged goes stale and is dropped on the following scan.
+  rescan_keep_grace_s: 5.0
   front:
     kind: auto               # auto | rpi | usb | url | file | mirror
     match_name: imx708       # CSI: "Pi Camera Module 3" (IMX708)

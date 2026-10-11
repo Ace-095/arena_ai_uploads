@@ -16,6 +16,7 @@ Locked down:
 """
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 ".."))
@@ -189,6 +190,69 @@ def test_single_camera_role():
     hw.unpatch(REAL_LIST_CAMERAS, REAL_V4L2)
 
 
+def test_single_usb_camera_also_takes_the_configured_role():
+    """Auto-detect is meant to work with WHATEVER is plugged in: one USB
+    camera and no CSI module must still give the mission a downward camera,
+    not silently leave 'bottom' empty and hand the only camera to 'front'.
+    """
+    hw = HW()
+    hw.usb = [usb("/dev/video0", "046d:0825", "Some USB cam")]
+    hw.patch()
+    a = make_rig(CFG).detect()
+    hw.unpatch(REAL_LIST_CAMERAS, REAL_V4L2)
+    check("single usb: one camera assigned", len(a) == 1, repr(a))
+    only = next(iter(a.values()))
+    check("single usb: auto-picked camera is re-roled to bottom",
+          only.facing == "bottom", only.facing)
+    check("single usb: it was marked as auto-picked",
+          getattr(only, "_auto_picked", False) is True, repr(only.__dict__))
+
+
+def test_declared_usb_role_is_not_re_roled():
+    """If config names the device for a role, that is a decision — one camera
+    that the operator deliberately gave the front role must keep it."""
+    hw = HW()
+    hw.usb = [usb("/dev/video0", "046d:0825", "Some USB cam")]
+    hw.patch()
+    cfg = {"cameras": {"auto_detect": True, "single_cam_role": "bottom",
+                       "front": {"kind": "usb", "device": "/dev/video0",
+                                 "match_vidpid": "046d:0825",
+                                 "hfov_deg": 66.0},
+                       "bottom": {"kind": "auto", "match_name": "imx477"}}}
+    a = make_rig(cfg).detect()
+    hw.unpatch(REAL_LIST_CAMERAS, REAL_V4L2)
+    check("declared: one camera assigned", len(a) == 1, repr(a))
+    check("declared: the named front role is kept",
+          a["cam1"].facing == "front", a["cam1"].facing)
+
+
+def test_rescan_keeps_a_live_camera_it_cannot_see():
+    """Auto-detect runs every 30 s on real hardware: one failed probe
+    (libcamera busy, an I2C/USB hiccup) must not black out a camera that is
+    demonstrably still streaming. It IS dropped once it really stops.
+    """
+    hw = HW()
+    hw.csi = [(0, "imx477", {})]
+    hw.patch()
+    rig = make_rig(CFG)
+    a = rig.detect()
+    key = next(iter(a))
+    cam = a[key]
+    cam.latest = lambda: (None, time.time(), 7)      # still delivering frames
+    hw.csi = []                                      # detection now sees nothing
+    changed = rig.rescan()
+    check("rescan+live: streaming camera kept", key in rig.cams,
+          repr(list(rig.cams)))
+    check("rescan+live: kept WITHOUT being reported as a change",
+          key not in changed, repr(changed))
+    # ...and when the frames really stop, the next scan drops it
+    cam.latest = lambda: (None, time.time() - 60.0, 7)
+    changed = rig.rescan()
+    check("rescan+live: stale camera is dropped", key not in rig.cams,
+          repr(list(rig.cams)))
+    check("rescan+live: the drop IS reported", key in changed, repr(changed))
+    hw.unpatch(REAL_LIST_CAMERAS, REAL_V4L2)
+
 def test_rescan_keeps_unchanged_and_adopts_new():
     hw = HW()
     hw.csi = [(0, "imx477", {})]
@@ -356,6 +420,9 @@ if __name__ == "__main__":
     test_csi_sensor_roles()
     test_usb_vidpid_match_and_fallback()
     test_single_camera_role()
+    test_single_usb_camera_also_takes_the_configured_role()
+    test_declared_usb_role_is_not_re_roled()
+    test_rescan_keeps_a_live_camera_it_cannot_see()
     test_rescan_keeps_unchanged_and_adopts_new()
     test_rescan_drops_vanished()
     test_explicit_kind_wins()
@@ -363,6 +430,6 @@ if __name__ == "__main__":
     test_csi_autofocus_and_tuning_are_config_driven()
     print("-" * 60)
     if FAILS:
-        print("FAILED %d/%d: %s" % (len(FAILS), 8, ", ".join(FAILS)))
+        print("FAILED %d/%d: %s" % (len(FAILS), 11, ", ".join(FAILS)))
         sys.exit(1)
     print("all cam-autodetect tests passed")

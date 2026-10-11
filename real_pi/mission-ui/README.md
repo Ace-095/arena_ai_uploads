@@ -57,6 +57,12 @@ The UI finds out which server it is talking to from `GET /health`
 normally served by the **bridge on the laptop** — treating that origin as "the
 Pi" is what once sent fence writes to a URL the bridge does not implement.
 
+The CAMERAS card follows the hardware: the tab labels and the `detected:` line
+come from the Pi's own `/api/cameras` (sensor, role, FOV), and **scan cams**
+re-runs auto-detect on the Pi (`POST /api/cameras/rescan`) and refreshes the
+list — plugged a camera in? press it, no SSH needed. A role the Pi reports as
+absent is hidden rather than shown as a dead tile.
+
 The `fc firmware` row reports what the connected controller says about itself
 (firmware version, MAVLink 2, and whether its capability bits implement the
 fence mission type). A controller that answers **without** fence support turns

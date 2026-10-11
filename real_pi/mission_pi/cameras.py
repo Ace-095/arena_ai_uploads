@@ -951,6 +951,17 @@ class CameraRig:
         self.cfg = cfg
         self.cams = {}  # name -> camera
         self.rescan_count = 0
+        # A camera that detect() no longer reports is only DROPPED once it has
+        # actually stopped delivering frames for this long. One failed probe
+        # (libcamera busy, a USB glitch) must not black out a live mission feed
+        # until the next rescan cycle; a genuinely unplugged camera goes stale
+        # within a frame or two and is dropped on the following rescan.
+        cam_cfg = (cfg.get("cameras", {}) or {})
+        try:
+            self.rescan_keep_grace_s = float(
+                cam_cfg.get("rescan_keep_grace_s", 5.0))
+        except (TypeError, ValueError):
+            self.rescan_keep_grace_s = 5.0
         self._lock = threading.RLock()  # rescan vs bring-up mutual exclusion
 
     def rescan_lock(self):
@@ -1101,6 +1112,14 @@ class CameraRig:
         #     camera per role, always.
         if auto_detect:
             taken_nodes = set()
+            # A camera an explicit role already claimed (kind: usb with
+            # device: /dev/videoN) must NOT be offered to the other role, or
+            # one physical camera ends up serving two roles at once.
+            for c in assigned.values():
+                if getattr(c, "kind", "") == "usb":
+                    src = getattr(c, "source", None)
+                    if isinstance(src, str) and src.startswith("/dev/"):
+                        taken_nodes.add(src)
             for name, ccfg, facing in (("cam1", front_cfg, "front"),
                                        ("cam2", bottom_cfg, "bottom")):
                 if name in assigned:
@@ -1122,6 +1141,7 @@ class CameraRig:
                     usb = []
                 match_vid = str(ccfg.get("match_vidpid") or "").lower()
                 match_name = str(ccfg.get("match_name") or "").lower()
+                declared = False
                 if match_vid or match_name:
                     for d in usb:
                         if (match_vid and d["vidpid"] == match_vid) or \
@@ -1129,6 +1149,7 @@ class CameraRig:
                                  (match_name in d["usb_desc"].lower() or
                                   match_name in d["name"].lower())):
                             node, desc = d["node"], d
+                            declared = True
                             break
                 if node is None:
                     for d in usb:
@@ -1151,6 +1172,9 @@ class CameraRig:
                                "v4l2 %s (%s)" % (node, desc.get("vidpid")))
                     c.device_desc = "v4l2 %s (%s)" % (node,
                                                       desc.get("vidpid"))
+                    # found by scanning, not named in config -> this role was a
+                    # guess, so the single-camera rule may re-role it
+                    c._auto_picked = not declared
                     assigned[name] = c
                     log.info("%s auto-detected USB cam %s (%s)", name,
                              node, c.model)
@@ -1178,10 +1202,14 @@ class CameraRig:
             assigned[name] = c
             log.info("assigned %s -> mirror of %s (%s)", name, src, facing)
 
-        # single rpi camera: role comes from config (explicit kinds keep theirs)
+        # ONE camera of any kind: its role comes from config, because which
+        # single camera the operator plugged in says nothing about whether it
+        # points down — and on this mission the downward role is the one that
+        # finds the QR. An EXPLICITLY configured role (kind/device written in
+        # config) is a deliberate decision and is left alone.
         if len(assigned) == 1:
             only = next(iter(assigned.values()))
-            if only.kind == "rpi":
+            if only.kind == "rpi" or getattr(only, "_auto_picked", False):
                 role = str(cam_cfg.get("single_cam_role", "bottom")).lower()
                 if role not in ("front", "bottom"):
                     role = "bottom"
@@ -1231,6 +1259,23 @@ class CameraRig:
                         (old.kind, old.index, old.model) == \
                         (c.kind, c.index, c.model):
                     new[n] = old
+            # roles detect() failed to see: keep them ONLY while they are
+            # demonstrably still streaming (see __init__). A camera that is
+            # really gone stops producing frames, so it is dropped next scan.
+            for n, old in old_cams.items():
+                if n in new:
+                    continue
+                try:
+                    _frame, ts, cnt = old.latest()
+                    age = None if not ts else time.time() - ts
+                except Exception:
+                    age, cnt = None, 0
+                if cnt and age is not None and age < self.rescan_keep_grace_s:
+                    new[n] = old
+                    log.warning("rescan #%d: %s was not auto-detected but is "
+                                "still streaming (frame %.1fs old) — kept; "
+                                "it will be dropped if it really is gone",
+                                self.rescan_count, n, age)
             self.cams = new
             # 1) roles that vanished — stop them
             for n in old_cams:

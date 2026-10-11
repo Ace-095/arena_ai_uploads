@@ -240,6 +240,8 @@ What it is really checking, and what to do if it fails:
 
 ```text
 [ ] /boot/firmware/config.txt : camera_auto_detect=0 (+ dtoverlay per camera)
+[ ] UI "scan cams" button shows "detected: cam1 (front) … · cam2 (bottom) …"
+    so you can see which camera the Pi actually picked for each role
 [ ] reboot, then: rpicam-hello --list-cameras   → both sensors, note indices
 [ ] ls /usr/share/libcamera/ipa/rpi/pisp/imx477_af.json    (UC-517 AF)
 [ ] vcgencmd get_throttled → 0x0 (power is adequate)
