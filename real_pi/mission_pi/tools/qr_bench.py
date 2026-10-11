@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Bench tool: run detector + decoder over images, print boxes/payloads/ms.
 
-  python tools/qr_bench.py [--detector classical|hailo] [--hef ...] [--tiles] img_or_dir...
+  python tools/qr_bench.py [--detector classical|onnx|pt|hailo|auto] [--hef ...] [--tiles] img_or_dir...
 
-Use on the Pi to validate a new .hef before flight, or on x86 with
---detector classical to sanity-check the decode stage.
+Use on the Pi to validate a new .hef (or the ONNX model on real frames) before
+flight, or on x86 with --detector classical to sanity-check the decode stage.
+--detector onnx loads models/qr_yolov8n.onnx through the mission's own
+detector ladder, so the number you see here is the number the mission gets.
 """
 import argparse
 import glob
@@ -18,7 +20,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("paths", nargs="+")
-    ap.add_argument("--detector", default="classical")
+    ap.add_argument("--detector", default="classical",
+                    choices=["classical", "onnx", "pt", "yolo", "hailo",
+                             "auto", "none"],
+                    help="onnx/yolo = CPU YOLO (ONNX; yolo also allows .pt), "
+                         "pt = pin PyTorch, hailo = AI HAT (.hef), "
+                         "classical = OpenCV QR only, auto = the mission "
+                         "ladder (classical here by default: a bare image "
+                         "bench has no model unless you ask for one)")
     ap.add_argument("--hef", default="models/qr_yolov8n.hef")
     ap.add_argument("--tiles", action="store_true")
     ap.add_argument("--conf", type=float, default=0.35)

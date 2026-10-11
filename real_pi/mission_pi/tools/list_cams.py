@@ -318,6 +318,50 @@ def print_file_checks():
         "MISSING — Hailo runs need it; detector.kind auto uses ONNX on CPU"))
 
 
+def assignment_report(assigned, cfg, boot_ok, config_path="config.yaml"):
+    """The == assignment == block as (lines, exit_code).
+
+    Divided out of main() so the wording can be tested against fake cameras:
+    what this prints is what an operator believes about their hardware, and
+    the two ways to get it wrong are (a) calling a working camera broken and
+    (b) calling a bug-free rig a failure.
+
+    Exit code: 0 as soon as ONE role is filled — a single-camera rig is a
+    valid configuration (`cameras.single_cam_role` assigns it), so a missing
+    second role is a note, not an error. 1 only when nothing was assigned.
+    """
+    lines = []
+    for name, c in sorted(assigned.items()):
+        lines.append("  %s (%s): %s  device=%s  size=%s" % (
+            name, c.facing, c.model, c.device_desc or c.index, c.size))
+    if not assigned:
+        lines.append("  NO CAMERAS ASSIGNED — check hardware + config")
+        if boot_ok:
+            # Boot config is right and libcamera STILL sees no camera — only
+            # a physical cause is left. Say which, in order.
+            lines.append("  boot config is OK, so this is physical: reseat the "
+                         "FPC cable (contacts the right way), try the other CAM "
+                         "connector (then update the ,cam0 suffix), and check "
+                         "`dmesg | grep -i imx477` after a reboot")
+        return lines, 1
+    single = (cfg.get("cameras", {}) or {}).get("single_cam_role", "bottom")
+    if len(assigned) == 1:
+        lines.append("  note: single camera -> treated as %r (cameras."
+                     "single_cam_role)" % single)
+    missing = {"front", "bottom"} - {c.facing for c in assigned.values()}
+    if missing:
+        # At least one camera WAS found, so this is a second-camera message —
+        # never "reseat the FPC cable" about a camera that is demonstrably
+        # streaming.
+        lines.append("  MISSING ROLE(S): %s (not a failure: roles are "
+                     "assigned to whatever is connected)" %
+                     ", ".join(sorted(missing)))
+        lines.append("  note: %d camera(s) found. For a second role, plug a "
+                     "camera or set cameras.%s.kind: usb with device: "
+                     "/dev/videoN" % (len(assigned), sorted(missing)[0]))
+    return lines, 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="config.yaml")
@@ -370,33 +414,10 @@ def main():
         from cameras import CameraRig
         rig = CameraRig(cfg)
         assigned = rig.detect()
-        if not assigned:
-            print("  NO CAMERAS ASSIGNED — check hardware + config")
-            return 1
-        for name, c in sorted(assigned.items()):
-            print("  %s (%s): %s  device=%s  size=%s" % (
-                name, c.facing, c.model, c.device_desc or c.index,
-                c.size))
-        single = (cfg.get("cameras", {}) or {}).get("single_cam_role", "bottom")
-        if len(assigned) == 1:
-            print("  note: single camera -> treated as %r (cameras."
-                  "single_cam_role)" % single)
-        missing = {"front", "bottom"} - \
-            {c.facing for c in assigned.values()}
-        if missing and len(assigned) < 2 and boot_ok:
-            # The boot config is right and libcamera STILL sees no camera —
-            # only a physical cause is left. Say which, in order.
-            print("  boot config is OK, so this is physical: reseat the FPC "
-                  "cable (contacts the right way), try the other CAM "
-                  "connector (then update the ,cam0 suffix), and check "
-                  "`dmesg | grep -i imx477` after a reboot")
-        if missing:
-            print("  MISSING ROLE(S): %s" % ", ".join(sorted(missing)))
-            print("  fix: plug the camera, or set cameras.%s.kind: usb "
-                  "with device: /dev/videoN, or loosen match_name"
-                  % sorted(missing)[0])
-            return 1
-        return 0
+        lines, code = assignment_report(assigned, cfg, boot_ok, args.config)
+        for ln in lines:
+            print(ln)
+        return code
     except Exception as e:
         print("  assignment failed: %r" % e)
         return 1

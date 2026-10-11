@@ -418,6 +418,12 @@ class Camera(_BaseCamera):
         #   /usr/share/libcamera/ipa/rpi/pisp/imx477_af.json
         # Without it the camera opens fine but has no focus controls.
         self.tuning_file = str(tuning_file).strip() if tuning_file else None
+        # Filled at open: the focus-related control names the camera actually
+        # exposes ([] = no lens subdev, so autofocus is impossible). None =
+        # not opened yet / unknown. libcamera merely LOGS "Could not set
+        # AF_MODE - no AF algorithm" and does not raise, so reading this back
+        # is the only way to know the truth.
+        self.focus_controls = None
         # Pinned manual focus, in dioptres (libcamera's LensPosition unit:
         # 0 = infinity, 1 = 1 m, 0.067 = 15 m). A downward camera looking at
         # the ground from a fixed altitude does not want continuous autofocus
@@ -450,6 +456,23 @@ class Camera(_BaseCamera):
             return None
         return self.lens_position
 
+    def status(self):
+        """Base status + what the OPERATOR needs to judge focus.
+
+        `af_mode` in `tuning` is what config ASKS for; `focus_controls` is
+        what the camera can actually DO. When it is `[]`, autofocus is
+        configured against a lens no software can move, so the UI/bring-up
+        log must say that instead of showing a reassuring `af_mode: auto`.
+        """
+        st = super().status()
+        st["autofocus"] = self.wants_autofocus()
+        st["lens_position"] = self.lens_position
+        st["focus_controls"] = (None if self.focus_controls is None
+                                else list(self.focus_controls))
+        st["focus_ok"] = (None if self.focus_controls is None
+                          else bool(self.focus_controls))
+        return st
+
     def _load_tuning(self):
         """Tuning file as a dict, or None. Never raises.
 
@@ -461,42 +484,60 @@ class Camera(_BaseCamera):
             return None
         import json
         spec = self.tuning_file
+        here = os.path.dirname(os.path.abspath(__file__))
         candidates = []
         if os.path.isabs(spec):
             candidates.append(spec)
         else:
-            candidates.append(os.path.join(os.path.dirname(
-                os.path.abspath(__file__)), spec))
+            candidates.append(os.path.join(here, spec))
             candidates.append(os.path.join(os.getcwd(), spec))
-        if "/" in spec or spec.lower().endswith(".json"):
-            for path in candidates:
-                if os.path.isfile(path):
-                    try:
-                        with open(path) as f:
-                            tuning = json.load(f)
-                        log.info("%s using tuning file %s", self.name, path)
-                        return tuning
-                    except Exception as e:
-                        log.warning("%s tuning file %s unreadable (%r) — "
-                                    "using the default tuning; autofocus "
-                                    "controls may be absent",
-                                    self.name, path, e)
-                        return None
-            log.warning("%s tuning file %r not found (looked in %s) — using "
-                        "the default tuning; autofocus controls may be absent",
-                        self.name, spec, ", ".join(candidates))
-            return None
-        try:
-            tuning = Picamera2.load_tuning_file(spec)
-        except Exception as e:
-            # Not fatal: a missing tuning file must degrade to the default
-            # tuning (camera still streams), never stop the mission.
-            log.warning("%s tuning file %r not loadable (%r) — using the "
-                        "default tuning; autofocus controls may be absent",
-                        self.name, self.tuning_file, e)
-            return None
-        log.info("%s using tuning file %s", self.name, self.tuning_file)
-        return tuning
+            # models/ is where the repo keeps its weights, so it is the
+            # obvious no-sudo drop-in for a tuning file we ship ourselves.
+            candidates.append(os.path.join(here, "models", spec))
+        # de-dup: cwd == the repo dir on the Pi, so the same path otherwise
+        # shows up twice in the warning and looks like a broken lookup
+        seen, uniq = set(), []
+        for p in candidates:
+            if p not in seen:
+                seen.add(p)
+                uniq.append(p)
+        candidates = uniq
+        # 1) A file we can read ourselves: absolute, repo-relative, in the
+        #    working dir, or shipped in models/. A copy in the repo needs no
+        #    sudo and survives OS updates, so it wins over the system one.
+        for path in candidates:
+            if os.path.isfile(path):
+                try:
+                    with open(path) as f:
+                        tuning = json.load(f)
+                    log.info("%s using tuning file %s", self.name, path)
+                    return tuning
+                except Exception as e:
+                    log.warning("%s tuning file %s unreadable (%r) — using the "
+                                "default tuning; autofocus controls may be "
+                                "absent", self.name, path, e)
+                    return None
+        # 2) A bare NAME is resolved by libcamera in its own IPA dir
+        #    (/usr/share/libcamera/ipa/rpi/pisp/...) — which is exactly where
+        #    Arducam's imx477_af.json lands when it is installed system-wide.
+        #    An explicit path that does not exist is an operator error instead,
+        #    so only names get this second chance.
+        if "/" not in spec:
+            try:
+                tuning = Picamera2.load_tuning_file(spec)
+                log.info("%s using tuning file %s (libcamera IPA dir)",
+                         self.name, spec)
+                return tuning
+            except Exception as e:
+                log.warning("%s tuning file %r not found — looked in %s and in "
+                            "libcamera's IPA dir (%r). Using the default "
+                            "tuning; autofocus controls may be absent",
+                            self.name, spec, ", ".join(candidates), e)
+                return None
+        log.warning("%s tuning file %r not found (looked in %s) — using the "
+                    "default tuning; autofocus controls may be absent",
+                    self.name, spec, ", ".join(candidates))
+        return None
 
     def _open(self):
         if not _HAVE_PICAM:
@@ -507,6 +548,32 @@ class Camera(_BaseCamera):
         cfg = self._picam.create_video_configuration(
             main={"size": tuple(self.size), "format": "RGB888"})
         self._picam.configure(cfg)
+        # Which focus controls exist at all? Ask before trying to set them:
+        #   AfMode/LensPosition present -> the VCM/lens is really driven
+        #   []                          -> no AF algorithm (stock overlay or a
+        #                                  module with no motor); libcamera
+        #                                  only WARNs, it does not raise, so
+        #                                  without this check the config
+        #                                  silently does nothing.
+        try:
+            names = sorted(k for k in (self._picam.camera_controls or {})
+                           if any(s in k.lower()
+                                  for s in ("af", "lens", "focus")))
+            self.focus_controls = names
+            if self.wants_autofocus() and not names:
+                log.warning("%s: autofocus is configured but this camera "
+                            "exposes NO focus controls (no AF algorithm) — "
+                            "the lens cannot be moved by software. Set "
+                            "cameras.%s.autofocus: false (a fixed lens "
+                            "focused near infinity is sharp from ~0.9 m to "
+                            "infinity at 15 m), or install the AF tuning "
+                            "file; see tools/focus_sweep.py --help",
+                            self.name, self.facing or "?")
+            elif names:
+                log.info("%s focus controls: %s", self.name, ", ".join(names))
+        except Exception as e:
+            log.debug("%s: could not read camera_controls: %r", self.name, e)
+
         controls = {"AeEnable": True}
         if self.wants_autofocus():
             if self.lens_position is not None:

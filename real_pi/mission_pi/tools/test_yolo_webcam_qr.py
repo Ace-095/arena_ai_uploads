@@ -34,6 +34,12 @@ USAGE (from the mission_pi/ directory or the repo root):
       --model models/qr_yolov8n.onnx --headless
   python3 tools/test_yolo_webcam_qr.py --source csi --hailo --headless
 
+  # NO DISPLAY (over SSH, e.g. on the Pi)? It runs headless by itself instead
+  # of letting Qt abort the process, and --save-frames gives you JPEGs to
+  # scp back and look at:
+  python3 tools/test_yolo_webcam_qr.py --source csi:bottom --onnx \
+      --preset day --require-decode --tiled --save-frames /tmp/bench
+
 LIVE KEYS (window mode):
   f  hide/show rejected (fake) boxes        v  toggle require-decode
   k  conf +0.05                              l  conf -0.05
@@ -59,6 +65,28 @@ except Exception:
     yaml = None
 
 PRESET_KEYS = "1234567"  # key -> preset list position
+
+
+def decide_show(headless, show, env=None):
+    """Open a window? -> (show, reason).
+
+    Qt ABORTS the whole process (SIGABRT, not a Python exception) when it
+    cannot init a platform plugin, and over SSH there is no display — so the
+    decision has to be made BEFORE the first imshow(), never as a try/except
+    around it. Explicit flags always win; otherwise a display decides.
+
+    Pure so it can be tested with no display and no camera.
+    """
+    env = os.environ if env is None else env
+    if headless:
+        return False, "headless requested"
+    if show:
+        return True, "window forced with --show"
+    if env.get("DISPLAY") or env.get("WAYLAND_DISPLAY"):
+        return True, "display found"
+    return False, ("no DISPLAY/WAYLAND_DISPLAY (SSH?) — running headless; "
+                   "re-run with --show once you have a desktop, or --headless "
+                   "to silence this note")
 
 
 def load_cfg(path):
@@ -233,9 +261,24 @@ def main():
                          "(default: mission_pi/config.yaml next to this tool)")
     ap.add_argument("--headless", action="store_true",
                     help="no window — one summary line per second (bench CI)")
+    ap.add_argument("--show", action="store_true",
+                    help="force the window even without DISPLAY "
+                         "(default: window only when a display exists)")
+    ap.add_argument("--save-frames", default="",
+                    help="dir to write annotated frames into (default off) — "
+                         "the way to SEE a headless run; one JPEG/second")
     ap.add_argument("--max-frames", type=int, default=0,
                     help="stop after N frames (0 = run until key/file end)")
     args = ap.parse_args()
+
+    # A window needs a display; Qt aborts the process, not an exception, when
+    # there is none — so decide here (and say which branch was taken).
+    _show, why = decide_show(args.headless, args.show)
+    if not _show:
+        print("[bench] %s" % why)
+    if args.save_frames:
+        os.makedirs(args.save_frames, exist_ok=True)
+        print("[bench] annotated frames -> %s (1/s)" % args.save_frames)
 
     cfg = load_cfg(args.config or os.path.join(_ROOT, "config.yaml"))
     from qr_filter import (QrFilter, load_presets, normalize_preset_name,
@@ -415,11 +458,16 @@ def main():
                             cv2.LINE_AA)
         hud(frame, len(raw), len(kept), payload_any)
 
-        if args.headless:
+        if not _show:
             if now - t_last_line >= 1.0:
                 t_last_line = now
                 print("[bench] frame=%d raw=%d filt=%d payload=%r fps=%.1f"
                       % (n_frames, n_raw, n_filt, payload_any, fps))
+                if args.save_frames:
+                    path = os.path.join(args.save_frames, "bench_%05d.jpg"
+                                        % n_frames)
+                    if cv2.imwrite(path, frame):
+                        print("[bench] wrote %s" % path)
         else:
             cv2.imshow("QR bench (f/v/k/l/t/p/1-7/q)", frame)
             k = cv2.waitKey(1) & 0xFF
@@ -473,7 +521,7 @@ def main():
             break
 
     cap.release()
-    if not args.headless:
+    if _show:
         cv2.destroyAllWindows()
     print("[done] frames=%d raw_boxes=%d filter_kept=%d (rejected %d)"
           % (n_frames, n_raw, n_filt, n_raw - n_filt))

@@ -192,7 +192,17 @@ PY
   detection works; focus is whatever the lens is screwed to.
 
 `tools/focus_sweep.py` runs that check itself and exits with a clear message
-instead of pretending. **For the downward camera, prefer one measured
+instead of pretending. The same answer now rides along in every camera
+status: `cameras.focus_ok` / `cameras.focus_controls` in the UI status payload
+and in the bring-up log — `focus_ok: false` next to `af_mode: auto` is the
+honest signal that a configured autofocus is doing nothing, because libcamera
+only logs `WARN … Could not set AF_MODE - no AF algorithm` and does not raise.
+`tools/cam_probe.py` prints the whole status dict per camera.
+
+Drop a tuning file we ship ourselves (e.g. a fixed `imx477_af.json` copied out
+of a vendor package) next to the config, in `models/`, or reference it by
+absolute path — all three are searched before libcamera's own IPA directory,
+and none of them needs `sudo` or survives only until the next OS update. **For the downward camera, prefer one measured
 position over autofocus** — the page below is how you get it:
 
 ```bash

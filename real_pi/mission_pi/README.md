@@ -308,6 +308,8 @@ Details + the executed test matrix + the bench procedure:
   `autofocus: false` + `lens_position:` lines for `config.yaml`. Refuses with
   a clear message when the camera has no focus control
 * `tools/qr_bench.py` — detector+decoder over images, boxes/payload/ms
+  (`--detector onnx|pt|yolo|hailo|classical|auto`; `onnx` runs the mission's
+  own ONNX rung, so the ms you see is the ms the mission gets)
 * `tools/link_doctor.py` — end-to-end Pi-link diagnosis (local or `--remote`)
 * `tools/fake_sitl.py` — SITL stand-in: tcp 5760/5762 + optional udp mirror
   (`--udp`), `--auto --loop` flies a demo mission by itself. Also a **writable

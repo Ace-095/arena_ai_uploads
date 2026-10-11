@@ -325,6 +325,19 @@ def _try_yolo_laptop(cfg):
         log.debug(f"yolo_onnx auto failed: {e}")
     return None
 
+# Names that mean "the CPU YOLO ladder" (ONNX or PyTorch), and the ones that
+# additionally pin the format. `onnx`/`pt` are the names an operator actually
+# types on the bench, so they must not be rejected as "unknown detector.kind".
+YOLO_KINDS = frozenset((
+    "yolo", "yolov8", "yolo_ultralytics", "yolo_onnx",
+    "onnx", "onnxruntime", "pt", "pytorch", "yolo_pt", "torch",
+))
+YOLO_FORMAT_ALIASES = {
+    "onnx": "onnx", "onnxruntime": "onnx", "yolo_onnx": "onnx",
+    "pt": "pt", "pytorch": "pt", "torch": "pt", "yolo_ultralytics": "pt",
+}
+
+
 def get_detector(cfg):
     """cfg: dict with kind/hef_path/input_size/conf_thr/iou_thr/custom_module."""
     kind = str(cfg.get("kind", "auto")).lower()
@@ -354,15 +367,26 @@ def get_detector(cfg):
     if kind == "hailo":
         return HailoYolo8Detector(cfg["hef_path"], cfg.get("input_size", 640),
                                   cfg.get("conf_thr", 0.35), cfg.get("iou_thr", 0.5))
-    if kind in ("yolo", "yolov8", "yolo_ultralytics", "yolo_onnx"):
+    if kind in YOLO_KINDS:
+        # An explicit format name pins the order, so `--detector onnx` on a
+        # machine that also has a .pt cannot silently load torch instead —
+        # the whole point of naming the format is to test THAT one.
+        fmt = YOLO_FORMAT_ALIASES.get(kind)
+        if fmt:
+            cfg = dict(cfg)
+            cfg["prefer"] = [fmt]
         y = _try_yolo_laptop(cfg)
         if y:
             return y
-        raise RuntimeError("yolo kind requested but no model found — put models/qr_yolov8n.pt or .onnx in place and pip install ultralytics or onnxruntime")
+        raise RuntimeError(
+            "yolo/onnx kind requested but no model found — put "
+            "models/qr_yolov8n.onnx (or .pt) in place and pip install "
+            "onnxruntime (or ultralytics)")
     if kind == "classical":
         return ClassicalDetector()
     if kind == "custom":
         return load_custom(cfg["custom_module"])
     if kind == "none":
         return ClassicalDetector()  # decode-only still tries classical boxes
-    raise RuntimeError("unknown detector.kind: %r (use auto/hailo/yolo/classical/custom/none)" % kind)
+    raise RuntimeError("unknown detector.kind: %r (use auto/hailo/onnx/yolo/pt/"
+                       "classical/custom/none)" % kind)
