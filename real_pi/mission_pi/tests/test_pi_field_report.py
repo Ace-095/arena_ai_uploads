@@ -59,7 +59,8 @@ F = _load()
 # The ladder's last step builds the whole detector, which is the only step that
 # can exit 0 without Hailo.
 CTOR = "12. the whole constructor, as the ladder builds it"
-LADDER_STEPS = 14    # 12 Hailo init steps + one real inference + the constructor
+CTOR_CLOSE = "12b. the whole constructor, then close it the way main.py does"
+LADDER_STEPS = 15    # 13 Hailo steps + the constructor + the constructor closed
 
 
 def make_args(**kw):
@@ -507,6 +508,97 @@ class TestHailoSteps(unittest.TestCase):
                     self.assertIn(api, code,
                                   "%r is named in the label %r but is not in "
                                   "that step's program" % (api, label))
+
+    def test_every_crashed_step_reports_its_last_words(self):
+        """Three steps SIGSEGVed on the Pi and the summary named one of them.
+
+        The first crash's last words were the whole diagnosis ("InferVStreams
+        entered" - so the crash came AFTER the streams worked) and the other two
+        crashes' words were in the JSON where nobody looks. Every crash gets a
+        line.
+        """
+        text = F.summarise({"sections": {"hailo_steps": {
+            "ctor_step": CTOR,
+            "first_crash": "9. InferVStreams(ng, in, out).__enter__()",
+            "first_failure": None,
+            "steps": [
+                {"step": "9. InferVStreams(ng, in, out).__enter__()",
+                 "signal": "SIGSEGV", "stdout_tail": "InferVStreams entered"},
+                {"step": "9b. one real inference through the entered InferVStreams",
+                 "signal": "SIGSEGV", "stdout_tail": "C: activated"},
+                {"step": CTOR, "signal": "SIGSEGV",
+                 "stdout_tail": "chosen: yolo_onnx"}]}}})
+        self.assertIn("last output before it died: InferVStreams entered", text)
+        self.assertIn("9b. one real inference through the entered InferVStreams"
+                      " died too - last output: C: activated", text)
+        self.assertIn("%s died too - last output: chosen: yolo_onnx" % CTOR, text)
+
+    def test_the_streams_steps_unroll_what_they_enter(self):
+        """A step that enters a context manager must leave it.
+
+        Production closes the detector (main.py's finally -> det.close()). A
+        ladder step that enters InferVStreams and walks away probes teardown by
+        garbage collection instead - and on the Pi that exact shape died with
+        SIGSEGV while HailoRT logged NETWORK_GROUP_NOT_ACTIVATED(69). The
+        lifecycle under test has to be the one the mission lives.
+        """
+        seen = []
+        real, F._child = F._child, (
+            lambda code, timeout=120, cwd=None: (
+                seen.append(code),
+                {"rc": 0, "signal": None, "stdout": "", "stderr": "",
+                 "timed_out": False})[1])
+        try:
+            got = F.sec_hailo_steps(make_args())
+        finally:
+            F._child = real
+        programs = dict(zip([e["step"] for e in got["steps"]], seen))
+        nine = [c for l, c in programs.items() if l.startswith("9. ")][0]
+        nineb = [c for l, c in programs.items() if l.startswith("9b. ")][0]
+        self.assertIn("st.__exit__", nine,
+                      "step 9 enters InferVStreams and never leaves it")
+        self.assertIn("InferVStreams exited cleanly", nine)
+        self.assertIn("st.__exit__", nineb,
+                      "step 9b enters InferVStreams and never leaves it")
+        self.assertIn("act_cm.__exit__", nineb,
+                      "step 9b activates and never deactivates")
+        self.assertIn("F: closed cleanly", nineb)
+
+    def test_the_constructor_can_be_closed_the_way_main_py_closes_it(self):
+        """Step 12 abandons the detector at process exit. main.py does not -
+        its finally calls det.close(). 12b runs that lifecycle end to end."""
+        seen = []
+        real, F._child = F._child, (
+            lambda code, timeout=120, cwd=None: (
+                seen.append(code),
+                {"rc": 0, "signal": None, "stdout": "", "stderr": "",
+                 "timed_out": False})[1])
+        try:
+            got = F.sec_hailo_steps(make_args())
+        finally:
+            F._child = real
+        programs = dict(zip([e["step"] for e in got["steps"]], seen))
+        self.assertIn(CTOR_CLOSE, programs, "the closed-constructor step is missing")
+        self.assertIn("det.close()", programs[CTOR_CLOSE])
+        self.assertIn("closed cleanly", programs[CTOR_CLOSE])
+
+    def test_no_constructor_step_counts_as_a_hailo_step(self):
+        """12 AND 12b can exit 0 by falling back to the CPU.
+
+        Counting either of them as a Hailo step is how a rig with no working
+        Hailo once read as "(1/13 steps ok)".
+        """
+        rep = {"sections": {"hailo_steps": {
+            "ctor_step": CTOR, "first_crash": None,
+            "first_failure": "1. import hailo_platform",
+            "steps": [{"step": "%d. ok" % i, "ok": False,
+                       "error": "ModuleNotFoundError: x"} for i in range(1, 13)]
+            + [{"step": CTOR, "ok": True, "stdout": "chosen: yolo_onnx"},
+               {"step": CTOR_CLOSE, "ok": True, "stdout": "chosen: yolo_onnx"}]}}}
+        text = F.summarise(rep)
+        self.assertIn("(0/12 Hailo steps ok)", text)
+        self.assertNotIn("/14 steps ok", text)
+        self.assertIn("fell back to: chosen: yolo_onnx", text)
 
     def test_a_fallback_constructor_is_not_counted_as_a_hailo_step(self):
         """The one step that can "succeed" without Hailo is the last one.

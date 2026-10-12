@@ -673,6 +673,51 @@ outright: it drives one real inference and prints `A:`…`E:` as it goes, so the
 surviving marker says whether the streams work and the crash is only in the
 teardown, or the streams never came up at all.
 
+### MEASURED at `a9dfdf2`: the streams ENTERED, then it died at teardown
+
+```
+hailosteps : CRASHED at: 9. InferVStreams(ng, in, out).__enter__() (11/13 Hailo steps ok)
+             died by SIGSEGV            <- 9
+             died by SIGSEGV            <- 9b
+             [HailoRT] [error] CHECK failed - Trying to write to vstream
+                 qr_yolov8n/input_layer1 before its network group is activated
+             [HailoRT] [error] CHECK_SUCCESS failed with status=HAILO_NETWORK_GROUP_NOT_ACTIVATED(69)
+             [HailoRT] [error] Failed waiting for threads with status HAILO_NETWORK_GROUP_NOT_ACTIVATED(69)
+             died by SIGSEGV            <- 12, the whole constructor
+             last output before it died: InferVStreams entered
+```
+
+`InferVStreams entered` is the whole diagnosis: **`__enter__()` returned
+successfully** and the SIGSEGV came after that print. The crash is not in
+building the streams — it is in tearing them down.
+
+And the log names the mechanism. Step 9 enters `InferVStreams` but never
+activates the network group and never closes anything — by design, isolating one
+call. At process exit the abandoned pipeline's internal threads try to work the
+input vstream, find the group unactivated, and fail with
+`HAILO_NETWORK_GROUP_NOT_ACTIVATED(69)`; the teardown then dies. That is a
+teardown-by-garbage-collection crash — and the ladder, not the mission, chose
+that shape. `main.py`'s `finally` calls `det.close()` (`main.py:724`), so
+production unrolls the very contexts the ladder was abandoning.
+
+So the ladder changed to test the lifecycle the mission lives: steps 9 and 9b now
+`__exit__` what they `__enter__` and print `exited cleanly` / `F: closed cleanly`,
+and step 12b runs the whole constructor **and then `det.close()`** —
+`get_detector()`, work, close, exactly `main.py`. Step 12 (construct and abandon)
+is kept as a separate probe of the process-exit-without-close shape, but it must
+not be read as what the mission does. Every crashed step now prints its last
+words, not only the first — three steps died in this run and the summary showed
+one of them.
+
+**What the next run decides.** `ok - every step completed` means Hailo inference
+and clean shutdown both work, and bring-up at `main.py:258` is unblocked. A crash
+in 9 or 12b *with* `exited cleanly` on the last line would instead mean the
+`__exit__`/`close()` path itself is the fault — the teardown-segfault shape Hailo
+itself has [in the background threads](https://community.hailo.ai/t/segmentation-fault-in-background-thread-after-successful-synchronous-inference-vstreams-api-hailo-8-hailort-4-24-0/19764),
+and then the fallback ladder in `get_detector()` must be watched, because
+`close()` from an error path would carry the same crash and `try/except` cannot
+catch a signal.
+
 ### THE ORIGINAL LEADING CAUSE, and what changed because of it
 
 The crash was at `vdev.configure(hef, cfg)` — the call immediately after

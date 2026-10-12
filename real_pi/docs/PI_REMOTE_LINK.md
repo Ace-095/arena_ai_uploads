@@ -605,25 +605,31 @@ at the `detector :` line: if it no longer says CRASHED, `mission_pi` can start w
 the HEF in place, and the Hailo rung of the detector is usable. That is the result
 that unblocks everything else.
 
-**(b) `CRASHED at: ... vdev.configure ...` (or later)** — the reorder was *not* the
-cause. The next suspect is already documented in
-`BENCH_RUNBOOK.md`, stage 0c: Pi 5 uses 16 KB kernel pages while the Hailo PCIe
-device declares 4096-byte max descriptor pages. Fix:
+**(b) `CRASHED at: ...`** — read the `last output before it died:` line FIRST.
+That line is the whole verdict: it says how far the step got before the signal.
+`InferVStreams entered` there means the crash is in the *teardown*, not in
+building the streams — completely different from the same verdict without it.
+Also read every `died too - last output:` line: several steps can crash and each
+one names its own last words. Paste all of the `[HailoRT]` lines too —
+`NETWORK_GROUP_NOT_ACTIVATED(69)` next to a teardown crash names the mechanism.
+The page-size suspect from `BENCH_RUNBOOK.md` stage 0c (Pi 5 16 KB kernel pages
+vs the device's 4096-byte descriptor pages) is only for a crash that looks like
+`max_desc_page_size … bigger than hw max desc page size`:
 
 ```
 echo "options hailo_pci force_desc_page_size=4096" | sudo tee /etc/modprobe.d/hailo_pci.conf
 sudo reboot
 ```
 
-then re-run Step 2. Also paste the `[HailoRT]` lines the report captured.
-
 **(c) `FAILED at: ...`** — a plain Python error, not a crash. The step name says
 where, and the report keeps the error text. That is a bug to fix in this repo, and
 the text is what I need.
 
-One thing to read carefully in all three cases. The count is `(n/12 Hailo steps ok)`
-— twelve, not thirteen, because the thirteenth step builds the whole detector and
-can exit 0 by **falling back** to ONNX instead of using Hailo. When that happens the
+One thing to read carefully in all three cases. The count is
+`(n/13 Hailo steps ok)` — thirteen, because the ladder now also drives one real
+inference (step 9b) among the Hailo steps, while the two whole-constructor steps
+(12 and 12b) are kept out of the count: they build the whole detector and can
+exit 0 by **falling back** to ONNX instead of using Hailo. When that happens the
 report says so on its own line and names the fallback:
 
 ```
@@ -635,9 +641,10 @@ That is not a pass. It means Hailo is still dead and the detector quietly went t
 the CPU — which is the thing the whole exercise is trying to avoid.
 
 In all three cases, the useful thing to paste back is the whole `hailosteps`
-block plus the `detector` block, including any `[HailoRT] [error] ...` lines —
-and the new `which generation won:` line from step 5, which is the specific
-question this round is asking.
+block plus the `detector` block, including any `[HailoRT] [error] ...` lines,
+every `last output …` line, and the `which generation won:` line from step 5.
+The `code :` header line must show the commit this conversation is on — if it
+does not, the run is testing old code and means nothing.
 
 ### Step 4 — the camera, in the same pass
 

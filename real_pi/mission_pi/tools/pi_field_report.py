@@ -442,7 +442,9 @@ if cp is not None:
                'op = hailo_vstream_params(hp, ng, ngp, False, FormatType.FLOAT32)\n'
                'st = InferVStreams(ng, ip, op)\n'
                'st.__enter__()\n'
-               'print("InferVStreams entered")'),
+               'print("InferVStreams entered")\n'
+               'st.__exit__(None, None, None)\n'
+               'print("InferVStreams exited cleanly")'),
         # The question the crash report could not answer: does Hailo actually
         # INFER, or does it die before the first frame? Markers are printed as it
         # goes and the child runs unbuffered, so a crash leaves the last marker
@@ -461,8 +463,9 @@ if cp is not None:
                'st.__enter__()\n'
                'print("B: streams entered", flush=True)\n'
                'act = getattr(ng, "activate", None)\n'
-               'if callable(act):\n'
-               '    act(ngp).__enter__()\n'
+               'act_cm = act(ngp) if callable(act) else None\n'
+               'if act_cm is not None:\n'
+               '    act_cm.__enter__()\n'
                'print("C: activated", flush=True)\n'
                'frame = np.zeros((1,) + tuple(ii.shape), dtype=np.uint8)\n'
                'res = st.infer({ii.name: frame})\n'
@@ -473,7 +476,11 @@ if cp is not None:
                '    for k in sorted(res.keys()):\n'
                '        a = np.asarray(res[k])\n'
                '        print("   %s %s %s" % (k, a.shape, a.dtype), flush=True)\n'
-               'print("E: done - inference works", flush=True)'),
+               'print("E: done - inference works", flush=True)\n'
+               'if act_cm is not None:\n'
+               '    act_cm.__exit__(None, None, None)\n'
+               'st.__exit__(None, None, None)\n'
+               'print("F: closed cleanly", flush=True)'),
         ("10. ng.activate(ngp).__enter__()",
          pre + 'cfg = hailo_configure_params(hef, hp)\n'
                'ng = vdev.configure(hef, cfg)[0]\n'
@@ -493,6 +500,18 @@ if cp is not None:
          ' det = D.get_detector(cfg.get("detector", {}) or {});'
          ' print("chosen:", getattr(det, "name", type(det).__name__))'
          % os.path.abspath(args.config)),
+        # The lifecycle main.py actually lives: get_detector(), work, then
+        # det.close() from the finally at main.py:724. Step 12 abandons the
+        # detector at process exit instead - a different question, kept, but it
+        # must not be mistaken for what the mission does.
+        ("12b. the whole constructor, then close it the way main.py does",
+         'import json, os, yaml, detector as D;'
+         ' cfg = yaml.safe_load(open(%r)) or {};'
+         ' det = D.get_detector(cfg.get("detector", {}) or {});'
+         ' print("chosen:", getattr(det, "name", type(det).__name__));'
+         ' det.close();'
+         ' print("closed cleanly")'
+         % os.path.abspath(args.config)),
     ]
     out = {"steps": [], "hef_path": hef_abs or None,
            "why": "each step runs alone in a child process, so the first "
@@ -504,7 +523,10 @@ if cp is not None:
         out["note"] = ("no HEF at %r - the ladder cannot choose Hailo at all. "
                        "Compile one (training/compile_hef.md) before reading "
                        "anything else here" % (hef or "detector.hef_path"))
-    ctor_name = steps[-1][0] if steps else None   # the whole constructor
+    # The constructor-family steps run get_detector(), which can exit 0 by
+    # falling back to the CPU. 12b follows 12 now, so "the last step" stopped
+    # being a definition of the constructor - name it instead.
+    ctor_name = next((lab for lab, _ in steps if lab.startswith("12. ")), None)
     out["ctor_step"] = ctor_name
     for name, code in steps:
         r = _child(code, timeout=90)
@@ -1060,7 +1082,10 @@ def summarise(r):
         # a silent CPU fallback being presented as success, so the denominator is
         # the Hailo steps alone, and the constructor's fallback gets its own line.
         _ctor = hs.get("ctor_step")
-        _halo = [r for r in _steps if r.get("step") != _ctor]
+        # every step whose name says "the whole constructor" can exit 0 via a
+        # CPU fallback - 12 and 12b both - so neither may enter this count.
+        _halo = [r for r in _steps
+                 if "the whole constructor" not in str(r.get("step") or "")]
         _ctor_rec = [r for r in _steps if r.get("step") == _ctor]
         _ctor_rec = _ctor_rec[0] if _ctor_rec else {}
         n_ok = sum(1 for r in _halo if r.get("ok"))
@@ -1080,11 +1105,16 @@ def summarise(r):
                     L.append("             died by %s" % st["signal"])
                     for line in (st.get("hailort_errors") or [])[:4]:
                         L.append("             %s" % line)
-            _crashed_rec = next((r for r in _steps if r.get("signal")), {})
-            _got_to = [ln for ln in (_crashed_rec.get("stdout_tail") or "").splitlines()
-                       if ln.strip()]
-            if _got_to:
-                L.append("             last output before it died: %s" % _got_to[-1])
+            for _i, _cr in enumerate(r for r in _steps if r.get("signal")):
+                _got_to = [ln for ln in (_cr.get("stdout_tail") or "").splitlines()
+                           if ln.strip()]
+                if not _got_to:
+                    continue
+                if _i == 0:
+                    L.append("             last output before it died: %s" % _got_to[-1])
+                else:
+                    L.append("             %s died too - last output: %s"
+                             % (_cr.get("step") or "?", _got_to[-1]))
             _fell_back()
         elif hs.get("first_failure"):
             L.append("hailosteps : FAILED at: %s (%d/%d Hailo steps ok)"
