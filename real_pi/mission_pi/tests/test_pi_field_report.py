@@ -410,15 +410,30 @@ class TestTheReportSaysWhichCodeProducedIt(unittest.TestCase):
                 env=dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
                          GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t"))
             run("init", "-q")
-            run("commit", "-q", "--allow-empty", "-m", "x")
+            t = os.path.join(d, "tracked.txt")
+            open(t, "w").write("one")
+            run("add", "tracked.txt")
+            run("commit", "-q", "-m", "x")
             got = F.code_stamp(d)
             self.assertTrue(got, "no stamp from a real repo: %r" % (got,))
             self.assertGreaterEqual(len(got["commit"]), 7)
             self.assertTrue(got["branch"])
             self.assertFalse(got["dirty"], "a clean tree reported as dirty")
-            open(os.path.join(d, "new.txt"), "w").write("x")
+            # a CHANGED TRACKED file is the thing that makes the report possibly
+            # not match its commit
+            open(t, "w").write("two")
             self.assertTrue(F.code_stamp(d)["dirty"],
-                            "an uncommitted file was not reported")
+                            "a modified tracked file was not reported")
+            open(t, "w").write("one")
+            self.assertFalse(F.code_stamp(d)["dirty"], "restored but still dirty")
+            # an untracked file cannot change the committed code - HailoRT drops
+            # hailort.log into the tree on every run, so counting it made the
+            # warning fire forever and mean nothing
+            open(os.path.join(d, "hailort.log"), "w").write("x")
+            got = F.code_stamp(d)
+            self.assertFalse(got["dirty"],
+                             "an untracked log file reported the tree dirty")
+            self.assertEqual(got["untracked"], 1)
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
@@ -441,6 +456,13 @@ class TestTheReportSaysWhichCodeProducedIt(unittest.TestCase):
                             "code": {"commit": "abc1234", "branch": "b",
                                      "dirty": True}})
         self.assertIn("uncommitted changes", text)
+
+    def test_untracked_files_get_their_own_softer_line(self):
+        text = F.summarise({"sections": {},
+                            "code": {"commit": "abc1234", "branch": "b",
+                                     "dirty": False, "untracked": 3}})
+        self.assertIn("3 untracked file(s)", text)
+        self.assertNotIn("uncommitted changes", text)
 
     def test_no_code_info_prints_no_line(self):
         text = F.summarise({"sections": {}})
@@ -625,6 +647,41 @@ class TestHailoSteps(unittest.TestCase):
         self.assertNotIn("/13 steps ok", text)
         self.assertIn("fell back to: chosen: yolo_onnx", text)
         self.assertIn("did not use Hailo", text)
+
+    def test_an_ok_constructor_that_chose_hailo_is_never_called_a_fallback(self):
+        """The claim "it did not use Hailo" must follow the constructor's OWN
+        output. An ok constructor printing "chosen: hailo" is the opposite of a
+        fallback, and the old line would have described it as one."""
+        rep = {"sections": {"hailo_steps": {
+            "ctor_step": CTOR,
+            "first_crash": "9. InferVStreams(ng, in, out).__enter__()",
+            "first_failure": None,
+            "steps": ([{"step": "%d. ok" % i, "ok": True} for i in range(1, 9)]
+                      + [{"step": "9. InferVStreams(ng, in, out).__enter__()",
+                          "signal": "SIGSEGV"}]
+                      + [{"step": "%d. ok" % i, "ok": True} for i in range(10, 13)]
+                      + [{"step": CTOR, "ok": True, "stdout": "chosen: hailo"}]
+                      + [{"step": CTOR_CLOSE, "ok": True,
+                          "stdout": "chosen: hailo"}])}}}
+        text = F.summarise(rep)
+        self.assertIn("CRASHED at: 9. InferVStreams", text)
+        self.assertNotIn("fell back", text)
+        self.assertNotIn("did not use Hailo", text)
+
+    def test_a_constructor_whose_choice_is_unreadable_is_caution_not_claim(self):
+        """Ok but no "chosen:" line - the report must not invent a fallback."""
+        rep = {"sections": {"hailo_steps": {
+            "ctor_step": CTOR, "first_crash": None,
+            "first_failure": "1. import hailo_platform",
+            "steps": ([{"step": "1. import hailo_platform", "ok": False,
+                        "error": "ModuleNotFoundError: x"}]
+                      + [{"step": "%d. ok" % i, "ok": False,
+                          "error": "stopped"} for i in range(2, 13)]
+                      + [{"step": CTOR, "ok": True, "stdout": "built"},
+                         {"step": CTOR_CLOSE, "ok": True, "stdout": "built"}])}}}
+        text = F.summarise(rep)
+        self.assertIn("what it chose is not on its output", text)
+        self.assertNotIn("fell back to", text)
 
     def test_no_fallback_line_when_the_constructor_did_use_hailo(self):
         # cumulative ladder: step 6 crashes and every step after it dies too

@@ -998,9 +998,16 @@ def code_stamp(repo=None):
         commit = _git("rev-parse", "--short", "HEAD")
         if not commit:
             return None
+        st = _git("status", "--porcelain") or ""
+        lines = [l for l in st.splitlines() if l.strip()]
+        # "dirty" has to mean the committed code may differ. Untracked files
+        # cannot do that - and HailoRT drops hailort.log into the tree on every
+        # run, so counting them made the warning fire forever and mean nothing.
+        tracked = [l for l in lines if not l.startswith("??")]
         return {"commit": commit,
                 "branch": _git("rev-parse", "--abbrev-ref", "HEAD"),
-                "dirty": bool(_git("status", "--porcelain"))}
+                "dirty": bool(tracked),
+                "untracked": sum(1 for l in lines if l.startswith("??"))}
     except Exception:
         return None
 
@@ -1049,6 +1056,9 @@ def summarise(r):
         if code.get("dirty"):
             L.append("             the working tree has uncommitted changes - this "
                      "report may not match the commit above")
+        elif code.get("untracked"):
+            L.append("             %d untracked file(s) in the tree - they cannot "
+                     "change the committed code" % code["untracked"])
     if sysd:
         L.append("board      : %s | %s | python %s | %s cores"
                  % (sysd.get("board", "?"), sysd.get("kernel"), sysd.get("python"),
@@ -1092,10 +1102,25 @@ def summarise(r):
         n_all = len(_halo)
 
         def _fell_back():
-            if _ctor_rec.get("ok"):
-                L.append("             the constructor step exited 0 anyway - it "
-                         "did not use Hailo, it fell back to: %s"
-                         % (_ctor_rec.get("stdout") or "an unnamed detector"))
+            for r in _steps:
+                if "the whole constructor" not in str(r.get("step") or ""):
+                    continue
+                if not r.get("ok"):
+                    continue
+                out = (r.get("stdout") or "").strip()
+                chosen = ""
+                for ln in out.splitlines():
+                    if ln.startswith("chosen:"):
+                        chosen = ln.split(":", 1)[1].strip()
+                if chosen.startswith("hailo"):
+                    continue        # it used Hailo - the claim would be false
+                if chosen:
+                    L.append("             the constructor step exited 0 anyway - it "
+                             "did not use Hailo, it fell back to: %s"
+                             % (out or "an unnamed detector"))
+                else:
+                    L.append("             the constructor step exited 0 but what it "
+                             "chose is not on its output: %s" % (out or "no output"))
 
         if hs.get("first_crash"):
             L.append("hailosteps : CRASHED at: %s (%d/%d Hailo steps ok)"

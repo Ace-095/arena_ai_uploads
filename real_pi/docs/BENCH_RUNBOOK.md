@@ -718,6 +718,40 @@ and then the fallback ladder in `get_detector()` must be watched, because
 `close()` from an error path would carry the same crash and `try/except` cannot
 catch a signal.
 
+### MEASURED at `3504b85`: Hailo inference works. The blocker is gone.
+
+Run on the Pi at commit `3504b85` (2026-10-13):
+
+```
+code       : 3504b85 on arena/1c4bb365-arena-ai-uploads
+hailosteps : CRASHED at: 12. the whole constructor, as the ladder builds it (13/13 Hailo steps ok)
+             died by SIGSEGV
+             last output before it died: chosen: hailo
+```
+
+Read it in three parts.
+
+**13/13 Hailo steps ok.** Every Hailo step passed — including 9 (InferVStreams
+entered *and exited cleanly*), 9b (one real inference on the real HEF, tensors
+returned, closed cleanly), and 5/6 (`hailo_configure_params` → `vdev.configure`).
+The configure-generation hypothesis is confirmed and closed: the documented
+constructor works on HailoRT 4.23 on this Pi.
+
+**`chosen: hailo`.** `get_detector()` did not fall back — it built the Hailo
+detector. The constructor **completed**; its last words are its own success line.
+
+**The only crash is step 12, the construct-and-abandon probe.** Step 12b — the
+same constructor followed by `det.close()`, which is exactly what `main.py`'s
+`finally` does — is clean. The SIGSEGV that remains is the
+process-exit-without-close shape, and no production path uses it.
+
+**`main.py:258` is unblocked.** The mission's bring-up can proceed with the HEF
+in place. What is still NOT YET MEASURED and remains the point of the exercise:
+real camera capture, the real lens FOV, end-to-end QR detection at altitude, and
+any flight result. Next probes are `--sec detector` (the detector ladder as
+`get_detector()` itself runs it) and `tools/list_cams.py` (which node is the
+downward camera), then the full survey.
+
 ### THE ORIGINAL LEADING CAUSE, and what changed because of it
 
 The crash was at `vdev.configure(hef, cfg)` — the call immediately after
