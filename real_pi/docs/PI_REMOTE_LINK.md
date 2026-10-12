@@ -606,6 +606,19 @@ then re-run Step 2. Also paste the `[HailoRT]` lines the report captured.
 where, and the report keeps the error text. That is a bug to fix in this repo, and
 the text is what I need.
 
+One thing to read carefully in all three cases. The count is `(n/12 Hailo steps ok)`
+— twelve, not thirteen, because the thirteenth step builds the whole detector and
+can exit 0 by **falling back** to ONNX instead of using Hailo. When that happens the
+report says so on its own line and names the fallback:
+
+```
+             the constructor step exited 0 anyway - it did not use Hailo, it
+             fell back to: chosen: yolo_onnx
+```
+
+That is not a pass. It means Hailo is still dead and the detector quietly went to
+the CPU — which is the thing the whole exercise is trying to avoid.
+
 In all three cases, the useful thing to paste back is the whole `hailosteps`
 block plus the `detector` block, including any `[HailoRT] [error] ...` lines —
 and the new `which generation won:` line from step 5, which is the specific
