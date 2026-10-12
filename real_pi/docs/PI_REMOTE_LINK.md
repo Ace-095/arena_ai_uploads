@@ -9,6 +9,25 @@ other than you to run anything.
 
 ---
 
+## Quick path (copy-paste)
+
+If you have already created the token, this is the whole thing:
+
+```bash
+cd ~/arena_ai_uploads/real_pi/mission_pi
+
+read -rs -p "paste token, then Enter: " T && printf '%s' "$T" > ~/.pi_agent_token && chmod 600 ~/.pi_agent_token && unset T
+export PI_AGENT_TOKEN="$(cat ~/.pi_agent_token)"
+export PI_AGENT_REPO="Ace-095/arena_ai_uploads"
+
+python3 tools/pi_agent.py --selftest        # must say "You are good to go"
+python3 tools/pi_agent.py --queue "/pi scout" && python3 tools/pi_agent.py --once
+```
+
+Step-by-step instructions for each of those, including the token, follow in §4.
+
+---
+
 ## 1. Why it works this way
 
 The machine that wrote this repo has no route to your LAN. That is measured, not
@@ -110,63 +129,219 @@ token, no path, and no environment variable.
 
 ---
 
-## 4. Setup
+## 4. Setup, step by step
 
-### 4.1 Create a token for the Pi
+Nothing here touches the aircraft. Steps 1-5 only talk to GitHub; the first
+command that opens hardware is in step 7.
 
-GitHub → Settings → Developer settings → **Fine-grained personal access tokens**
-→ Generate new token:
+### Step 0 - get the code onto the Pi
 
-* **Repository access:** Only select repositories → `Ace-095/arena_ai_uploads`
-* **Permissions:**
-  * **Issues: Read and write** ← required
-  * **Metadata: Read** ← comes with the above automatically
-* Nothing else. Not `Contents`, not `Actions`, not `Workflows`.
-
-**Why "Read and write" on Issues matters, measured:** a token that can create an
-issue but not label or comment on one makes GitHub **create the issue and silently
-drop the label** — no error, no timeline event, and the job is never picked up.
-That is the worst possible outcome, so `--queue` re-reads the issue afterwards and
-refuses to report success if the label did not stick.
-
-Put the token in a file only you can read, not in your shell history:
+The agent lives on this branch, not on `main`:
 
 ```bash
-install -m 600 /dev/null ~/.pi_agent_token
-printf '%s' 'github_pat_...' > ~/.pi_agent_token   # paste it in your editor instead
-chmod 600 ~/.pi_agent_token
+cd ~/arena_ai_uploads
+git branch --show-current              # what are we on?
+git fetch origin
+git checkout arena/1c4bb365-arena-ai-uploads
+git pull
+ls real_pi/mission_pi/tools/pi_agent.py     # must exist now
 ```
 
-### 4.2 First run (does nothing but look)
+If `git checkout` complains about local changes, tell me what it said - do not
+force it, your Pi may have edits worth keeping.
+
+### Step 1 - create the token
+
+1. Open **https://github.com/settings/personal-access-tokens/new**
+   (or: your avatar → *Settings* → *Developer settings* → *Personal access
+   tokens* → *Fine-grained tokens* → *Generate new token*).
+2. **Token name:** `pi-agent` — anything you will recognise in six months.
+3. **Expiration:** 90 days is sensible. Put a reminder in your calendar for
+   the day before; the agent prints a clear 401 when it lapses.
+4. **Repository access:** *Only select repositories* → pick
+   **`Ace-095/arena_ai_uploads`**. Not "All repositories".
+5. **Permissions** → expand *Repository permissions* → find **Issues** → set it
+   to **Read and write**.
+   * `Metadata: Read` turns itself on. That is expected and required.
+   * **Leave everything else at "No access."** No Contents, no Actions, no
+     Workflows, no Administration.
+6. **Generate token**, then copy it. GitHub shows it once.
+
+> **The one mistake to avoid.** Setting *Issues* to **Read-only** instead of
+> **Read and write**. I hit exactly this while building this: with Issues read,
+> the token could still *create* issues and create repo labels, but labelling an
+> issue and commenting on one both failed with `403 Resource not accessible by
+> integration` — which does not say which permission to fix. That is the whole
+> reason `--selftest` exists (step 4).
+
+Never paste the token into this chat, an issue, a commit, or a screenshot.
+
+### Step 2 - store it on the Pi
+
+This reads the token without echoing it to the screen and without putting it in
+your shell history:
+
+```bash
+read -rs -p "paste token, then press Enter: " T \
+  && printf '%s' "$T" > ~/.pi_agent_token \
+  && chmod 600 ~/.pi_agent_token \
+  && unset T \
+  && echo "saved: $(wc -c < ~/.pi_agent_token) bytes, mode $(stat -c %a ~/.pi_agent_token)"
+```
+
+Expect roughly `93 bytes, mode 600`. (`printf '%s'`, not `echo`: no trailing
+newline. The agent strips whitespace anyway, but tidy is tidy.)
+
+No editor needed, and nothing is left in `~/.bash_history`. If you prefer an
+editor, `nano ~/.pi_agent_token` then `chmod 600` it — but do not use
+`export PI_AGENT_TOKEN=...` interactively, because that lands in your history.
+
+### Step 3 - point it at the repository
+
+```bash
+cd ~/arena_ai_uploads/real_pi/mission_pi
+export PI_AGENT_TOKEN="$(cat ~/.pi_agent_token)"
+export PI_AGENT_REPO="Ace-095/arena_ai_uploads"
+```
+
+To save these two exports for every future shell:
+
+```bash
+printf 'export PI_AGENT_REPO="Ace-095/arena_ai_uploads"\n' >> ~/.bashrc
+printf 'export PI_AGENT_TOKEN="$(cat ~/.pi_agent_token)"\n' >> ~/.bashrc
+```
+
+Keep the *token itself* in the 600-mode file and only the *reference* in
+`.bashrc`.
+
+### Step 4 - verify the token BEFORE anything else — `--selftest`
+
+This is the step that turns a confusing failure into a named one. It talks only
+to GitHub, runs no action, and cleans up after itself (one uniquely-named label,
+plus a throwaway issue if there was no open issue to borrow):
+
+```bash
+python3 tools/pi_agent.py --selftest
+```
+
+A healthy Pi prints:
+
+```
+pi_agent self-test
+============================================================
+  PASS token is valid (GET /user)
+       Ace-095
+  PASS repo is readable (GET /repos)
+       Ace-095/arena_ai_uploads (owner Ace-095)
+  PASS create a repo label (Issues: write)
+  PASS list open issues (Issues: read)
+       3 open: #5, #6, #7
+  PASS label an issue (the one that usually fails)
+  PASS remove a label again
+  PASS comment on an issue (how results come back)
+       1234567
+  PASS delete the test comment
+  PASS remove the test label
+  PASS delete the test label from the repo
+============================================================
+All required permissions are present. You are good to go.
+```
+
+If instead you see `FAIL label an issue` / `FAIL comment on an issue`, the
+token's **Issues** permission is *Read-only*. Fix it in step 1 and re-run. Do not
+continue past this step until it says **good to go**; everything after it assumes
+the token can write.
+
+### Step 5 - see what you are authorising, and rehearse
+
+```bash
+python3 tools/pi_agent.py --list-actions     # the complete allowlist; no network
+python3 tools/pi_agent.py --once --dry-run   # shows what it WOULD run; runs nothing
+```
+
+Read the list. Nine actions, all read-only or explicitly consented. If any of
+them looks wrong to you, stop and say so.
+
+### Step 6 - first real job
+
+```bash
+python3 tools/pi_agent.py --queue "/pi help" && python3 tools/pi_agent.py --once
+```
+
+This creates a labelled issue, runs the action, and comments the result back.
+Then look at it:
+
+```bash
+python3 tools/pi_agent.py --queue "/pi scout" && python3 tools/pi_agent.py --once
+```
+
+`scout` is the read-only field survey: board, thermal, deps, Hailo, the detector
+rung it picks, cameras. It is quick and it opens **no** hardware.
+
+You can also queue by hand in the browser: open an issue whose **first line** is
+`/pi scout`, add the **`pi:job`** label, and the agent will pick it up on its next
+pass.
+
+### Step 7 - the one that matters: measure the real FOV
+
+Every range number in this repository rests on a **VENDOR-QUOTED 75°/60°** that
+nobody has checked. This measures it.
+
+**Physics setup first:**
+1. A **white sheet flat on a darker floor**, directly under the downward camera.
+2. It must be **centred** in the picture and must not touch the frame edges.
+3. It must be **clearly brighter** than the ground around it.
+4. Tape-measure from the **lens** to the **sheet** — that number is `dist_m`.
+5. Camera on `bottom`, `mission_pi` stopped.
+
+Then, in a fresh shell (or re-export after step 3):
 
 ```bash
 cd ~/arena_ai_uploads/real_pi/mission_pi
 export PI_AGENT_TOKEN="$(cat ~/.pi_agent_token)"
 export PI_AGENT_REPO="Ace-095/arena_ai_uploads"
 
-python3 tools/pi_agent.py --list-actions     # what you are authorising
-python3 tools/pi_agent.py --once --dry-run   # shows what it WOULD do; runs nothing
+python3 tools/pi_agent.py --queue "/pi fov dist_m=2.0 panel_mm=420 panel_mm_h=297 hardware=yes" \
+  && python3 tools/pi_agent.py --once
 ```
 
-### 4.3 Queue a job and answer it
+* `dist_m` = what your tape says, in metres (here 2.0).
+* `panel_mm` = the sheet's **long** side in mm (A3 = 420, A4 = 297).
+* `panel_mm_h` = the sheet's **short** side in mm (A3 = 297). Optional; include
+  it and you also get VFOV and a sanity check that the measured aspect ratio
+  matches the declared one.
+
+It refuses rather than guesses, and every refusal says why. A good result looks
+like `FOV : MEASURED hfov=75.10 deg vfov=59.80 deg (config says hfov=75.0)`, with
+`spread` under a few percent. Bench accuracy on known synthetic lenses is within
+**0.35°**; a single centred sheet measures the **centre** field of view, and
+corner distortion is not covered.
+
+Then put the measured numbers into `config.yaml`
+(`cameras.bottom.hfov_deg` / `vfov_deg`) so the UI's coverage planner and the
+footprint maths stop using the vendor value.
+
+### Step 8 - tell me
+
+I can read issues (only write is blocked from my side), so once a job has
+answered, just say "done" and I will pull the result, check it against what the
+code claims, and tell you what it means. You do not need to copy any output into
+the chat.
+
+### Step 9 - run it as a service (optional)
+
+Only worth doing once step 4 passes. Then you can queue from the browser and walk
+away.
 
 ```bash
-# queue it (creates the labelled issue) and immediately handle the queue
-python3 tools/pi_agent.py --queue "/pi scout" && python3 tools/pi_agent.py --once
+install -m 600 /dev/null ~/.pi-agent.env
+nano ~/.pi-agent.env      # see the two lines below
 ```
 
-Or queue several and let the loop drain them:
-
-```bash
-python3 tools/pi_agent.py --queue "/pi hailo"
-python3 tools/pi_agent.py --queue "/pi capture role=bottom hardware=yes"
-python3 tools/pi_agent.py --once
 ```
-
-You can also queue from the GitHub **web UI**: open an issue whose first line is
-`/pi scout`, add the `pi:job` label. No CLI needed.
-
-### 4.4 Run it as a service (optional)
+PI_AGENT_TOKEN=github_pat_xxx
+PI_AGENT_REPO=Ace-095/arena_ai_uploads
+```
 
 ```ini
 # /etc/systemd/system/pi-agent.service
@@ -179,11 +354,10 @@ Wants=network-online.target
 Type=simple
 User=pi
 WorkingDirectory=/home/pi/arena_ai_uploads/real_pi/mission_pi
-EnvironmentFile=/home/pi/.pi-agent.env      # PI_AGENT_TOKEN=..., PI_AGENT_REPO=...
+EnvironmentFile=/home/pi/.pi-agent.env
 ExecStart=/usr/bin/python3 tools/pi_agent.py --loop --interval 20
 Restart=on-failure
 RestartSec=30
-# it needs the camera and the serial port only when you ask for them
 SupplementaryGroups=video dialout
 
 [Install]
@@ -191,11 +365,27 @@ WantedBy=multi-user.target
 ```
 
 ```bash
+sudo systemctl daemon-reload
 sudo systemctl enable --now pi-agent
 journalctl -u pi-agent -f
 ```
 
-Run it as your normal user, never as root. It does not need root for anything.
+Adjust `User=` and the two `/home/pi/...` paths if your Pi's user is not `pi`.
+Run it as your normal user, never as root - it needs no root for anything.
+
+### Troubleshooting
+
+| What you see | What it means |
+|---|---|
+| `FAIL label an issue` in `--selftest` | token's **Issues** permission is *Read-only* → set it to **Read and write** |
+| `403 Resource not accessible by integration` | the same thing, from a command rather than the self-test |
+| `not queued: the pi:job label did NOT stick` | same cause; the issue was created but never queued — add the label in the browser or fix the token |
+| `401` / `token is valid` FAIL | wrong token, or it expired (check the expiry date from step 1) |
+| `need --repo owner/name` | `export PI_AGENT_REPO=...` is missing in this shell |
+| A job is silently ignored | no `pi:job` label, or you are not the issue's author, or it is already `pi:done` |
+| `refused: mission_pi is running` | stop `mission_pi`: it owns the camera and the serial port |
+| `FOV : NOT MEASURED - ...` then a reason | sheet off-centre, touching an edge, too small in frame, or not bright enough against the floor. The reason is printed after the dash — read it, it is specific |
+| `no camera detected for role 'bottom' - see list_cams above` | run `python3 tools/list_cams.py`, and make sure nothing else holds the camera |
 
 ---
 

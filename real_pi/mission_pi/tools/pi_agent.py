@@ -755,6 +755,39 @@ class GitHubTransport(object):
                 pass
         return url, number, got
 
+    def add_labels(self, number, labels):
+        self._call("POST", "/repos/%s/issues/%s/labels"
+                   % (self.repo, number), {"labels": list(labels)})
+
+    def remove_label(self, number, label):
+        self._call("DELETE", "/repos/%s/issues/%s/labels/%s"
+                   % (self.repo, number, urllib.parse.quote(label)))
+
+    def create_label(self, name, color="ededed", description=""):
+        self._call("POST", "/repos/%s/labels" % self.repo,
+                   {"name": name, "color": color, "description": description})
+
+    def delete_label(self, name):
+        self._call("DELETE", "/repos/%s/labels/%s"
+                   % (self.repo, urllib.parse.quote(name)))
+
+    def list_issues(self, limit=5):
+        _s, d = self._call("GET", "/repos/%s/issues?state=open&per_page=%d"
+                           % (self.repo, limit))
+        return [i for i in (d or []) if "pull_request" not in i]
+
+    def create_comment(self, number, body):
+        _s, d = self._call("POST", "/repos/%s/issues/%s/comments"
+                           % (self.repo, number), {"body": body})
+        return (d or {}).get("id")
+
+    def delete_comment(self, comment_id):
+        self._call("DELETE", "/repos/issues/comments/%s" % comment_id)
+
+    def close_issue(self, number):
+        self._call("PATCH", "/repos/%s/issues/%s" % (self.repo, number),
+                   {"state": "closed"})
+
     def set_labels(self, number, remove=(), add=()):
         for label in remove:
             try:
@@ -815,6 +848,38 @@ class FakeTransport(object):
                             "updated_at": "2026-01-01T00:00:00Z"})
         return ("https://example.invalid/issues/%d" % number, number,
                 list(labels))
+
+    def add_labels(self, number, labels):
+        self.calls.append(("add_labels", number, tuple(labels)))
+        for it in self.issues:
+            if it["number"] == number:
+                for l in labels:
+                    it["labels"].append({"name": l})
+
+    def remove_label(self, number, label):
+        self.calls.append(("remove_label", number, label))
+        for it in self.issues:
+            if it["number"] == number:
+                it["labels"] = [l for l in it["labels"] if l["name"] != label]
+
+    def create_label(self, name, color="ededed", description=""):
+        self.calls.append(("create_label", name))
+
+    def delete_label(self, name):
+        self.calls.append(("delete_label", name))
+
+    def list_issues(self, limit=5):
+        return [i for i in self.issues if i.get("state", "open") == "open"][:limit]
+
+    def create_comment(self, number, body):
+        self.comments.setdefault(number, []).append(body)
+        return 4242
+
+    def delete_comment(self, comment_id):
+        self.calls.append(("delete_comment", comment_id))
+
+    def close_issue(self, number):
+        self.calls.append(("close_issue", number))
 
     def set_labels(self, number, remove=(), add=()):
         self.calls.append(("labels", number, tuple(remove), tuple(add)))
@@ -975,6 +1040,132 @@ class Agent(object):
         ])
 
 
+def read_credentials(args, env=None):
+    """(token, repo), both stripped.
+
+    A token pasted into a file, or set by a systemd EnvironmentFile, very often
+    carries a trailing newline. A newline inside an Authorization header is a
+    401 that reads like a bad token, and it is the first thing that goes wrong
+    when the token comes from a file rather than an interactive export. The repo
+    name is stripped for the same reason - it goes into the URL.
+    """
+    env = os.environ if env is None else env
+    token = (env.get(args.token_env) or "").strip()
+    repo = (args.repo or env.get("PI_AGENT_REPO") or "").strip()
+    return token, repo
+
+
+def selftest(transport, log=print):
+    """Check every permission the agent needs, and name the one that is missing.
+
+    Written because the failure mode is genuinely confusing: a token can create
+    an issue and create a label, and still be unable to label an issue or comment
+    on one - and GitHub reports the resulting 403 as "Resource not accessible by
+    integration", which says nothing about which permission to fix.
+
+    Everything it creates it also removes: one uniquely-named label, and one
+    throwaway issue if there was no open issue to borrow. Nothing of yours is
+    touched, and it never runs an action.
+    """
+    steps = []
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    temp_label = "pi:selftest-%s" % stamp
+
+    def step(name, fn, hint=""):
+        try:
+            got = fn()
+            detail = "" if got is None else str(got)
+            if len(detail) > 300:
+                detail = detail[:300] + " ...(truncated)"
+            steps.append((True, name, detail, hint))
+            return got
+        except Exception as e:
+            steps.append((False, name, redact(str(e)), hint))
+            return None
+
+    login = step("token is valid (GET /user)", transport.whoami)
+    # getattr: a transport missing `.repo` must not be reported as a token
+    # problem. A self-test that blames the wrong thing is worse than no test.
+    owner = step("repo is readable (GET /repos)",
+                 lambda: "%s (owner %s)" % (getattr(transport, "repo", "?"),
+                                            transport.repo_owner()))
+    created_label = step("create a repo label (Issues: write)",
+                         lambda: (transport.create_label(
+                             temp_label, "ededed", "pi_agent self-test, safe to delete"
+                         ), True)[1])
+
+    # Borrow an open issue if there is one; otherwise make a throwaway.
+    issues = step("list open issues (Issues: read)",
+                  lambda: "%d open: %s" % (
+                      len(transport.list_issues(5)),
+                      ", ".join("#%s" % i.get("number")
+                                for i in transport.list_issues(5)))) or []
+    issues = transport.list_issues(5) if isinstance(issues, str) else issues
+    borrowed, issue_no, created_issue = False, None, False
+    if issues:
+        issue_no = issues[0].get("number")
+        borrowed = True
+    else:
+        def make():
+            _url, number, _got = transport.create_issue(
+                "pi_agent self-test - safe to close", "/pi selftest-marker", ())
+            return number
+        issue_no = step("create an issue (Issues: write)", make)
+        created_issue = bool(issue_no)
+
+    labelled = commented = None
+    if issue_no:
+        labelled = step("label an issue (the one that usually fails)",
+                        lambda: (transport.add_labels(issue_no, [temp_label]),
+                                 True)[1],
+                        hint="needs Issues: Read and write, not just read")
+        if labelled:
+            step("remove a label again",
+                 lambda: (transport.remove_label(issue_no, temp_label), True)[1])
+        commented = step("comment on an issue (how results come back)",
+                         lambda: transport.create_comment(
+                             issue_no, "pi_agent self-test comment - safe to delete"))
+
+    # --- clean up, whatever happened ---------------------------------------
+    if commented:
+        step("delete the test comment",
+             lambda: (transport.delete_comment(commented), True)[1])
+    if labelled:
+        step("remove the test label",
+             lambda: (transport.remove_label(issue_no, temp_label), True)[1])
+    if created_label:
+        step("delete the test label from the repo",
+             lambda: (transport.delete_label(temp_label), True)[1])
+    if created_issue and issue_no:
+        step("close the throwaway issue",
+             lambda: (transport.close_issue(issue_no), True)[1])
+
+    ok = all(s[0] for s in steps if "delete" not in s[1] and "close" not in s[1])
+    lines = ["pi_agent self-test", "=" * 60]
+    for good, name, detail, hint in steps:
+        lines.append("  %s %s" % ("PASS" if good else "FAIL", name))
+        if detail:
+            lines.append("       %s" % detail)
+        if not good and hint:
+            lines.append("       -> %s" % hint)
+    lines.append("=" * 60)
+    if ok:
+        lines.append("All required permissions are present. You are good to go.")
+    else:
+        lines.append("Some permissions are MISSING. The agent will not be able to")
+        lines.append("work until they are granted. Fix the token:")
+        lines.append("  github.com/settings/tokens -> the token -> Issues: Read and write")
+        lines.append("  (a token needs 'Read and write' on Issues. 'Read' alone can")
+        lines.append("   create issues and labels, which is exactly what makes this")
+        lines.append("   failure so confusing.)")
+    lines.append("")
+    lines.append("Nothing was executed on this machine - this only talks to GitHub.")
+    text = "\n".join(lines)
+    if log:
+        log(text)
+    return ok, text
+
+
 def queue_job(transport, command, title=None):
     """Validate a command and queue it. Returns (ok, message).
 
@@ -1017,7 +1208,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(
         description="Run a fixed, read-only list of actions on this Pi when "
                     "the repository owner asks for them in a GitHub issue.")
-    ap.add_argument("--repo", default=os.environ.get("PI_AGENT_REPO"),
+    ap.add_argument("--repo", default=None,
                     help="owner/name (default $PI_AGENT_REPO)")
     ap.add_argument("--token-env", default="PI_AGENT_TOKEN",
                     help="env var holding the GitHub token (default "
@@ -1040,6 +1231,10 @@ def main(argv=None):
                     help="append-only audit log (default %(default)s)")
     ap.add_argument("--list-actions", action="store_true",
                     help="print the allowlist and exit")
+    ap.add_argument("--selftest", action="store_true",
+                    help="check that the token has every permission the agent "
+                         "needs, then exit. Creates and removes its own test "
+                         "label; runs no action")
     ap.add_argument("--queue", metavar="COMMAND",
                     help="validate a command and queue it as a labelled issue, "
                          "then exit (e.g. --queue '/pi scout')")
@@ -1050,11 +1245,12 @@ def main(argv=None):
         print(help_text())
         return 0
 
+    # Credentials FIRST: --repo's argparse default is None now, so resolving
+    # $PI_AGENT_REPO has to happen before the check or the env var never works.
+    token, args.repo = read_credentials(args)
     if not args.repo:
         print("need --repo owner/name or $PI_AGENT_REPO", file=sys.stderr)
         return 2
-
-    token = os.environ.get(args.token_env) or ""
     fake = FakeTransport() if (args.dry_run and not token) else None
     if fake is not None:
         print("no token in $%s - dry-run will show the allowlist but no real "
@@ -1084,6 +1280,10 @@ def main(argv=None):
     except Exception as e:
         print("startup failed: %s" % redact(str(e)), file=sys.stderr)
         return 2
+
+    if args.selftest:
+        ok, _text = selftest(transport)
+        return 0 if ok else 1
 
     if args.queue:
         ok, msg = queue_job(transport, args.queue)

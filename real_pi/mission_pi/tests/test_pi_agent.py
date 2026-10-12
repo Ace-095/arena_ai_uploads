@@ -516,6 +516,117 @@ class TestJobParsing(unittest.TestCase):
         self.assertEqual(A.parse_job(issue(body="/pi SCOUT")).action, "scout")
 
 
+class TestCredentials(unittest.TestCase):
+    """The token nearly always arrives from a file or a systemd EnvironmentFile,
+    where a trailing newline is invisible and produces a 401 that reads like a
+    bad token."""
+
+    class Args(object):
+        token_env = "PI_AGENT_TOKEN"
+        repo = None
+
+    def test_a_trailing_newline_on_the_token_is_stripped(self):
+        _t, r = A.read_credentials(self.Args(),
+                                   {"PI_AGENT_TOKEN": "abc123\n",
+                                    "PI_AGENT_REPO": "o/r\n"})
+        self.assertEqual(_t, "abc123")
+        self.assertEqual(r, "o/r")
+
+    def test_surrounding_whitespace_is_stripped(self):
+        _t, _r = A.read_credentials(self.Args(),
+                                    {"PI_AGENT_TOKEN": "  abc123  \r\n"})
+        self.assertEqual(_t, "abc123")
+
+    def test_an_explicit_repo_beats_the_environment(self):
+        class A2(TestCredentials.Args):
+            repo = "explicit/name"
+        _t, r = A.read_credentials(A2(), {"PI_AGENT_REPO": "ignored/name"})
+        self.assertEqual(r, "explicit/name")
+
+    def test_a_missing_token_is_empty_not_none(self):
+        _t, r = A.read_credentials(self.Args(), {})
+        self.assertEqual(_t, "")
+        self.assertEqual(r, "")
+
+
+class TestSelftest(unittest.TestCase):
+    """--selftest exists to turn a bare 403 into the name of the missing
+    permission. Measured on the live API: a token can create issues and labels
+    and still fail to label an issue, and GitHub reports all of it as
+    "Resource not accessible by integration"."""
+
+    def run_selftest(self, transport):
+        lines = []
+        ok, text = A.selftest(transport, log=lines.append)
+        return ok, text
+
+    def test_a_good_token_passes_and_reports_each_capability(self):
+        t = A.FakeTransport(owner="owner")
+        t.issues = [issue(number=9, body="/pi help", labels=())]
+        ok, text = self.run_selftest(t)
+        self.assertTrue(ok, text)
+        for want in ("token is valid", "repo is readable", "create a repo label",
+                     "label an issue", "comment on an issue"):
+            self.assertIn(want, text)
+
+    def test_it_names_the_missing_permission_when_labelling_fails(self):
+        class CannotLabel(A.FakeTransport):
+            def add_labels(self, number, labels):
+                raise RuntimeError("403 Resource not accessible by integration")
+        t = CannotLabel(owner="owner")
+        t.issues = [issue(number=9, body="/pi help", labels=())]
+        ok, text = self.run_selftest(t)
+        self.assertFalse(ok)
+        self.assertIn("FAIL label an issue", text)
+        self.assertIn("Issues: Read and write", text)
+
+    def test_it_creates_and_closes_a_throwaway_issue_when_there_are_none(self):
+        t = A.FakeTransport(owner="owner")
+        ok, text = self.run_selftest(t)
+        self.assertTrue(ok, text)
+        self.assertIn("create an issue", text)
+        self.assertIn("close the throwaway issue", text)
+        self.assertIn(("close_issue", 1000), t.calls)
+
+    def test_it_cleans_up_its_own_label(self):
+        t = A.FakeTransport(owner="owner")
+        t.issues = [issue(number=9, body="/pi help", labels=())]
+        self.run_selftest(t)
+        created = [c for c in t.calls if c[0] == "create_label"]
+        deleted = [c for c in t.calls if c[0] == "delete_label"]
+        self.assertEqual(len(created), 1)
+        self.assertEqual(len(deleted), 1)
+        self.assertEqual(created[0][1], deleted[0][1],
+                         "the label it made was not the label it deleted")
+
+    def test_it_does_not_leave_its_test_label_on_the_issue(self):
+        t = A.FakeTransport(owner="owner")
+        t.issues = [issue(number=9, body="/pi help", labels=())]
+        self.run_selftest(t)
+        names = [l["name"] for l in t.issues[0]["labels"]]
+        self.assertEqual([n for n in names if n.startswith("pi:selftest")], [])
+
+    def test_it_executes_no_action(self):
+        """It talks to GitHub and nothing else. This runs on a flight vehicle."""
+        t = A.FakeTransport(owner="owner")
+        t.issues = [issue(number=9, body="/pi help", labels=())]
+        real = A.run_argv
+        calls = []
+        A.run_argv = lambda *a, **k: calls.append(a) or A.Result([], 0, "", 0)
+        try:
+            self.run_selftest(t)
+        finally:
+            A.run_argv = real
+        self.assertEqual(calls, [], "the self-test executed something locally")
+
+    def test_a_bad_output_is_not_a_wall_of_json(self):
+        t = A.FakeTransport(owner="owner")
+        t.issues = [issue(number=9, body="/pi help", labels=())]
+        _ok, text = self.run_selftest(t)
+        self.assertLess(len(text), 4000, "the report is too noisy to read")
+        self.assertNotIn("node_id", text)
+
+
 class TestQueueJob(unittest.TestCase):
     """`--queue` is how a command gets INTO the system from the Pi's side.
 
