@@ -613,6 +613,128 @@ class TestPerceptionTapUnderLiveMission(unittest.TestCase):
         self.assertIs(snap.get("perception_only"), True)
 
 
+
+
+@unittest.skipIf(SKIP, SKIP or "")
+class TestFenceAgainstRealVehicle(unittest.TestCase):
+    """The geofence round-trip against a REAL autopilot.
+
+    Every other fence test in this repo runs against tools/fake_sitl.py, which
+    stores the integers it is given EXACTLY. A real ArduPilot cannot: AC_Fence
+    keeps polygon vertices as `Vector2f` (float32 of degrees*1e7), so the
+    readback is up to one float32 ULP off the uploaded value. That difference
+    made a perfectly stored fence fail `fence.matches()` (1.1e-7 deg tolerance
+    against ~3.2e-6 deg of quantization) and would have answered 502
+    "FC did not store the fence we sent" on EVERY upload to real hardware.
+    These tests exist so the fake can never hide that again.
+
+    SAFETY: only ever touches the FENCE mission type. It never uploads flight
+    waypoints and never arms.
+    """
+
+    #: ~9 m square, built around the VEHICLE'S OWN home - not a hardcoded spot.
+    #: (A first version used fixed coordinates ~11,000 km from the vehicle's
+    #: Canberra home. ArduPilot accepted them, since fence vertices are absolute,
+    #: but a fence that far from home is not the thing a flight would upload.)
+    SIDE = 0.00008
+
+    def setUp(self):
+        self.fc = _connect()
+        _reset_vehicle(self.fc)
+        home = self.fc.get_home(timeout=8.0)
+        self.assertIsNotNone(home, "the vehicle did not report a home position")
+        la, lo = float(home[0]), float(home[1])
+        self.HOME = (la, lo)
+        d = self.SIDE
+        self.verts = [(la, lo), (la, lo + d), (la + d, lo + d), (la + d, lo)]
+
+    def tearDown(self):
+        # never leave a test fence on the vehicle for the next test to inherit
+        try:
+            self.fc.clear_fence()
+        except Exception:
+            pass
+        try:
+            self.fc.close()
+        except Exception:
+            pass
+
+    def test_00_starts_with_no_fence(self):
+        """Guards the rest: a leftover fence makes every later assertion lie."""
+        self.assertEqual(self.fc.read_fence(timeout=8.0), [],
+                         "the vehicle already holds a fence - a previous run "
+                         "left it behind")
+
+    def test_a_real_vehicle_advertises_its_fence_capability(self):
+        """A REAL board's answer to "can you take a fence?", not the fake's.
+
+        Capabilities arrive only on request, so the production order matters:
+        get_autopilot_version() first, then fence_capability(). Calling
+        fence_capability() on its own reports None/None/"FC did not report
+        AUTOPILOT_VERSION" - which is honest, and is what an earlier hand probe
+        of mine wrongly called a bug.
+        """
+        self.assertEqual(self.fc.fence_capability()[0], None,
+                         "this test is only meaningful before a version fetch")
+        ver = self.fc.get_autopilot_version(timeout=2.0)
+        self.assertTrue(ver, "a real autopilot must answer AUTOPILOT_VERSION")
+        m2, fence_ok, text = self.fc.fence_capability()
+        self.assertIsNotNone(fence_ok,
+                             "capability unknown after a successful version read: %s"
+                             % text)
+        self.assertTrue(m2, "a modern ArduCopter must advertise MAVLink2")
+        self.assertTrue(fence_ok,
+                        "a modern ArduCopter must advertise MISSION_FENCE: %s" % text)
+
+    def test_upload_readback_verifies_against_the_real_vehicle(self):
+        """THE regression: the tolerance fix, against real float32 storage."""
+        n = self.fc.upload_fence(self.verts, timeout=15.0)
+        self.assertEqual(n, 4)
+        got = self.fc.read_fence(timeout=8.0)
+        self.assertEqual(len(got), 4, "the vehicle did not return 4 vertices")
+        from fence import matches, quant_tolerance
+        self.assertTrue(matches(self.verts, got),
+                        "a correctly stored fence failed readback verification: "
+                        "sent %r got %r" % (self.verts, got))
+        # and the difference really is only the storage quantization
+        for (a, b), (c, e) in zip(self.verts, got):
+            self.assertLessEqual(abs(c - a), quant_tolerance(a),
+                                 "lat error exceeds the float32 storage budget")
+            self.assertLessEqual(abs(e - b), quant_tolerance(b),
+                                 "lon error exceeds the float32 storage budget")
+
+    def test_clear_empties_the_fence_on_the_real_vehicle(self):
+        self.fc.upload_fence(self.verts, timeout=15.0)
+        self.assertEqual(len(self.fc.read_fence(timeout=8.0)), 4)
+        self.assertTrue(self.fc.clear_fence(timeout=8.0))
+        self.assertEqual(self.fc.read_fence(timeout=8.0), [],
+                         "the fence survived a clear the FC acknowledged")
+
+    def test_a_self_intersecting_polygon_never_reaches_the_vehicle(self):
+        """Refused locally, before any MAVLink write - the vehicle is untouched."""
+        self.fc.upload_fence(self.verts, timeout=15.0)
+        bowtie = [(self.HOME[0], self.HOME[1]),
+                  (self.HOME[0] + self.SIDE, self.HOME[1] + self.SIDE),
+                  (self.HOME[0] + self.SIDE, self.HOME[1]),
+                  (self.HOME[0], self.HOME[1] + self.SIDE)]
+        with self.assertRaises(ValueError):
+            self.fc.upload_fence(bowtie, timeout=5.0)
+        got = self.fc.read_fence(timeout=8.0)
+        self.assertEqual(len(got), 4, "a refused upload changed the vehicle's fence")
+        from fence import matches
+        self.assertTrue(matches(self.verts, got),
+                        "the refused upload corrupted the stored fence")
+
+    def test_the_stored_fence_is_the_one_we_sent(self):
+        """The readback the UI shows is the VEHICLE's, not the Pi's drawing."""
+        self.fc.upload_fence(self.verts, timeout=15.0)
+        got = self.fc.read_fence(timeout=8.0)
+        self.assertEqual(len(got), 4)
+        for (a, b) in got:      # a vertex we never sent must not appear
+            self.assertLess(abs(a - self.HOME[0]), 0.001)
+            self.assertLess(abs(b - self.HOME[1]), 0.001)
+
+
 if __name__ == "__main__":
     if SKIP:
         print("SKIP: %s" % SKIP)

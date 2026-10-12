@@ -1,10 +1,23 @@
 // geo.js — flat-earth ENU math + FOV coverage (arena/test1)
 // Same convention as bridge/mp_bridge.py + mission_pi/geo.py
-// Camera specs from cam.txt: Pi Cam3 66° HFOV, IMX477 100° HFOV (113° diag)
+//
+// SOURCE OF TRUTH: mission_pi/config.yaml (cameras.front / cameras.bottom) —
+// the same two numbers the flight code and tools/fov_report.py use. Keep these
+// in step with it; a coverage grid computed from a lens the aircraft is not
+// flying is worse than no grid.
+//
+// MEASURED correction: `bottom` used to carry the OLD Waveshare lens
+// (100° HFOV, 4056x3040, 2.7 mm). The mounted camera is an Arducam UC-517
+// (IMX477 + 3.9 mm VCM, vendor-quoted 75°H/60°V, 2028x1520). With the stale
+// spec the planner spaced lawnmower rows 32.9% further apart than a 75° lens
+// can cover - at 10 m, 10.74 m of spacing against a 15.3 m footprint - so the
+// planned search left gaps between passes at every altitude. The FOV is
+// VENDOR-QUOTED and NOT measured, exactly as tools/fov_report.py says; measure
+// it on the bench and update both this file and config.yaml.
 
 const EARTH_RADIUS_M = 6371000.0;
 
-// Camera specs from cam.txt
+// Camera specs - keep in step with mission_pi/config.yaml
 const CAM_SPECS = {
   front: {
     model: "Pi Camera Module 3 Standard",
@@ -16,13 +29,13 @@ const CAM_SPECS = {
     resolution: [4608, 2592],
   },
   bottom: {
-    model: "Waveshare IMX477 IR-CUT B",
+    model: "Arducam UC-517 (IMX477 + 3.9 mm VCM)",
     sensor: "IMX477",
-    hfov_deg: 100.0,
-    vfov_deg: 75.0,
-    diagonal_fov_deg: 113.0,
-    focal_mm: 2.7,
-    resolution: [4056, 3040],
+    hfov_deg: 75.0,          // VENDOR-QUOTED, NOT measured
+    vfov_deg: 60.0,          // VENDOR-QUOTED, NOT measured
+    diagonal_fov_deg: 87.7,  // derived from 75/60 above, not a vendor figure
+    focal_mm: 3.9,
+    resolution: [2028, 1520],
   }
 };
 

@@ -307,15 +307,15 @@ Guards that make this safe:
 
 | File | Lines | Purpose |
 |---|---:|---|
-| `tracker.py` | ~330 | `Track` + `BoxTracker`: association, motion gate, EMA, persistence, expiry |
-| `perception.py` | ~700 | quality gate, `qr_roi`, `PayloadValidator`, `PerceptionFSM`, `PerceptionPipeline` |
-| `perception_tap.py` | ~300 | read-only install onto the running stack; `ObservationBuffer`; detector decorator |
-| `tests/test_tracker.py` | ~230 | 24 tests |
-| `tests/test_perception_fsm.py` | ~470 | 45 tests |
-| `tests/test_perception_tap.py` | ~420 | 26 tests |
-| `tests/test_perception_bench.py` | ~170 | 20 tests |
-| `tools/perception_bench.py` | ~640 | Phase-8 metric harness (`make` / `run` / `live`) |
-| `tools/fov_report.py` | ~300 | Phase-4 feasibility calculator + lever analysis |
+| `tracker.py` | 376 | `Track` + `BoxTracker`: association, motion gate, EMA, persistence, expiry |
+| `perception.py` | 793 | quality gate, `qr_roi`, `PayloadValidator`, `PerceptionFSM`, `PerceptionPipeline` |
+| `perception_tap.py` | 315 | read-only install onto the running stack; `ObservationBuffer`; detector decorator |
+| `tests/test_tracker.py` | 232 | 24 tests |
+| `tests/test_perception_fsm.py` | 485 | 45 tests |
+| `tests/test_perception_tap.py` | 420 | 26 tests |
+| `tests/test_perception_bench.py` | 165 | 20 tests |
+| `tools/perception_bench.py` | 863 | Phase-8 metric harness (`make` / `run` / `live`) |
+| `tools/fov_report.py` | 356 | Phase-4 feasibility calculator + lever analysis |
 | `docs/PERCEPTION_PIPELINE.md` | this file | |
 
 ### Modified files (additive only)
@@ -398,7 +398,7 @@ New tests: **115**, all passing. Full existing suite re-run: **33 files passed,
 | `tests/test_perception_fsm.py` | 45 | **OK** |
 | `tests/test_perception_tap.py` | 26 | **OK** |
 | `tests/test_perception_bench.py` | 20 | **OK** |
-| `bash tools/run_tests.sh` (whole repo) | 35 files | **33 passed, 0 failed, 2 skipped** |
+| `bash tools/run_tests.sh` (whole repo) | 42 files | **41 passed, 0 failed, 1 skipped** (2026-10-12; the skip is `test_sitl_flight.py` with no vehicle attached — with real SITL up it runs 25/25) |
 
 Skipped (self-skipping, hardware absent): `test_hef_and_focus.py`,
 and `test_fence_e2e_fake_fc.py` skipped in the loaded run.

@@ -52,6 +52,28 @@ fi
 
 echo "python: $PY"
 "$PY" -c "import sys; print('version:', sys.version.split()[0])" 2>/dev/null
+# Optional dependencies change WHICH files can do their work, so a SKIP must be
+# attributable. (Measured: after a sandbox reset these vanish while the git
+# worktree survives, which silently turned whole suites into skips.)
+"$PY" - <<'DEPS' 2>/dev/null || true
+try:
+    import importlib
+    have = []
+    for name, why in (("numpy", "vision/tracker/bench suites"),
+                      ("cv2", "vision + camera suites"),
+                      ("yaml", "config loading"),
+                      ("pymavlink", "SITL / FC link"),
+                      ("onnx", "model-fact checks in test_hef_and_focus"),
+                      ("onnxruntime", "the CPU detector ladder")):
+        try:
+            importlib.import_module(name)
+            have.append(name)
+        except Exception:
+            print("optional dep MISSING: %-12s -> skips that need %s" % (name, why))
+    print("optional deps present:", ", ".join(have) if have else "none")
+except Exception:
+    pass
+DEPS
 
 if [ "$LIST_ONLY" = "1" ]; then
   echo "$FILES"
@@ -66,10 +88,27 @@ for f in $FILES; do
   name="$(basename "$f")"
   out="$(timeout 600 "$PY" "$f" 2>&1)"; rc=$?
   if [ $rc -eq 0 ]; then
-    # A file counts as SKIPPED only when it says it ran nothing it needed to
-    # (self-skipping tests) — matching the bare word "skip" anywhere would also
-    # catch assertions like "PASS ready when all ok/skipped".
-    if printf '%s' "$out" | grep -qE "^(SKIP|skipped)|Ran 0 tests|SELF-SKIP"; then
+    # SKIPPED means the file did no work that it needed to do - NOT merely that
+    # it mentioned skipping. The old rule grepped a bare word "skipped"
+    # anywhere, which mis-counted test_fence_e2e_fake_fc.py (24 tests, 23 of
+    # them passing, one optional DOM test skipped) as a whole-file SKIP, and so
+    # under-reported the coverage. Rules now, in order:
+    #   1. all of a unittest run skipped  -> Ran N tests / OK (skipped=N)
+    #   2. a self-checking script borrowing the word at line start, with no
+    #      unittest run at all  -> "SKIP ..." / "SELF-SKIP" (the project's
+    #      test_hef_and_focus.py prints "SKIP model facts (...)" with no colon,
+    #      so the colon cannot be required - and this branch is only reachable
+    #      when no "Ran N tests" line exists, which is what keeps it safe)
+    #   3. a unittest run that ran nothing  -> Ran 0 tests
+    ran="$(printf '%s' "$out" | sed -nE 's/^Ran ([0-9]+) tests?.*/\1/p' | tail -1)"
+    allskipped="$(printf '%s' "$out" | sed -nE 's/^OK \(skipped=([0-9]+)\).*/\1/p' | tail -1)"
+    if printf '%s' "$out" | grep -qE "^Ran 0 tests"; then
+      SKIP=$((SKIP+1)); mark="SKIP"
+    elif [ -n "$ran" ] && [ -n "$allskipped" ] && [ "$ran" = "$allskipped" ]; then
+      SKIP=$((SKIP+1)); mark="SKIP"
+    elif [ -n "$ran" ]; then
+      PASS=$((PASS+1)); mark="PASS"
+    elif printf '%s' "$out" | grep -qE "^(SKIP\b|SELF-SKIP)"; then
       SKIP=$((SKIP+1)); mark="SKIP"
     else
       PASS=$((PASS+1)); mark="PASS"

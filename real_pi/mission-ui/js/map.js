@@ -3,7 +3,9 @@
  * v2 fixes + arena/test1 enhancements:
  *  - polygon drawing (primary, shows on Mission Planner) + button to convert polygon -> fence inclusion
  *  - configurable max height from config.yaml (flight.max_alt_m)
- *  - FOV-based coverage planning (cam.txt: Pi Cam3 66° HFOV, IMX477 100° HFOV)
+ *  - FOV-based coverage planning (keep in step with mission_pi/config.yaml:
+ *    Pi Cam3 66° HFOV front, Arducam UC-517 75° HFOV bottom - the bottom spec
+ *    used to say the old Waveshare 100° and planned rows 33% too far apart)
  *  - coverage grid visualization that divides area according to cam footprint
  *  - curated sources: offline MBTiles + OSM + Carto-dark fallback
  *  - FIXED grid anchor: frozen at boot (or fence origin), not live centre
@@ -18,7 +20,11 @@ const MAX_GRID_LINES = 280;
 const SPACINGS = [1, 2, 5, 10, 20, 50, 100];
 const fmtInt = (n) => Math.round(n).toLocaleString('en-US').replace(/,/g, ' ');
 
-// --- Camera specs from cam.txt (arena/test1) ---
+// --- Camera specs (arena/test1) - SOURCE OF TRUTH: mission_pi/config.yaml ---
+// These drive `optimalSpacing()` and therefore the lawnmower rows this UI
+// generates, so they must be the lens the aircraft actually flies. See the
+// measured note in geo.js: the stale Waveshare entry spaced rows 32.9% further
+// apart than the 75° lens covers, leaving gaps between passes.
 const CAM_SPECS = {
   front: {
     model: "Pi Camera Module 3 Standard",
@@ -28,11 +34,11 @@ const CAM_SPECS = {
     resolution: [4608, 2592],
   },
   bottom: {
-    model: "Waveshare IMX477 IR-CUT B",
-    hfov_deg: 100.0,
-    vfov_deg: 75.0,
-    diagonal_fov_deg: 113.0,
-    resolution: [4056, 3040],
+    model: "Arducam UC-517 (IMX477 + 3.9 mm VCM)",
+    hfov_deg: 75.0,          // VENDOR-QUOTED, NOT measured
+    vfov_deg: 60.0,          // VENDOR-QUOTED, NOT measured
+    diagonal_fov_deg: 87.7,  // derived from 75/60 above, not a vendor figure
+    resolution: [2028, 1520],
   }
 };
 

@@ -16,7 +16,16 @@ The app has two roles, `cam1` / `cam2`. Current configuration requests:
 | Role | Sensor match | Capture size | Horizontal FOV |
 |---|---|---:|---:|
 | front | IMX708 (Cam Module 3) | 4608 × 2592 | 66° |
-| bottom | IMX477 | 2028 × 1520 | 100° |
+| bottom | IMX477 (Arducam UC-517, 3.9 mm) | 2028 × 1520 | 75° |
+
+**Correction (2026-10-12):** the bottom row said **100°** for a long time. That is
+the *old* Waveshare IMX477 lens (100° H / 113° diag, 2.7 mm), which is no longer
+mounted; `CAMERA_AND_PIXHAWK_SETUP.md` §"not this lens" already said so. The
+mounted 3.9 mm lens is quoted **75° H / 60° V — VENDOR-QUOTED, NOT MEASURED**, and
+that is what `mission_pi/config.yaml` carries. It matters: with 100° the 10 m
+footprint looks like 23.8 × 15.3 m, with the real 75° it is 15.3 × 11.6 m, and
+the UI's coverage planner spaced rows **32.9 % too far apart** while both files
+disagreed — see `tests/test_ui_camera_specs.py`.
 
 These are **configured**, not measured sensor output/optical calibration. Some
 backends resize to the requested dimensions; making an image larger does not
