@@ -6,3 +6,8 @@ __pycache__/
 
 # optional UI test dependencies
 node_modules/
+
+# pi_field_report output - belt and braces, in case --out-dir is aimed here
+field_report_*.json
+fov_bottom.png
+fov_front.png

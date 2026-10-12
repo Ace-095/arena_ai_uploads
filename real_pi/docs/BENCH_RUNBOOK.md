@@ -509,3 +509,120 @@ throttled Pi cannot hold a framerate and the numbers will lie.
 
 **Nothing here is a flight result.** It is bench evidence, and it is labelled as
 such in the JSON (`read_only: true`, per-section provenance).
+
+---
+
+## Stage 0c — when the detector section crashes (SIGBUS on the Pi)
+
+**What happened, measured.** On the real Pi, `scout` reported:
+
+```
+  system    done (534 ms)
+  deps      done (3637 ms)
+  hailo     done (228 ms)
+```
+
+and then the process died with **exit −7 — SIGBUS**. The next section was
+`detector`, which builds the detector ladder and constructs
+`HailoYolo8Detector` (`detector.py:538`).
+
+Two things were wrong, and only one of them was the Pi's:
+
+1. **`pi_field_report` could not survive it.** `try/except` catches exceptions, not
+   signals. A native crash in an optional section killed the whole survey and
+   wrote **no report at all** — the tool whose entire job is to bring information
+   back brought none. Every accelerator step now runs in a child process, so a
+   crash is a *result*: the section reports the signal and keeps going.
+2. **Hailo initialisation on this Pi is failing at a native level.** That is a
+   genuine finding, not a tool bug, and it is the thing to fix next.
+
+### Read this first: the new `hailosteps` line
+
+`scout` now walks Hailo initialisation one step at a time, each in its own child
+process, so the report names the step that died **and captures HailoRT's own error
+text** — which names the cause:
+
+```
+hailosteps : CRASHED at: open the device (hp.VDevice) (3/5 steps ok)
+             died by SIGBUS
+             [HailoRT] [error] CHECK failed - max_desc_page_size given 16384 ...
+```
+
+The five steps are exactly what `HailoYolo8Detector.__init__` does, in order:
+`import hailo_platform` → `Device.scan()` → `HEF(path)` → `VDevice()` → build the
+detector. **The first step that dies is the culprit**; the ones after it still get
+probed.
+
+### The two documented causes on a Pi 5, and their fixes
+
+Both are known Pi 5 + Hailo integration problems. Which one you have is decided by
+the `[HailoRT] [error]` line above, not by guessing.
+
+**(a) PCIe descriptor page size — 16 KB pages vs a 4096-byte device.**
+Pi 5 kernels run 16 KB pages; the Hailo PCIe device advertises a 4096-byte maximum
+descriptor page. The symptom string is explicit:
+
+```
+[HailoRT] [error] CHECK failed - max_desc_page_size given 16384 is bigger than hw max desc page size 4096
+```
+
+Fix ([Hailo community](https://community.hailo.ai/t/hailort-error-check-failed-max-desc-page-size-given-16384-is-bigger-than-hw-max-desc-page-size-4096/3690),
+[official Pi 5 guide](https://github.com/hailo-ai/hailo-rpi5-examples/blob/main/doc/install-raspberry-pi5.md)):
+
+```bash
+echo 'options hailo_pci force_desc_page_size=4096' | sudo tee /etc/modprobe.d/hailo_pci.conf
+cat /etc/modprobe.d/hailo_pci.conf      # must show exactly that one line
+sudo reboot
+```
+
+**(b) Driver and HailoRT version mismatch.** The community reports this constantly
+on Pi 5, and it looks like this:
+
+```
+[HailoRT] [error] CHECK failed - Driver version (4.20.0) is different from library version (4.21.0)
+[HailoRT] [error] Driver version mismatch, status HAILO_INVALID_DRIVER_VERSION(76)
+```
+
+Diagnose with:
+
+```bash
+hailortcli fw-control identify
+apt list --installed 2>/dev/null | grep -Ei 'hailo|hailort'
+dmesg | grep -i hailo | tail -20
+```
+
+Then make the driver and the library **the same version** — either install the
+matching `hailort-pcie-driver` .deb, or move the runtime to match the driver. Do
+not mix.
+
+**(c) A third, community-reported lead:** Hailo on Pi 5 reportedly broke across
+kernel `6.12.20 → 6.12.25`
+([Hailo community](https://community.hailo.ai/t/problems-running-the-hailo-raspi5-examples/14474)).
+`uname -r` and the kernel the working examples were built against are worth
+comparing if (a) and (b) are both clean.
+
+### Quick evidence bundle
+
+```bash
+cd ~/arena_ai_uploads/real_pi/mission_pi
+uname -r
+hailortcli fw-control identify 2>&1 | head -20
+cat /etc/modprobe.d/hailo_pci.conf 2>/dev/null || echo "(no hailo_pci.conf)"
+apt list --installed 2>/dev/null | grep -Ei 'hailo|hailort'
+python3 tools/pi_field_report.py --sec hailo_steps     # names the failing step
+```
+
+`hailo_steps` is read-only and takes a couple of seconds. Or just ask the agent:
+
+```bash
+python3 tools/pi_agent.py --queue "/pi scout"
+```
+
+### Honest status
+
+The crash is **measured**; the cause is **not yet determined**. The two failures
+above are documented Pi 5 problems and are the leading candidates, which is why
+the probe now captures the HailoRT error text that distinguishes them. Until the
+detector builds, **every Hailo number in this repository is unmeasured** and the
+ladder is falling back to CPU — which, per the brief, must be visible rather than
+silent. `IS_HAILO=false` in the report is that visibility.

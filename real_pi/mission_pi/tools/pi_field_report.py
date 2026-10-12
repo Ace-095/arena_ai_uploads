@@ -38,6 +38,7 @@ import math
 import os
 import platform
 import re
+import signal
 import socket
 import subprocess
 import sys
@@ -51,6 +52,58 @@ sys.path.insert(0, PI)
 OK = "[ok]"
 NO = "[--]"
 WARN = "[!!]"
+
+
+def _child(code, timeout=120, cwd=None):
+    """Run python in a CHILD process; a native crash must not take this one down.
+
+    try/except catches exceptions. It does not catch SIGNALS, and a native
+    library can die by signal. Measured on the real Pi: HailoYolo8Detector()
+    died with SIGBUS inside the detector section, which killed the entire
+    survey and wrote NO report at all - the worst possible outcome for a tool
+    whose only job is to bring information back from a machine nobody can log
+    into. Everything that loads a native accelerator therefore runs out here,
+    where a crash is a result instead of an ending.
+
+    Returns dict(rc, signal, stdout, stderr, timed_out).
+    """
+    prelude = "import sys; sys.path[:0] = [%r, %r]\n" % (PI, HERE)
+    try:
+        pr = subprocess.run([sys.executable, "-c", prelude + code],
+                            cwd=cwd or PI, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, timeout=timeout)
+        rc, sig = pr.returncode, None
+        if rc is not None and rc < 0:
+            try:
+                sig = signal.Signals(-rc).name
+            except Exception:
+                sig = "signal %d" % -rc
+        return {"rc": rc, "signal": sig,
+                "stdout": pr.stdout.decode("utf-8", "replace"),
+                "stderr": pr.stderr.decode("utf-8", "replace"),
+                "timed_out": False}
+    except subprocess.TimeoutExpired:
+        return {"rc": None, "signal": None, "stdout": "", "stderr": "",
+                "timed_out": True}
+    except Exception as e:
+        return {"rc": None, "signal": None, "stdout": "",
+                "stderr": "%s: %s" % (type(e).__name__, e), "timed_out": False}
+
+
+def _hailort_errors(text, limit=6):
+    """The lines that actually name the cause. HailoRT writes them to stderr
+    in the form `[HailoRT] [error] CHECK failed - ...`, and they are the whole
+    diagnosis: page size, driver version, firmware version."""
+    out = []
+    for line in (text or "").splitlines():
+        low = line.lower()
+        if "[hailort]" in low or "error" in low or "failed" in low:
+            line = line.strip()
+            if line and line not in out:
+                out.append(line)
+        if len(out) >= limit:
+            break
+    return out
 
 
 def _run(cmd, timeout=120, cwd=None):
@@ -222,22 +275,137 @@ def sec_hailo(args):
 
 
 def sec_detector(args):
-    """Which rung of the ladder get_detector() lands on, and why."""
-    out = {}
-    cfg = _cfg(args.config)
-    try:
-        import detector as D
-        det = D.get_detector(cfg.get("detector", {}) or {})
-        out["chosen"] = getattr(det, "name", type(det).__name__)
-        out["is_hailo"] = "hailo" in str(out["chosen"]).lower()
-        for attr in ("input_size", "tile_bottom", "tile_front", "conf", "conf_thr"):
-            if hasattr(det, attr):
-                out[attr] = getattr(det, attr)
-    except Exception as e:
-        out["error"] = "%s: %s" % (type(e).__name__, e)
+    """Which rung of the ladder get_detector() lands on, and why.
+
+    Runs in a CHILD process. This is not tidiness - on the real Pi the in-process
+    version died with SIGBUS while constructing the Hailo detector, and since a
+    signal cannot be caught it took the whole survey with it and no report was
+    ever written. A detector that cannot be built is now a reported result.
+    """
+    out = {"probe": "child process (a native crash in Hailo/ONNX must not kill "
+                    "the survey)"}
+    code = """
+import json, os
+cfg = __import__("yaml").safe_load(open(%r)) or {}
+import detector as D
+det = D.get_detector(cfg.get("detector", {}) or {})
+info = {"chosen": getattr(det, "name", type(det).__name__)}
+info["is_hailo"] = "hailo" in str(info["chosen"]).lower()
+for attr in ("input_size", "tile_bottom", "tile_front", "conf", "conf_thr"):
+    if hasattr(det, attr):
+        info[attr] = getattr(det, attr)
+print("PIJSON" + json.dumps(info))
+""" % os.path.abspath(args.config)
+    res = _child(code, timeout=180)
+    if res["signal"]:
+        out["crashed"] = True
+        out["signal"] = res["signal"]
+        out["error"] = ("the detector ladder died by %s. A native accelerator "
+                        "killed the process; see hailo_steps for the step and "
+                        "the HailoRT message" % res["signal"])
+        out["hailort_errors"] = _hailort_errors(res["stderr"])
+        out["stderr_tail"] = res["stderr"][-1200:]
+    elif res["timed_out"]:
+        out["crashed"] = True
+        out["error"] = "timed out after 180s"
+    else:
+        marker = [l for l in res["stdout"].splitlines() if l.startswith("PIJSON")]
+        if marker:
+            try:
+                out.update(json.loads(marker[-1][len("PIJSON"):]))
+            except Exception as e:
+                out["error"] = "could not parse the child's result: %s" % e
+        else:
+            out["error"] = "no result from the child (rc=%s)" % res["rc"]
+        if res["rc"] not in (0, None) and "error" not in out:
+            out["rc"] = res["rc"]
+        if res["stderr"]:
+            errs = _hailort_errors(res["stderr"])
+            if errs:
+                out["stderr_warnings"] = errs
     out["ladder_note"] = ("get_detector picks HEF -> ONNX -> .pt -> classical; "
                           "a name without 'hailo' means the accelerator was NOT "
                           "used, which is a result in itself")
+    return out
+
+
+def sec_hailo_steps(args):
+    """Walk Hailo initialisation one step at a time, each in its own child.
+
+    Written after the detector section took the whole survey down with SIGBUS:
+    knowing only "it crashed" is not actionable. These are the exact steps
+    HailoYolo8Detector.__init__ performs, in order, so the answer is a specific
+    step name plus HailoRT's own error text - which names the cause (page size,
+    driver version, firmware) and therefore the fix.
+    """
+    cfg = _cfg(args.config)
+    hef = ((cfg.get("detector") or {}).get("hef_path") or "")
+    hef_abs = os.path.join(PI, hef) if hef and not os.path.isabs(hef) else hef
+    steps = [
+        ("import hailo_platform",
+         'import hailo_platform as hp; print("version:", '
+         'getattr(hp, "__version__", "?"))'),
+        ("hailo_platform.Device.scan()",
+         'import hailo_platform as hp; print("devices:", '
+         '[str(d) for d in hp.Device.scan()])'),
+        ("load the HEF file (hp.HEF)",
+         'import hailo_platform as hp; hef = hp.HEF(%r); print("HEF ok:", '
+         'type(hef).__name__)' % hef_abs),
+        ("open the device (hp.VDevice)",
+         'import hailo_platform as hp; v = hp.VDevice(); print("VDevice ok")'),
+        ("build the detector the ladder would build",
+         'import json, os, yaml, detector as D;'
+         ' cfg = yaml.safe_load(open(%r)) or {};'
+         ' det = D.get_detector(cfg.get("detector", {}) or {});'
+         ' print("chosen:", getattr(det, "name", type(det).__name__))'
+         % os.path.abspath(args.config)),
+    ]
+    out = {"steps": [], "hef_path": hef_abs or None,
+           "why": "each step runs alone in a child process, so the first "
+                  "CRASHED step is the culprit and the rest still get probed",
+           "caveat": "5 processes open the device one after another; that is "
+                     "safe but it is not a test of running them together"}
+    if not hef_abs or not os.path.exists(hef_abs):
+        out["note"] = ("no HEF at %r - the ladder cannot choose Hailo at all. "
+                       "Compile one (training/compile_hef.md) before reading "
+                       "anything else here" % (hef or "detector.hef_path"))
+    for name, code in steps:
+        r = _child(code, timeout=90)
+        rec = {"step": name}
+        if r["timed_out"]:
+            rec["timed_out"] = True
+        elif r["signal"]:
+            rec["signal"] = r["signal"]
+            rec["hailort_errors"] = _hailort_errors(r["stderr"])
+            rec["stderr_tail"] = r["stderr"][-600:]
+        elif r["rc"] == 0:
+            rec["ok"] = True
+            rec["stdout"] = r["stdout"].strip()[-300:]
+            errs = _hailort_errors(r["stderr"])
+            if errs:
+                rec["warnings"] = errs          # warnings can precede a crash
+        else:
+            rec["rc"] = r["rc"]
+            rec["error"] = (r["stderr"] or r["stdout"]).strip().splitlines()[-1:] 
+            rec["error"] = rec["error"][0] if rec["error"] else "failed"
+            errs = _hailort_errors(r["stderr"])
+            if errs:
+                rec["hailort_errors"] = errs
+        out["steps"].append(rec)
+    # Three outcomes, not two. The first version only looked for signals, so a
+    # machine with NO hailo_platform at all reported "all 5 init steps
+    # completed" while four of them had failed - the same "verdict that does not
+    # match reality" mistake this branch keeps having to fix.
+    crashed = [r["step"] for r in out["steps"] if r.get("signal")]
+    failed = [r["step"] for r in out["steps"] if not r.get("ok")]
+    out["first_crash"] = crashed[0] if crashed else None
+    out["first_failure"] = failed[0] if failed else None
+    if crashed:
+        out["verdict"] = "CRASHED at: %s" % crashed[0]
+    elif failed:
+        out["verdict"] = "FAILED at: %s" % failed[0]
+    else:
+        out["verdict"] = "ok - every step completed"
     return out
 
 
@@ -641,12 +809,17 @@ def sec_tests(args):
 
 
 SECTIONS = (("system", sec_system), ("deps", sec_deps), ("hailo", sec_hailo),
+            ("hailo_steps", sec_hailo_steps),
             ("detector", sec_detector), ("cameras", sec_cameras),
             ("fov", sec_fov), ("decode", sec_decode),
             ("inference", sec_inference), ("fc", sec_fc), ("tests", sec_tests))
 
 
 def build(args):
+    try:
+        os.makedirs(args.out_dir, exist_ok=True)
+    except Exception:
+        args.out_dir = "."
     wanted = None if args.sec == "all" else {args.sec}
     report = {"tool": "pi_field_report", "ts": time.time(),
               "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -701,12 +874,46 @@ def summarise(r):
         L.append("hailo      : platform=%s | devices=%s | hef=%s onnx=%s"
                  % (h.get("hailo_platform"), h.get("hailo_devices"),
                     h.get("hef_present"), h.get("onnx_present")))
+    hs = s.get("hailo_steps") or {}
+    if hs:
+        n_ok = sum(1 for r in (hs.get("steps") or []) if r.get("ok"))
+        n_all = len(hs.get("steps") or [])
+        if hs.get("first_crash"):
+            L.append("hailosteps : CRASHED at: %s (%d/%d steps ok)"
+                     % (hs["first_crash"], n_ok, n_all))
+            for st in hs.get("steps") or []:
+                if st.get("signal"):
+                    L.append("             died by %s" % st["signal"])
+                    for line in (st.get("hailort_errors") or [])[:4]:
+                        L.append("             %s" % line)
+        elif hs.get("first_failure"):
+            L.append("hailosteps : FAILED at: %s (%d/%d steps ok)"
+                     % (hs["first_failure"], n_ok, n_all))
+            for st in (hs.get("steps") or []):
+                if not st.get("ok"):
+                    seen = []
+                    for line in ([st.get("error") or st.get("signal") or "failed"]
+                                 + list(st.get("hailort_errors") or [])[:3]):
+                        if line and line not in seen:
+                            seen.append(line)
+                            L.append("             %s" % line)
+                    break
+        else:
+            L.append("hailosteps : all %d init steps completed" % n_all)
+        if hs.get("note"):
+            L.append("             %s" % hs["note"])
     d = s.get("detector") or {}
     if d:
-        L.append("detector   : chosen=%s | IS_HAILO=%s"
-                 % (d.get("chosen"), d.get("is_hailo")))
-        if d.get("error"):
-            L.append("             error: %s" % d["error"])
+        if d.get("crashed"):
+            L.append("detector   : CRASHED by %s - the ladder could not be built"
+                     % d.get("signal"))
+            for line in (d.get("hailort_errors") or [])[:4]:
+                L.append("             %s" % line)
+        else:
+            L.append("detector   : chosen=%s | IS_HAILO=%s"
+                     % (d.get("chosen"), d.get("is_hailo")))
+            if d.get("error"):
+                L.append("             error: %s" % d["error"])
     c = s.get("cameras") or {}
     if c:
         L.append("cameras    : /dev/%s" % (", ".join(c.get("dev_video") or [])
@@ -792,7 +999,12 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=os.path.join(PI, "config.yaml"))
-    ap.add_argument("--out-dir", default=".")
+    # NOT the current directory. Reports used to land in mission_pi/ and two of
+    # them were swept into a commit - the tool must not leave artefacts in the
+    # repository it is inspecting, and `git status` on the Pi should stay clean.
+    ap.add_argument("--out-dir", default=os.path.expanduser("~/pi_field_reports"),
+                    help="where to write the JSON and the FOV frame "
+                         "(default %(default)s)")
     ap.add_argument("--role", default="bottom", choices=("bottom", "front"))
     ap.add_argument("--samples", type=int, default=5)
     ap.add_argument("--infer-frames", type=int, default=5)

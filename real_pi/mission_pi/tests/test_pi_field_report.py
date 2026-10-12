@@ -21,6 +21,7 @@ return an explanation instead of raising.
 """
 import importlib.util
 import inspect
+import signal
 import json
 import math
 import os
@@ -51,6 +52,22 @@ def _load():
 
 
 F = _load()
+
+
+def make_args(**kw):
+    """A complete argument namespace for build()/sections."""
+    class A(object):
+        pass
+    a = A()
+    defaults = dict(config=os.path.join(_PI, "config.yaml"), out_dir="/tmp",
+                    role="bottom", samples=2, infer_frames=2, dist_m=0.0,
+                    panel_mm=0.0, panel_mm_h=0.0, qr_modules=0, no_capture=True,
+                    no_decode=False, no_infer=False, with_fc=False,
+                    fc_device=None, with_tests=False, sec="all", json=None)
+    defaults.update(kw)
+    for k, v in defaults.items():
+        setattr(a, k, v)
+    return a
 
 
 def frame_with_sheet(fw, fh, sw, sh, ground=60, sheet=240, noise=4, seed=3):
@@ -234,6 +251,143 @@ class TestSectionsDegradeGracefully(unittest.TestCase):
         self.assertAlmostEqual(got["hfov_deg"], 75.0, delta=1.5)
         self.assertIn("aspect_check", got)
         F.FRAMES.by_role.clear()
+
+
+class TestANativeCrashIsContained(unittest.TestCase):
+    """The bug that killed the whole survey on the real Pi.
+
+    HailoYolo8Detector() died with SIGBUS (exit -7) inside the detector section.
+    A signal is not an exception, so try/except caught nothing, the survey aborted
+    after three of ten sections, and NO report was written - the tool whose only
+    job is to bring information back brought none. Anything that loads a native
+    accelerator now runs in a child process.
+    """
+
+    def test_a_child_signal_is_reported_not_fatal(self):
+        for sig, want in ((signal.SIGBUS, "SIGBUS"), (signal.SIGSEGV, "SIGSEGV"),
+                          (signal.SIGKILL, "SIGKILL")):
+            with self.subTest(signal=want):
+                r = F._child("import os, signal; os.kill(os.getpid(), %d)" % sig)
+                self.assertEqual(r["signal"], want)
+                self.assertLess(r["rc"], 0)
+
+    def test_output_before_a_crash_is_kept(self):
+        r = F._child('import os, signal\n'
+                     'print("i got this far", flush=True)\n'
+                     'os.kill(os.getpid(), signal.SIGBUS)')
+        self.assertIn("i got this far", r["stdout"])
+        self.assertEqual(r["signal"], "SIGBUS")
+
+    def test_a_child_that_exits_normally_has_no_signal(self):
+        r = F._child('print("fine")')
+        self.assertIsNone(r["signal"])
+        self.assertEqual(r["rc"], 0)
+        self.assertIn("fine", r["stdout"])
+
+    def test_hailort_error_lines_are_extracted(self):
+        err = ("[HailoRT] [warning] benign\n"
+               "[HailoRT] [error] CHECK failed - max_desc_page_size given 16384 "
+               "is bigger than hw max desc page size 4096\n"
+               "noise here\n")
+        got = F._hailort_errors(err)
+        self.assertTrue(any("max_desc_page_size" in l for l in got))
+
+    def test_the_survey_completes_even_when_a_section_crashes(self):
+        """The regression, end to end: one section's child dies by SIGBUS and the
+        report still contains every section."""
+        real_child = F._child
+
+        def crashing(code, timeout=120, cwd=None):
+            if "PIJSON" in code:                 # the detector section
+                return {"rc": -7, "signal": "SIGBUS", "stdout": "",
+                        "stderr": "[HailoRT] [error] CHECK failed - boom",
+                        "timed_out": False}
+            return real_child(code, timeout=timeout, cwd=cwd)
+        F._child = crashing
+        try:
+            rep = F.build(make_args(sec="all"))
+        finally:
+            F._child = real_child
+        self.assertIn("detector", rep["sections"])
+        self.assertTrue(rep["sections"]["detector"]["crashed"])
+        self.assertEqual(rep["sections"]["detector"]["signal"], "SIGBUS")
+        for name, _fn in F.SECTIONS:
+            self.assertIn(name, rep["sections"],
+                          "a crashed section lost the sections after it")
+        text = F.summarise(rep)
+        self.assertIn("CRASHED by SIGBUS", text)
+        self.assertIn("CHECK failed - boom", text)
+
+
+class TestHailoSteps(unittest.TestCase):
+    def _with_child(self, results):
+        """results: list of dicts, one per probe step, in order."""
+        seq = list(results)
+
+        def fake(code, timeout=120, cwd=None):
+            return seq.pop(0) if seq else {"rc": 0, "signal": None,
+                                           "stdout": "", "stderr": "",
+                                           "timed_out": False}
+        real, F._child = F._child, fake
+        try:
+            return F.sec_hailo_steps(make_args())
+        finally:
+            F._child = real
+
+    @staticmethod
+    def ok(out="fine"):
+        return {"rc": 0, "signal": None, "stdout": out, "stderr": "",
+                "timed_out": False}
+
+    @staticmethod
+    def crasher(err="[HailoRT] [error] CHECK failed - page size"):
+        return {"rc": -7, "signal": "SIGBUS", "stdout": "", "stderr": err,
+                "timed_out": False}
+
+    @staticmethod
+    def failing(err="ModuleNotFoundError: No module named 'hailo_platform'"):
+        return {"rc": 1, "signal": None, "stdout": "", "stderr": err,
+                "timed_out": False}
+
+    def test_all_ok(self):
+        got = self._with_child([self.ok()] * 5)
+        self.assertEqual(got["verdict"], "ok - every step completed")
+        self.assertIsNone(got["first_crash"])
+        self.assertIsNone(got["first_failure"])
+
+    def test_a_crash_names_the_step_and_keeps_probing(self):
+        got = self._with_child([self.ok(), self.ok(), self.ok(),
+                                self.crasher(), self.ok()])
+        self.assertEqual(got["first_crash"], "open the device (hp.VDevice)")
+        self.assertIn("CRASHED", got["verdict"])
+        self.assertEqual(len(got["steps"]), 5,
+                         "probing stopped at the crash instead of continuing")
+        bad = [s for s in got["steps"] if s.get("signal")][0]
+        self.assertTrue(any("page size" in l for l in bad["hailort_errors"]),
+                        "HailoRT's own error text was not captured")
+
+    def test_a_plain_failure_is_not_reported_as_a_crash(self):
+        """The verdict bug: a machine with no hailo_platform reported 'all 5
+        steps completed' while four had failed."""
+        got = self._with_child([self.failing()] * 4 + [self.ok()])
+        self.assertEqual(got["verdict"], "FAILED at: import hailo_platform")
+        self.assertIsNone(got["first_crash"])
+        self.assertEqual(got["first_failure"], "import hailo_platform")
+
+    def test_a_missing_hef_is_called_out(self):
+        got = self._with_child([self.ok()] * 5)
+        self.assertIn("hef_path", got)
+        if not (got["hef_path"] and os.path.exists(got["hef_path"])):
+            self.assertIn("no HEF", got.get("note", ""))
+
+    def test_a_timed_out_step_is_reported_as_a_failure_not_a_crash(self):
+        """A wedged device is not the same as a segfaulting one, and the report
+        should not conflate them."""
+        got = self._with_child([{"rc": None, "signal": None, "stdout": "",
+                                 "stderr": "", "timed_out": True}] * 5)
+        self.assertEqual(got["first_failure"], "import hailo_platform")
+        self.assertIsNone(got["first_crash"])
+        self.assertIn("FAILED", got["verdict"])
 
 
 class TestReportShape(unittest.TestCase):
