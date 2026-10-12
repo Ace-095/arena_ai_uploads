@@ -164,10 +164,24 @@ def test_tuning_file_can_be_a_repo_path(tmp_path="/tmp"):
                          autofocus=False, tuning_file="/nope/missing.json")
         check("a missing path degrades to None (no raise)",
               c2._load_tuning() is None)
+        # a name that exists NOWHERE - not "imx477_af.json", because the repo
+        # now SHIPS that file and a fixture that leans on its absence breaks the
+        # moment the missing file arrives (it did)
         c3 = REAL_CAMERA("cam2", 0, (2028, 1520), 75.0, "bottom",
-                         autofocus=False, tuning_file="imx477_af.json")
+                         autofocus=False,
+                         tuning_file="no_such_tuning_xyz.json")
         check("a bare name still goes through Picamera2.load_tuning_file "
               "and degrades here", c3._load_tuning() is None)
+        # and the file the repo DOES ship now resolves for a bare name - the
+        # whole point of shipping it: the UC-517's AF needs no sudo
+        c4 = REAL_CAMERA("cam2", 0, (2028, 1520), 75.0, "bottom",
+                         autofocus=False, tuning_file="imx477_af.json")
+        t4 = c4._load_tuning()
+        algos = [list(a)[0] for a in ((t4 or {}).get("algorithms") or []) if a]
+        check("the shipped imx477_af.json resolves for a bare name and "
+              "carries rpi.af", isinstance(t4, dict) and
+              any(a.endswith(".af") for a in algos),
+              "algos=%r" % (algos[:5],))
 
 
 if __name__ == "__main__":

@@ -340,8 +340,9 @@ def print_file_checks():
               "(%s)" % ", ".join(IPA_TUNING_DIRS))
     # a tuning file we ship ourselves is searched next to the config, in
     # models/, by path — no sudo, survives OS updates
-    for cand in (os.path.join(HERE, "imx477_af.json"),
-                 os.path.join(HERE, "models", "imx477_af.json")):
+    parent = os.path.dirname(HERE)
+    for cand in (os.path.join(parent, "imx477_af.json"),
+                 os.path.join(parent, "models", "imx477_af.json")):
         if os.path.isfile(cand):
             print("  repo-local %s -> used before libcamera's own copy"
                   % cand)

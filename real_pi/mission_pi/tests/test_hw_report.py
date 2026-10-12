@@ -217,6 +217,25 @@ def test_file_checks_report_the_af_algorithm_not_just_the_filename():
               "vc4/imx477.json" not in out, out)
 
 
+def test_the_repo_local_af_tuning_is_reported_where_the_stack_reads_it():
+    """A shipped tuning file is the no-sudo fix for the UC-517's dead autofocus
+    - but only if this report can SEE it. The check looked in tools/ and
+    tools/models/ while cameras._load_tuning reads mission_pi/ and
+    mission_pi/models/, so a perfectly good copy in the right place printed
+    nothing here."""
+    cand = os.path.join(PI, "models", "imx477_af.json")
+    check("the shipped AF tuning is present at %s" % cand,
+          os.path.isfile(cand))
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        list_cams.print_file_checks()
+    out = buf.getvalue()
+    check("the report names it as the copy the stack will use",
+          ("repo-local %s" % cand) in out, out)
+    check("and claims no tools/-relative path the stack never reads",
+          os.path.join("tools", "models", "imx477_af.json") not in out, out)
+
+
 def _vcm_dtbo(tmpdir, with_vcm=True):
     """A fake dtbo: parameter names are plain strings in the blob."""
     p = os.path.join(tmpdir, "imx477.dtbo")
@@ -415,6 +434,7 @@ if __name__ == "__main__":
     test_verdict_detects_the_stock_overlay_without_vcm()
     test_verdict_when_dtoverlay_h_and_the_file_disagree()
     test_file_checks_report_the_af_algorithm_not_just_the_filename()
+    test_the_repo_local_af_tuning_is_reported_where_the_stack_reads_it()
     test_verdict_handles_missing_dtbo_and_other_cameras()
     test_vcm_scan_is_honest_about_unreadable_files()
     test_boot_report_returns_a_dict_without_a_pi()
