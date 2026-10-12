@@ -570,10 +570,14 @@ crash is in the code that runs *after* `VDevice()` — the configure/streams pat
 
 **Two other things this report says, both of which matter:**
 
-* `deps: missing: onnx` — the ONNX runtime is not installed in
-  `/home/ace/real_pi/.venv`. So the ladder's second rung cannot load either: with
-  Hailo crashing and ONNX missing, the detector is falling through to the `.pt` or
-  classical rung. Install `onnxruntime` before judging any CPU-vs-Hailo number.
+* `deps: missing: onnx` — read carefully, because the obvious reading is wrong.
+  That line lists **only the modules that failed to import**, and the ladder
+  imports `onnxruntime` before it imports `onnx`. `onnxruntime` is therefore
+  **present** and the detector's ONNX rung **can** load; what is missing is `onnx`,
+  the model-conversion/IR library, which inference does not use. An earlier
+  version of this section said the ONNX runtime was missing and that the second
+  rung could not load — that was a misreading of this same line, corrected here.
+  `pip install onnx` only if conversion or inspection tooling is wanted.
 * 26 `/dev/video*` nodes. That is the Pi 5's own codec/ISP devices, not cameras;
   identifying which is the UC-517 needs a capture run (`--no-capture` was used
   here). Expect one real camera among the noise.
