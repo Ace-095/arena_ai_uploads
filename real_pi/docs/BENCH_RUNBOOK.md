@@ -594,6 +594,22 @@ hailosteps : CRASHED at: build the detector the ladder would build (4/5 steps ok
              died by SIGSEGV
 ```
 
+A step's `ok` is "that child exited 0", and exactly one step can exit 0 without
+Hailo working: the last one, which builds the whole detector and **falls back** to
+ONNX or classical when Hailo is dead. A run of this on a machine with no
+`hailo_platform` at all printed `(1/13 steps ok)`, which reads like progress and is
+the opposite — the brief forbids a silent CPU fallback being read as success. So
+the count is now `(n/12 Hailo steps ok)` — the constructor step is not in the
+denominator — and when that last step exits 0 anyway the report says so on its own
+line and names what it fell back to:
+
+```
+hailosteps : FAILED at: 1. import hailo_platform (0/12 Hailo steps ok)
+             ModuleNotFoundError: No module named 'hailo_platform'
+             the constructor step exited 0 anyway - it did not use Hailo, it
+             fell back to: chosen: yolo_onnx
+```
+
 The ladder is now thirteen steps, and they are exactly what
 `HailoYolo8Detector.__init__` does, in order: `import hailo_platform` →
 `Device.scan()` → `HEF(path)` → `VDevice()` → **`hailo_configure_params(hef, hp)`,

@@ -467,6 +467,8 @@ if cp is not None:
         out["note"] = ("no HEF at %r - the ladder cannot choose Hailo at all. "
                        "Compile one (training/compile_hef.md) before reading "
                        "anything else here" % (hef or "detector.hef_path"))
+    ctor_name = steps[-1][0] if steps else None   # the whole constructor
+    out["ctor_step"] = ctor_name
     for name, code in steps:
         r = _child(code, timeout=90)
         rec = {"step": name}
@@ -974,18 +976,37 @@ def summarise(r):
                     h.get("hef_present"), h.get("onnx_present")))
     hs = s.get("hailo_steps") or {}
     if hs:
-        n_ok = sum(1 for r in (hs.get("steps") or []) if r.get("ok"))
-        n_all = len(hs.get("steps") or [])
+        _steps = hs.get("steps") or []
+        # The last step is the WHOLE CONSTRUCTOR, and it can exit 0 by falling
+        # back to an ONNX or classical detector. Counting that with the Hailo
+        # steps made a machine with no working Hailo print "(1/13 steps ok)" -
+        # which reads like progress and is the opposite of it. The brief forbids
+        # a silent CPU fallback being presented as success, so the denominator is
+        # the Hailo steps alone, and the constructor's fallback gets its own line.
+        _ctor = hs.get("ctor_step")
+        _halo = [r for r in _steps if r.get("step") != _ctor]
+        _ctor_rec = [r for r in _steps if r.get("step") == _ctor]
+        _ctor_rec = _ctor_rec[0] if _ctor_rec else {}
+        n_ok = sum(1 for r in _halo if r.get("ok"))
+        n_all = len(_halo)
+
+        def _fell_back():
+            if _ctor_rec.get("ok"):
+                L.append("             the constructor step exited 0 anyway - it "
+                         "did not use Hailo, it fell back to: %s"
+                         % (_ctor_rec.get("stdout") or "an unnamed detector"))
+
         if hs.get("first_crash"):
-            L.append("hailosteps : CRASHED at: %s (%d/%d steps ok)"
+            L.append("hailosteps : CRASHED at: %s (%d/%d Hailo steps ok)"
                      % (hs["first_crash"], n_ok, n_all))
             for st in hs.get("steps") or []:
                 if st.get("signal"):
                     L.append("             died by %s" % st["signal"])
                     for line in (st.get("hailort_errors") or [])[:4]:
                         L.append("             %s" % line)
+            _fell_back()
         elif hs.get("first_failure"):
-            L.append("hailosteps : FAILED at: %s (%d/%d steps ok)"
+            L.append("hailosteps : FAILED at: %s (%d/%d Hailo steps ok)"
                      % (hs["first_failure"], n_ok, n_all))
             for st in (hs.get("steps") or []):
                 if not st.get("ok"):
@@ -996,8 +1017,10 @@ def summarise(r):
                             seen.append(line)
                             L.append("             %s" % line)
                     break
+            _fell_back()
         else:
-            L.append("hailosteps : all %d init steps completed" % n_all)
+            L.append("hailosteps : all %d init steps completed"
+                     % len(_steps))
         if hs.get("note"):
             L.append("             %s" % hs["note"])
     d = s.get("detector") or {}

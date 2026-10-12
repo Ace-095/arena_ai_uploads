@@ -54,6 +54,11 @@ def _load():
 F = _load()
 
 
+# The ladder's last step builds the whole detector, which is the only step that
+# can exit 0 without Hailo.
+CTOR = "12. the whole constructor, as the ladder builds it"
+
+
 def make_args(**kw):
     """A complete argument namespace for build()/sections."""
     class A(object):
@@ -380,6 +385,59 @@ class TestHailoSteps(unittest.TestCase):
                     self.assertIn(api, code,
                                   "%r is named in the label %r but is not in "
                                   "that step's program" % (api, label))
+
+    def test_a_fallback_constructor_is_not_counted_as_a_hailo_step(self):
+        """The one step that can "succeed" without Hailo is the last one.
+
+        It builds the whole detector, which falls back to ONNX or classical when
+        Hailo is dead. Counting it with the Hailo steps made a rig with NO
+        working Hailo print "(1/13 steps ok)" - which reads like progress, and the
+        brief forbids a silent CPU fallback being presented as success.
+        """
+        # 13 records, like the real ladder: 12 Hailo steps then the constructor
+        rep = {"sections": {"hailo_steps": {
+            "ctor_step": CTOR,
+            "first_crash": None, "first_failure": "1. import hailo_platform",
+            "steps": ([{"step": "1. import hailo_platform", "rc": 1,
+                        "error": "ModuleNotFoundError: No module named "
+                                 "'hailo_platform'"}]
+                      + [{"step": "%d. later" % i, "rc": 1}
+                         for i in range(2, 13)]
+                      + [{"step": CTOR, "ok": True,
+                          "stdout": "chosen: yolo_onnx"}])}}}
+        text = F.summarise(rep)
+        self.assertIn("FAILED at: 1. import hailo_platform", text)
+        self.assertIn("(0/12 Hailo steps ok)", text)
+        self.assertNotIn("/13 steps ok", text)
+        self.assertIn("fell back to: chosen: yolo_onnx", text)
+        self.assertIn("did not use Hailo", text)
+
+    def test_no_fallback_line_when_the_constructor_did_use_hailo(self):
+        # cumulative ladder: step 6 crashes and every step after it dies too
+        rep = {"sections": {"hailo_steps": {
+            "ctor_step": CTOR,
+            "first_crash": "6. vdev.configure(hef, cfg)", "first_failure": None,
+            "steps": ([{"step": "%d. ok" % i, "ok": True} for i in range(1, 6)]
+                      + [{"step": "6. vdev.configure(hef, cfg)",
+                          "signal": "SIGSEGV",
+                          "hailort_errors": ["[HailoRT] [error] boom"]}]
+                      + [{"step": "%d. later" % i, "signal": "SIGSEGV"}
+                         for i in range(7, 13)]
+                      + [{"step": CTOR, "signal": "SIGSEGV"}])}}}
+        text = F.summarise(rep)
+        self.assertIn("CRASHED at: 6. vdev.configure(hef, cfg)", text)
+        self.assertIn("(5/12 Hailo steps ok)", text)
+        self.assertIn("died by SIGSEGV", text)
+        self.assertNotIn("fell back to", text)
+
+    def test_the_success_line_still_counts_every_step(self):
+        rep = {"sections": {"hailo_steps": {
+            "ctor_step": CTOR,
+            "first_crash": None, "first_failure": None,
+            "steps": ([{"step": "%d. ok" % i, "ok": True} for i in range(1, 13)]
+                      + [{"step": CTOR, "ok": True}])}}}
+        text = F.summarise(rep)
+        self.assertIn("all 13 init steps completed", text)
 
     def test_all_ok(self):
         got = self._with_child([self.ok()] * 13)
