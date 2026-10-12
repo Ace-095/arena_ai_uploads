@@ -213,14 +213,34 @@ class _FakeHPOld(_FakeHP):
             return "old"
 
 
+class _FakeHPBoth(_FakeHPOld):
+    """A runtime where BOTH generations exist - which is the case that decides
+    precedence, and the case the previous version of this test never built."""
+
+
 def test_hailo_configure_params_probe():
-    """The two API generations, and a runtime that has neither (which must
-    come back as a sentence naming hailortcli --version)."""
+    """API generations, precedence, and the failure that must be a sentence.
+
+    PRECEDENCE CHANGED ON MEASURED EVIDENCE. The detector died with SIGSEGV at
+    `vdev.configure(hef, cfg)` on a real Pi (HailoRT 4.23.0). The one way this
+    helper differed from every published Pi 5 example was preferring
+    `hef.create_configure_params` over `ConfigureParams.create_from_hef`. The
+    documented one is now tried first, so this test pins that precedence rather
+    than the old assumption.
+    """
     import hailo_decode as HD
-    check("modern hef.create_configure_params(interface) is preferred",
+    check("the documented create_from_hef wins when both exist",
+          HD.hailo_configure_params(_FakeHefModern(), _FakeHPBoth()) == "old")
+    check("a runtime with ONLY hef.create_configure_params still works",
           HD.hailo_configure_params(_FakeHefModern(), _FakeHP()) == "modern")
-    check("old ConfigureParams.create_from_hef still works",
+    check("a runtime with ONLY ConfigureParams.create_from_hef still works",
           HD.hailo_configure_params(_FakeHefOld(), _FakeHPOld()) == "old")
+    report = []
+    HD.hailo_configure_params(_FakeHefModern(), _FakeHPBoth(), report=report)
+    check("it reports which API generation actually won",
+          report and "create_from_hef" in report[0]["api"], report)
+    check("and the type it returned",
+          report and report[0]["returns"] == "str", report)
     raised = ""
     try:
         HD.hailo_configure_params(_FakeHefOld(), _FakeHP())

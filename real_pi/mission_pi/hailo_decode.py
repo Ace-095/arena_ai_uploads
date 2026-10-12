@@ -95,15 +95,30 @@ def describe_shape(name, shape):
 
 
 
-def hailo_configure_params(hef, hp=None):
+def hailo_configure_params(hef, hp=None, report=None):
     """Build HailoRT configure params across API generations.
 
-    Modern (HailoRT 4.2x): `hef.create_configure_params(StreamInterface.PCIe)`.
-    Older: `ConfigureParams.create_from_hef(hef, interface=HailoStreamInterface.PCIe)`,
-    and older still took the string "PCIe". Newest first, and the last error is
-    reported if nothing works — a version bump must produce a sentence, not a
-    bare TypeError deep inside the mission (which is how the HAT sat idle while
-    the mission happily ran on ONNX).
+    ORDER CHANGED AFTER A MEASURED CRASH — read this before reordering again.
+
+    On the real Pi (HailoRT 4.23.0, AI HAT, Pi 5) the detector died with SIGSEGV
+    at `vdev.configure(hef, cfg)`. The only thing this helper did differently from
+    every published working example is this: it tried
+    `hef.create_configure_params(interface)` FIRST, on the strength of a comment
+    claiming 4.23 dropped the older constructor. A survey of the Hailo community's
+    Raspberry Pi 5 examples — 4.19 through 4.23, including Hailo's own minimal
+    working example and their AI Kit walkthroughs — shows them ALL using
+
+        ConfigureParams.create_from_hef(hef=hef, interface=HailoStreamInterface.PCIe)
+
+    and NONE using `hef.create_configure_params`. Handing `configure()` a params
+    object of the wrong generation is a C++ type confusion, which presents as
+    SIGSEGV rather than a Python exception.
+
+    So the DOCUMENTED constructor is now tried first. This is safe either way: if
+    a future runtime really has dropped it, the call raises and we fall through to
+    the next generation exactly as before. `report` (a list) collects the label of
+    whichever generation won, so a field report can say which API is in play
+    instead of it being invisible.
     """
     if hp is None:
         import hailo_platform as hp
@@ -117,22 +132,34 @@ def hailo_configure_params(hef, hp=None):
         pcie = "PCIe"
 
     tries = []
-    mk = getattr(hef, "create_configure_params", None)
-    if callable(mk):
-        tries.append(lambda: mk(pcie))
     cp = getattr(hp, "ConfigureParams", None)
     if cp is not None:
-        tries.append(lambda: cp.create_from_hef(hef, interface=pcie))
-        tries.append(lambda: cp.create_from_hef(hef, interface="PCIe"))
-        tries.append(lambda: cp.create_from_hef(hef))
+        # The documented path, and the one every working Pi 5 example uses.
+        tries.append(("ConfigureParams.create_from_hef(interface=HailoStreamInterface.PCIe)",
+                      lambda: cp.create_from_hef(hef, interface=pcie)))
+        tries.append(("ConfigureParams.create_from_hef(interface='PCIe')",
+                      lambda: cp.create_from_hef(hef, interface="PCIe")))
+        tries.append(("ConfigureParams.create_from_hef(hef)",
+                      lambda: cp.create_from_hef(hef)))
+    mk = getattr(hef, "create_configure_params", None)
+    if callable(mk):
+        # Kept as a LAST resort, and deliberately not first. Unverified against
+        # any published example, and the prime suspect for the SIGSEGV above.
+        tries.append(("hef.create_configure_params(interface)",
+                      lambda: mk(pcie)))
     last = None
-    for fn in tries:
+    for label, fn in tries:
         try:
-            return fn()
+            got = fn()
         except Exception as e:          # probing APIs is the point here
-            last = e
-    raise RuntimeError("no HailoRT API worked to configure the HEF (%r) — "
-                       "please report `hailortcli --version`" % (last,))
+            last = "%s -> %s: %s" % (label, type(e).__name__, e)
+            continue
+        if report is not None:
+            report.append({"api": label, "returns": type(got).__name__})
+        return got
+    raise RuntimeError("no HailoRT API worked to configure the HEF "
+                       "(tried %d; last: %s) — please report `hailortcli "
+                       "--version`" % (len(tries), last))
 
 
 def hailo_vstream_params(hp, ng, ng_params, use_input, format_type):

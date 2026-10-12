@@ -609,7 +609,34 @@ helper silently falls through to an older constructor whose params object the 4.
 `5b.` prints which generations exist and what each returns, so that stops being a
 guess.
 
-### The two documented causes on a Pi 5, and their fixes
+### THE LEADING CAUSE, and what changed because of it
+
+The crash is at `vdev.configure(hef, cfg)` — the call immediately after
+`_hailo_configure_params()`. Every published Raspberry Pi 5 + Hailo example
+(HailoRT 4.19 through 4.23: Hailo's own minimal working example, the AI Kit
+walkthroughs, the Frigate and UAV projects) builds those params with
+
+```python
+configure_params = ConfigureParams.create_from_hef(
+    hef=hef, interface=HailoStreamInterface.PCIe)
+```
+
+and **none** of them uses `hef.create_configure_params(...)`. This repository
+tried `hef.create_configure_params(...)` **first**, on the strength of a code
+comment claiming 4.23 dropped the older constructor — a claim nothing verified.
+
+Handing `configure()` a params object of the wrong generation is C++ type
+confusion, and type confusion presents as **SIGSEGV rather than a Python
+exception**, which is exactly the observed failure.
+
+**Changed:** the documented constructor is now tried first, and
+`hef.create_configure_params` is kept only as a last resort. This is safe either
+way — if a future runtime really has dropped `create_from_hef`, the call raises
+and the ladder falls through as before. The detector now records which generation
+it used (`configure_api`), and the `5b.` step prints it, so the next run on the Pi
+either fixes the crash or says plainly that this was not the cause.
+
+### The two other documented causes on a Pi 5, and their fixes
 
 Both are known Pi 5 + Hailo integration problems. Which one you have is decided by
 the `[HailoRT] [error]` line above, not by guessing.

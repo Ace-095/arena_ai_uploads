@@ -291,7 +291,8 @@ import detector as D
 det = D.get_detector(cfg.get("detector", {}) or {})
 info = {"chosen": getattr(det, "name", type(det).__name__)}
 info["is_hailo"] = "hailo" in str(info["chosen"]).lower()
-for attr in ("input_size", "tile_bottom", "tile_front", "conf", "conf_thr"):
+for attr in ("input_size", "tile_bottom", "tile_front", "conf", "conf_thr",
+             "configure_api"):
     if hasattr(det, attr):
         info[attr] = getattr(det, attr)
 print("PIJSON" + json.dumps(info))
@@ -402,6 +403,16 @@ if cp is not None:
             print("  %s -> ok: %s" % (label, type(fn()).__name__))
         except Exception as e:
             print("  %s -> RAISED: %s: %s" % (label, type(e).__name__, e))
+# ...and which generation the REAL helper actually picks, which is what the
+# detector will use. This is the line that decides whether the SIGSEGV is a
+# params-generation problem or something else.
+try:
+    rep = []
+    hailo_configure_params(hef, hp, report=rep)
+    print("the helper picks:", rep[0]["api"] if rep else "nothing?")
+    print("  and it returned a:", rep[0]["returns"] if rep else "?")
+except Exception as e:
+    print("the helper raised: %s: %s" % (type(e).__name__, e))
 """),
         ("6. vdev.configure(hef, cfg)",
          pre + 'cfg = hailo_configure_params(hef, hp)\n'
