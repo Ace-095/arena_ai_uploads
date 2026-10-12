@@ -557,7 +557,22 @@ git stash pop
 
 ### Step 1 — prove the new code is actually there
 
-Never trust a pull that reported success; check for the strings themselves.
+**This is the step that went wrong the first time.** The command ran fine and
+produced a plausible-looking report — of the *old* code, because the pull had not
+happened. The output gave no sign of it: nothing in a report said which commit
+produced it, and the only clue was that the step names looked familiar. Reports now
+carry their own commit:
+
+```
+=== PI FIELD REPORT 2026-10-13T00:45:33Z (addc001) ===
+code       : 5a6c1a2 on arena/1c4bb365-arena-ai-uploads
+hailosteps : CRASHED at: ...
+```
+
+If that `code :` line is missing or shows anything other than the commit named in
+the conversation, **the run is testing the wrong code and its result means
+nothing.** Never trust a pull that reported success; check for the strings
+themselves.
 
 ```
 cd ~/arena_ai_uploads/real_pi/mission_pi

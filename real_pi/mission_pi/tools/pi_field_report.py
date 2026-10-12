@@ -915,6 +915,32 @@ SECTIONS = (("system", sec_system), ("deps", sec_deps), ("hailo", sec_hailo),
             ("inference", sec_inference), ("fc", sec_fc), ("tests", sec_tests))
 
 
+def code_stamp(repo=None):
+    """Which commit produced this report - so a stale checkout cannot hide.
+
+    The Pi ran this tool for a full round against a checkout one commit behind,
+    and the only clue was that the output looked old. Every downstream conclusion
+    depended on recognising a step label from memory. A report that does not name
+    its own code is ambiguous; this removes the ambiguity. Returns None when git
+    is unavailable - it must never be the reason a survey fails.
+    """
+    repo = repo or os.path.dirname(os.path.abspath(os.path.join(HERE, os.pardir)))
+    try:
+        def _git(*a):
+            r = subprocess.run(["git", "-C", repo] + list(a), capture_output=True,
+                               timeout=10)
+            return r.stdout.decode("utf-8", "replace").strip() if r.returncode == 0 \
+                else None
+        commit = _git("rev-parse", "--short", "HEAD")
+        if not commit:
+            return None
+        return {"commit": commit,
+                "branch": _git("rev-parse", "--abbrev-ref", "HEAD"),
+                "dirty": bool(_git("status", "--porcelain"))}
+    except Exception:
+        return None
+
+
 def build(args):
     try:
         os.makedirs(args.out_dir, exist_ok=True)
@@ -924,6 +950,7 @@ def build(args):
     report = {"tool": "pi_field_report", "ts": time.time(),
               "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
               "config": os.path.abspath(args.config),
+              "code": code_stamp(),
               "read_only": True, "sections": {}}
     for name, fn in SECTIONS:
         if wanted is not None and name not in wanted:
@@ -951,6 +978,13 @@ def summarise(r):
     sysd = s.get("system") or {}
     who = sysd.get("hostname") or socket.gethostname() or "unknown host"
     L.append("=== PI FIELD REPORT %s (%s) ===" % (r.get("utc"), who))
+    code = r.get("code") or {}
+    if code.get("commit"):
+        L.append("code       : %s%s" % (
+            code["commit"], " on %s" % code["branch"] if code.get("branch") else ""))
+        if code.get("dirty"):
+            L.append("             the working tree has uncommitted changes - this "
+                     "report may not match the commit above")
     if sysd:
         L.append("board      : %s | %s | python %s | %s cores"
                  % (sysd.get("board", "?"), sysd.get("kernel"), sysd.get("python"),

@@ -20,12 +20,14 @@ Hailo and no FC (which is exactly where these tests DO run) every section must
 return an explanation instead of raising.
 """
 import importlib.util
+import shutil
 import inspect
 import signal
 import json
 import math
 import os
 import subprocess
+import tempfile
 import sys
 import unittest
 
@@ -322,6 +324,61 @@ class TestANativeCrashIsContained(unittest.TestCase):
         text = F.summarise(rep)
         self.assertIn("CRASHED by SIGBUS", text)
         self.assertIn("CHECK failed - boom", text)
+
+
+class TestTheReportSaysWhichCodeProducedIt(unittest.TestCase):
+    """The Pi spent a whole round running this tool one commit behind.
+
+    Nothing in the output said so - the only clue was that the step labels looked
+    familiar. A report that omits its own commit is ambiguous at exactly the
+    moment the answer matters, so the commit is now in the header and the JSON.
+    """
+
+    def test_it_reads_the_commit_and_branch_of_a_real_repo(self):
+        if not shutil.which("git"):
+            self.skipTest("no git on this machine")
+        d = tempfile.mkdtemp()
+        try:
+            run = lambda *a: subprocess.run(
+                ["git", "-C", d] + list(a), capture_output=True,
+                env=dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+                         GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t"))
+            run("init", "-q")
+            run("commit", "-q", "--allow-empty", "-m", "x")
+            got = F.code_stamp(d)
+            self.assertTrue(got, "no stamp from a real repo: %r" % (got,))
+            self.assertGreaterEqual(len(got["commit"]), 7)
+            self.assertTrue(got["branch"])
+            self.assertFalse(got["dirty"], "a clean tree reported as dirty")
+            open(os.path.join(d, "new.txt"), "w").write("x")
+            self.assertTrue(F.code_stamp(d)["dirty"],
+                            "an uncommitted file was not reported")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_it_never_raises_where_there_is_no_repo(self):
+        """A missing git, or a tarball with no .git, must not fail a survey."""
+        self.assertIsNone(F.code_stamp("/nonexistent/nowhere/at/all"))
+        d = tempfile.mkdtemp()
+        try:
+            self.assertIsNone(F.code_stamp(d))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_the_header_names_the_commit(self):
+        text = F.summarise({"sections": {}, "code": {"commit": "72ac2e1",
+                                                     "branch": "b365"}})
+        self.assertIn("code       : 72ac2e1 on b365", text)
+
+    def test_a_dirty_tree_is_flagged_not_hidden(self):
+        text = F.summarise({"sections": {},
+                            "code": {"commit": "abc1234", "branch": "b",
+                                     "dirty": True}})
+        self.assertIn("uncommitted changes", text)
+
+    def test_no_code_info_prints_no_line(self):
+        text = F.summarise({"sections": {}})
+        self.assertNotIn("code       :", text)
 
 
 class TestHailoSteps(unittest.TestCase):
