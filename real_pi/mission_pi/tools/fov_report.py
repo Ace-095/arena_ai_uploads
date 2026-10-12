@@ -66,6 +66,9 @@ EMPIRICAL_MODULES = 29
 #: 3x3 tiling of a 2028 px frame (a tile is ~256 px -> 640/256 = 2.5x).
 MIN_DETECT_PX = 12
 
+#: What the detector network actually receives (detector.input_size in config).
+NET_INPUT_PX = 640
+
 
 def _cfg(path):
     with open(path) as fh:
@@ -80,10 +83,19 @@ def _num(v, default):
 
 
 def compute(cfg, alt_m, qr_mm, modules, quiet, tilt_deg, sensor_px,
-            speed_ms, exposure_s):
-    """One geometry row. Pure arithmetic, no I/O, so it is unit-testable."""
-    cam = ((cfg.get("cameras") or {}).get("bottom") or {})
-    size = cam.get("size") or [2028, 1520]
+            speed_ms, exposure_s, cam_role="bottom",
+            net_tile_cols=3, net_input_px=NET_INPUT_PX):
+    """One geometry row. Pure arithmetic, no I/O, so it is unit-testable.
+
+    cam_role: which camera config to read (bottom | front). For the FORWARD
+    camera `alt_m` is the DISTANCE AHEAD to a panel that faces the camera
+    square-on: the same 2*d*tan(fov/2) footprint applies, and there is no
+    foreshortening because the panel is perpendicular to the optical axis.
+    It is NOT a ground footprint — do not read a front row as "altitude".
+    """
+    cam_role = cam_role if cam_role in ("bottom", "front") else "bottom"
+    cam = ((cfg.get("cameras") or {}).get(cam_role) or {})
+    size = cam.get("size") or ([4608, 2592] if cam_role == "front" else [2028, 1520])
     img_w, img_h = int(size[0]), int(size[1])
     hfov = _num(cam.get("hfov_deg"), 75.0)
     vfov = cam.get("vfov_deg")
@@ -110,6 +122,16 @@ def compute(cfg, alt_m, qr_mm, modules, quiet, tilt_deg, sensor_px,
     px_per_module = qr_px / float(total_modules) if total_modules else 0.0
 
     blur_px = speed_ms * exposure_s * px_per_m
+    # The detector does NOT see the frame at capture resolution: YOLO letterboxes
+    # to `input_size` (640). A 4608 px front frame is therefore shrunk 7.2x
+    # BEFORE the network runs, so a 70 px QR arrives as ~10 px. `detectable`
+    # above only asks "is the QR a big enough blob in the frame"; this asks the
+    # question that actually decides detection. Tiling (detector.tile_bottom /
+    # tile_front) recovers it by feeding one tile at a time.
+    tiles = max(1, int(net_tile_cols) or 1)
+    net_px_full = qr_px * min(1.0, float(NET_INPUT_PX) / max(1.0, img_w))
+    tile_w = img_w / float(tiles)
+    net_px_tiled = qr_px * min(1.0, float(NET_INPUT_PX) / max(1.0, tile_w))
     row = {
         "alt_m": round(alt_m, 2),
         "footprint_m": [round(foot_w_t, 2), round(foot_h, 2)],
@@ -119,6 +141,10 @@ def compute(cfg, alt_m, qr_mm, modules, quiet, tilt_deg, sensor_px,
         "px_per_module": round(px_per_module, 2),
         "motion_blur_px": round(blur_px, 2),
         "detectable": qr_px >= MIN_DETECT_PX,
+        "net_input_px": round(net_px_full, 1),
+        "net_input_px_tiled": round(net_px_tiled, 1),
+        "detectable_at_input": net_px_full >= MIN_DETECT_PX,
+        "detectable_at_input_tiled": net_px_tiled >= MIN_DETECT_PX,
         "decodable_at_target": px_per_module >= PX_PER_MODULE_TARGET,
         "decodable_empirical": px_per_module >= PX_PER_MODULE_EMPIRICAL,
         "blur_ok": blur_px <= 3.0,
@@ -193,6 +219,11 @@ def main():
                     help="QR modules across, excluding quiet zone "
                          "(25 = version 2, 21 = version 1)")
     ap.add_argument("--quiet", type=int, default=4, help="quiet zone modules")
+    ap.add_argument("--cam", default="bottom", choices=["bottom", "front"],
+                    help="which camera role to compute for. 'front' answers "
+                         "'how far AHEAD can the forward camera read a panel that "
+                         "faces it' - there is no foreshortening in that case, and "
+                         "the distance is NOT an altitude")
     ap.add_argument("--tilt", type=float, default=0.0,
                     help="camera tilt from nadir, degrees")
     ap.add_argument("--speed", default="2.0", help="ground speed m/s (list ok)")
@@ -205,17 +236,19 @@ def main():
     speeds = [float(x) for x in str(args.speed).split(",") if x.strip()]
     exps = [float(x) / 1000.0 for x in str(args.exposure_ms).split(",") if x.strip()]
 
-    cam = ((cfg.get("cameras") or {}).get("bottom") or {})
-    size = cam.get("size") or [2028, 1520]
+    cam = ((cfg.get("cameras") or {}).get(args.cam) or {})
+    size = cam.get("size") or ([4608, 2592] if args.cam == "front" else [2028, 1520])
 
     print("=" * 78)
-    print("A3 QR geometry report — from %s" % args.config)
+    print("A3 QR geometry report [%s camera] — from %s" % (args.cam, args.config))
     print("=" * 78)
     print()
     print("INPUTS")
     print("-" * 78)
     print("  %-28s %-22s %s" % ("value", "used", "provenance"))
-    print("  %-28s %-22s %s" % ("bottom capture size",
+    print("  %-28s %-22s %s" % ("camera role", args.cam,
+                                "CONFIGURED (cameras.%s)" % args.cam))
+    print("  %-28s %-22s %s" % ("%s capture size" % args.cam,
                                 "%dx%d" % (int(size[0]), int(size[1])),
                                 "CONFIGURED (real sensor mode)"))
     print("  %-28s %-22s %s" % ("horizontal FOV", "%.1f deg" % _num(cam.get("hfov_deg"), 75.0),
@@ -245,7 +278,7 @@ def main():
                      "blur px", "verdict"))
             for alt in alts:
                 r = compute(cfg, alt, args.qr_mm, args.modules, args.quiet,
-                            args.tilt, None, speed, exp)
+                            args.tilt, None, speed, exp, cam_role=args.cam)
                 r.update({"speed_ms": speed, "exposure_ms": exp * 1000.0})
                 rows.append(r)
                 verdict = []
@@ -262,6 +295,24 @@ def main():
                       % (alt, "%.1fx%.1f" % tuple(r["footprint_m"]),
                          r["gsd_mm_per_px"], r["qr_px"], r["px_per_module"],
                          r["motion_blur_px"], " ".join(verdict)))
+            print()
+            print("  What the NETWORK actually receives (input_size=%d):" % NET_INPUT_PX)
+            print("  %-6s %-14s %-14s %s" % ("alt", "full frame", "3x3 tiled", "note"))
+            for r in rows[-len(alts):]:
+                note = ""
+                if not r["detectable_at_input"] and r["detectable_at_input_tiled"]:
+                    note = "needs TILING (detector.tile_%s: true)" % args.cam
+                elif not r["detectable_at_input_tiled"]:
+                    note = "too small even tiled"
+                print("  %-6.1f %-14s %-14s %s"
+                      % (r["alt_m"], "%.1f px" % r["net_input_px"],
+                         "%.1f px" % r["net_input_px_tiled"], note))
+            print()
+            print("  'detectable' above counts pixels IN THE FRAME. A %d px frame is"
+                  % int(size[0]))
+            print("  letterboxed to %d px before YOLO runs, so the frame-pixel"
+                  % NET_INPUT_PX)
+            print("  verdict can be optimistic — this table is the one that decides.")
             print()
 
     _levers(cfg, args, alts[0] if alts else 10.0)

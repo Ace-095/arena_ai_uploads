@@ -82,7 +82,9 @@ Produced by `tools/fov_report.py`, which reads the live `config.yaml` and labels
 each input's provenance rather than inventing values.
 
 **Assumption in the table:** the QR symbol fills the A3 short side (297 mm),
-25 modules + 4-module quiet zone; nadir camera; 2 m/s; 2 ms exposure.
+25 modules + a 4-module quiet zone on each side (**33 modules total** — the
+`px/module` column divides by 33, matching `fov_report.py`); nadir camera; 2 m/s;
+2 ms exposure.
 
 | Alt | Ground footprint | mm/px | QR px | px/module | blur px | Verdict |
 |---:|---|---:|---:|---:|---:|---|
@@ -112,6 +114,25 @@ both numbers are useful:
 Quoting only the heuristic would make 10 m look impossible when it demonstrably
 is not; quoting only the empirical floor would hide how little margin a
 1.2 px/module decode has. Both appear in the tool output.
+
+### What the detector network actually receives (the binding constraint)
+
+The table above counts pixels **in the frame**. The detector does not see the
+frame at capture resolution — it letterboxes to `detector.input_size` (640), so a
+2028 px frame is shrunk ~3.2× and a 4608 px frame **7.2×** before YOLO runs.
+`fov_report.py --cam bottom|front` prints this as a second table:
+
+| Camera | 15 m, full frame | 15 m, 3×3 tiled | Verdict |
+|---|---:|---:|---|
+| bottom (Arducam, 2028 px) | 8.3 px | 24.8 px | needs tiling |
+| front (IMX708, 4608 px) | 9.8 px | 29.3 px | needs tiling |
+
+This is why `detector.tile_bottom: true` is **load-bearing** rather than a
+tuning nicety: with full-frame inference at 15 m the panel arrives at the network
+as ~8 px and detection collapses regardless of how many sensor pixels you paid
+for. Note the counter-intuitive result: the 12 MP front camera is *not* safe at
+15 m on raw resolution alone — 4608 px is downscaled harder than 2028 px, so both
+land near 10 px until tiling is enabled.
 
 ### What would actually change the answer
 

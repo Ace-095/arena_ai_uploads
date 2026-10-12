@@ -125,6 +125,41 @@ then update the label from *vendor-quoted* to *measured in this runbook's sense*
 
 ---
 
+### Which camera? (bottom Arducam vs the Pi Camera Module 3)
+
+Both are computed by the same tool — `--cam` selects the role:
+
+```bash
+python3 tools/fov_report.py --alts 10,12,15              # bottom (Arducam UC-517)
+python3 tools/fov_report.py --cam front --alts 10,12,15  # front (IMX708)
+```
+
+| Camera | 4608/2028 px | FOV | px/module @15 m | net px @15 m (tiled) |
+|---|---|---:|---:|---:|
+| bottom (Arducam UC-517) | 2028×1520 | 75°/60° | 0.79 | 24.8 |
+| front (Pi Cam Module 3) | 4608×2592 | 66°/41° | **2.13** | 29.3 |
+
+**The front camera has 2.7× the resolution, and it still does not "do 15 m" by
+itself** — for three separate reasons, all of which the tool now prints:
+
+1. **It is the wrong way round.** `front` is forward-facing. A panel flat on the
+   ground seen from a forward camera is nearly edge-on, so the modules are
+   foreshortened. The `px/module` column assumes the panel faces the lens
+   square-on, which is only true for a vertical panel or a mount that tilts the
+   camera down.
+2. **The network input, not the sensor, is the bottleneck.** 4608 px is
+   letterboxed to 640 — a **7.2×** shrink — so 15 m gives ~9.8 px at the network
+   against ~29.3 px when 3×3 tiled. `detector.tile_front` is **false** by
+   default, so as shipped the front camera cannot see a 15 m panel at all.
+3. **The bottom camera is the one that finds the QR.** `single_cam_role` and the
+   whole mission design put the downward camera at the centre of the search.
+
+So: the Pi camera is a *resolution upgrade*, not a solution. If you ever want it
+for the downward job it must be **remounted as the bottom camera** (`match_name`
+changed, `tile_bottom: true` kept) — and if you want tiling on the front camera,
+set `detector.tile_front: true` and expect **9 inferences per frame** instead of
+one, which is a real cost on the CPU rung.
+
 ## Stage 2 — QR detection vs ANGLE at a known distance
 
 ### Print and lay out the panel
