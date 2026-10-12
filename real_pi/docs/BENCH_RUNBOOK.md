@@ -319,6 +319,35 @@ Two things that waste hours if you do not know them:
 2. SITL's serial1 is what mission_pi joins. Watch for `SERIAL1 on TCP port 5762`
    in the SITL console before starting terminal 2.
 
+### VERIFIED against a real ArduCopter build (not just documented)
+
+Both behaviours above were reproduced on a freshly built `arducopter` SITL
+(ArduPilot master, `sim_vehicle.py -v ArduCopter -f quad --no-mavproxy -w`):
+
+| Check | Result |
+|---|---|
+| connect straight to `tcp:5762` | **no heartbeat, ever** — not a slow start |
+| connect to `tcp:5760` | heartbeat immediately |
+| connect to `5760` **and hold it**, then `5762` | heartbeat in **<0.1 s**, sysid 1 |
+| a second concurrent client on `5762` | **no heartbeat** — one client per SERIAL port |
+
+So `mission_pi` needs something holding 5760 — Mission Planner, or a script:
+
+```bash
+# keep this running in its own terminal while you bench against real SITL
+python3 - <<'EOF'
+from pymavlink import mavutil
+import time
+c = mavutil.mavlink_connection('tcp:127.0.0.1:5760', source_system=255)
+c.wait_heartbeat(timeout=10)
+print("holding SERIAL0 open - mission_pi can now use 5762")
+while True: time.sleep(1)
+EOF
+```
+
+`tests/test_sitl_flight.py` does this for you (it primes SERIAL0 and reuses one
+link, because of the one-client-per-port rule).
+
 ```bash
 # terminal 2 (after MP is connected to 5760)
 cd ~/arena_ai_uploads/real_pi/mission_pi

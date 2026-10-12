@@ -204,6 +204,37 @@ def run_check(args):
 
 
 # ------------------------------------------------------------ bring-up -----
+def camera_summary(started, failed, assigned=()):
+    """(state, detail) for the bring-up `cameras` line.
+
+    A camera that FAILED to start must never be summarised as ok. This is not
+    hypothetical: `rig.detect()` fills `rig.cams` BEFORE `cam.start()` is
+    attempted, so the old `if rig.cams:` check reported
+
+        ERROR: cam1 start failed: ...
+        ERROR: cam2 start failed: ...
+        INFO : bring-up cameras: ok (cam1=file/front, cam2=file/bottom)
+
+    and the operator went looking for a vision bug with two dead cameras.
+    `assigned` is what the rig *thinks* it has; `started` is what actually runs.
+    """
+    started = list(started)
+    failed = list(failed)
+    if started and not failed:
+        return "ok", "%d running: %s" % (len(started), ", ".join(sorted(started)))
+    if started and failed:
+        return "degraded", ("%d running (%s), %d FAILED to start (%s)"
+                            % (len(started), ", ".join(sorted(started)),
+                               len(failed), ", ".join(sorted(failed))))
+    if failed:
+        return "failed", "%d camera(s) FAILED to start: %s" % (
+            len(failed), ", ".join(sorted(failed)))
+    if assigned:
+        return "failed", "no camera started (%s assigned but not running)" % (
+            ", ".join(sorted(assigned)))
+    return "failed", "no camera assigned"
+
+
 def bring_up_thread(cfg, args, fc, rig, det_box, streams, mission, hub, bu):
     """Everything that can fail, in fail-soft order, off the main thread."""
 
@@ -235,6 +266,7 @@ def bring_up_thread(cfg, args, fc, rig, det_box, streams, mission, hub, bu):
     if args.no_cams:
         say("cameras", "skipped", "--no-cams")
     else:
+        started, failed_start = [], []
         try:
             with rig.rescan_lock():
                 detected = rig.detect()
@@ -250,12 +282,25 @@ def bring_up_thread(cfg, args, fc, rig, det_box, streams, mission, hub, bu):
                     try:
                         cam.start()
                         rig.cams[name] = cam
+                        started.append(name)
                     except Exception as e:
+                        failed_start.append(name)
                         log.error("%s start failed: %r", name, e)
+            # a camera the rescan already adopted is running too - count it
+            for name, c in rig.cams.items():
+                if getattr(c, "running", False) and name not in started:
+                    started.append(name)
+            _state, _detail = camera_summary(started, failed_start,
+                                             assigned=list(rig.cams.keys()))
             if rig.cams:
-                say("cameras", "ok", ", ".join(
+                say("cameras", _state, "%s | %s" % (_detail, ", ".join(
                     "%s=%s/%s" % (n, c.model, c.facing)
-                    for n, c in sorted(rig.cams.items())))
+                    for n, c in sorted(rig.cams.items()))))
+                if _state != "ok":
+                    hub.push("log", {
+                        "level": "ERROR",
+                        "msg": "cameras: %s — the mission cannot see the QR "
+                               "until this is fixed" % _detail})
 
                 # --- QR boost: make QR pop more than ground (Kabaddi setting) ---
                 try:
@@ -303,7 +348,7 @@ def bring_up_thread(cfg, args, fc, rig, det_box, streams, mission, hub, bu):
                     hub.push("log", {"level": "WARN", "msg": "QR boost setup failed: %s" % e})
 
             else:
-                bu.mark("cameras", "failed", "no camera assigned")
+                bu.mark("cameras", "failed", _detail)
                 hub.push("log", {"level": "ERROR",
                                  "msg": "no cameras — the mission will "
                                         "failsafe at search; check config "
