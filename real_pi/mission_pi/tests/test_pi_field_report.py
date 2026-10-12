@@ -59,6 +59,7 @@ F = _load()
 # The ladder's last step builds the whole detector, which is the only step that
 # can exit 0 without Hailo.
 CTOR = "12. the whole constructor, as the ladder builds it"
+LADDER_STEPS = 14    # 12 Hailo init steps + one real inference + the constructor
 
 
 def make_args(**kw):
@@ -326,6 +327,70 @@ class TestANativeCrashIsContained(unittest.TestCase):
         self.assertIn("CHECK failed - boom", text)
 
 
+class TestTheLastWordsOfACrashedChild(unittest.TestCase):
+    """A crashed step must still say how far it got.
+
+    "CRASHED at step 9" cannot distinguish dying at the first line from dying
+    after the streams came up successfully - and those are completely different
+    diagnoses. The child's prints are the only evidence, so two things had to be
+    true: the child runs unbuffered (-u), and a crashed record keeps its stdout.
+    """
+
+    def test_children_are_run_unbuffered(self):
+        """Without -u, CPython block-buffers a piped stdout and every print before
+        a native crash is thrown away with the process."""
+        seen = {}
+
+        def fake_run(argv, **kw):
+            seen["argv"] = list(argv)
+            raise RuntimeError("stop here - the argv is what this test is about")
+
+        real, F.subprocess.run = F.subprocess.run, fake_run
+        try:
+            F._child("print('x')")
+        except Exception:
+            pass
+        finally:
+            F.subprocess.run = real
+        self.assertIn("argv", seen, "the child was never launched")
+        self.assertIn("-u", seen["argv"], "the child was not run unbuffered: %r"
+                      % (seen["argv"],))
+
+    def test_a_print_before_a_native_crash_survives(self):
+        r = F._child("import os, signal\n"
+                     "print('marker before dying')\n"
+                     "os.kill(os.getpid(), signal.SIGSEGV)\n")
+        self.assertEqual(r["signal"], "SIGSEGV")
+        self.assertIn("marker before dying", r["stdout"],
+                      "the child's last words were lost - this is the whole "
+                      "reason -u is there")
+
+    def test_a_crashed_step_keeps_its_stdout(self):
+        seen = []
+        real, F._child = F._child, (
+            lambda code, timeout=120, cwd=None: (
+                seen.append(code),
+                {"rc": -11, "signal": "SIGSEGV",
+                 "stdout": "A: building\nB: streams entered\n",
+                 "stderr": "", "timed_out": False})[1])
+        try:
+            got = F.sec_hailo_steps(make_args())
+        finally:
+            F._child = real
+        crashed = [r for r in got["steps"] if r.get("signal")]
+        self.assertTrue(crashed, "nothing was recorded as crashed")
+        self.assertIn("B: streams entered", crashed[0]["stdout_tail"])
+
+    def test_the_summary_says_how_far_the_first_crash_got(self):
+        text = F.summarise({"sections": {"hailo_steps": {
+            "ctor_step": CTOR, "first_crash": "9. InferVStreams(ng, in, out).__enter__()",
+            "first_failure": None,
+            "steps": [{"step": "9. InferVStreams(ng, in, out).__enter__()",
+                       "signal": "SIGSEGV",
+                       "stdout_tail": "A: building\nB: streams entered"}]}}})
+        self.assertIn("last output before it died: B: streams entered", text)
+
+
 class TestTheReportSaysWhichCodeProducedIt(unittest.TestCase):
     """The Pi spent a whole round running this tool one commit behind.
 
@@ -430,7 +495,7 @@ class TestHailoSteps(unittest.TestCase):
             got = F.sec_hailo_steps(make_args())
         finally:
             F._child = real
-        self.assertEqual(len(seen), 13, "one program per ladder step")
+        self.assertEqual(len(seen), LADDER_STEPS, "one program per ladder step")
         steps = list(zip([e["step"] for e in got["steps"]], seen))
         apis = ("hef.create_configure_params", "hailo_configure_params",
                 "create_from_hef", "vdev.configure", "create_params",
@@ -451,7 +516,7 @@ class TestHailoSteps(unittest.TestCase):
         working Hailo print "(1/13 steps ok)" - which reads like progress, and the
         brief forbids a silent CPU fallback being presented as success.
         """
-        # 13 records, like the real ladder: 12 Hailo steps then the constructor
+        # a whole ladder's worth of records: the Hailo steps then the constructor
         rep = {"sections": {"hailo_steps": {
             "ctor_step": CTOR,
             "first_crash": None, "first_failure": "1. import hailo_platform",
@@ -459,7 +524,7 @@ class TestHailoSteps(unittest.TestCase):
                         "error": "ModuleNotFoundError: No module named "
                                  "'hailo_platform'"}]
                       + [{"step": "%d. later" % i, "rc": 1}
-                         for i in range(2, 13)]
+                         for i in range(2, 13)]  # 12 Hailo steps
                       + [{"step": CTOR, "ok": True,
                           "stdout": "chosen: yolo_onnx"}])}}}
         text = F.summarise(rep)
@@ -497,7 +562,7 @@ class TestHailoSteps(unittest.TestCase):
         self.assertIn("all 13 init steps completed", text)
 
     def test_all_ok(self):
-        got = self._with_child([self.ok()] * 13)
+        got = self._with_child([self.ok()] * LADDER_STEPS)
         self.assertEqual(got["verdict"], "ok - every step completed")
         self.assertIsNone(got["first_crash"])
         self.assertIsNone(got["first_failure"])
@@ -508,7 +573,7 @@ class TestHailoSteps(unittest.TestCase):
         # pinning the exact string would break every time the ladder is reordered
         self.assertIn("open the device (hp.VDevice)", got["first_crash"])
         self.assertIn("CRASHED", got["verdict"])
-        self.assertGreaterEqual(len(got["steps"]), 13,
+        self.assertGreaterEqual(len(got["steps"]), LADDER_STEPS,
                                 "probing stopped at the crash instead of continuing")
         bad = [s for s in got["steps"] if s.get("signal")][0]
         self.assertTrue(any("page size" in l for l in bad["hailort_errors"]),
@@ -559,7 +624,7 @@ class TestHailoSteps(unittest.TestCase):
         """A wedged device is not the same as a segfaulting one, and the report
         should not conflate them."""
         got = self._with_child([{"rc": None, "signal": None, "stdout": "",
-                                 "stderr": "", "timed_out": True}] * 13)
+                                 "stderr": "", "timed_out": True}] * LADDER_STEPS)
         self.assertIn("import hailo_platform", got["first_failure"])
         self.assertIsNone(got["first_crash"])
         self.assertIn("FAILED", got["verdict"])

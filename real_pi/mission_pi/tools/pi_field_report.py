@@ -69,7 +69,12 @@ def _child(code, timeout=120, cwd=None):
     """
     prelude = "import sys; sys.path[:0] = [%r, %r]\n" % (PI, HERE)
     try:
-        pr = subprocess.run([sys.executable, "-c", prelude + code],
+        # -u is load-bearing. A child's stdout is a PIPE, so CPython block-buffers
+        # it (8 KiB) and every print before a native crash is thrown away with the
+        # process. Without this, a step that dies by SIGSEGV after printing five
+        # progress markers is indistinguishable from one that died on its first
+        # line - and "how far did it get" is the entire question.
+        pr = subprocess.run([sys.executable, "-u", "-c", prelude + code],
                             cwd=cwd or PI, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, timeout=timeout)
         rc, sig = pr.returncode, None
@@ -438,6 +443,37 @@ if cp is not None:
                'st = InferVStreams(ng, ip, op)\n'
                'st.__enter__()\n'
                'print("InferVStreams entered")'),
+        # The question the crash report could not answer: does Hailo actually
+        # INFER, or does it die before the first frame? Markers are printed as it
+        # goes and the child runs unbuffered, so a crash leaves the last marker
+        # behind - "A/B/C" before dying means the streams never came up, "E" means
+        # it ran an inference and the crash came afterwards, at teardown.
+        ("9b. one real inference through the entered InferVStreams",
+         pre + 'cfg = hailo_configure_params(hef, hp)\n'
+               'ng = vdev.configure(hef, cfg)[0]\n'
+               'ngp = ng.create_params()\n'
+               'ip = hailo_vstream_params(hp, ng, ngp, True, FormatType.UINT8)\n'
+               'op = hailo_vstream_params(hp, ng, ngp, False, FormatType.FLOAT32)\n'
+               'import numpy as np\n'
+               'ii = hef.get_input_vstream_infos()[0]\n'
+               'print("A: building InferVStreams", flush=True)\n'
+               'st = InferVStreams(ng, ip, op)\n'
+               'st.__enter__()\n'
+               'print("B: streams entered", flush=True)\n'
+               'act = getattr(ng, "activate", None)\n'
+               'if callable(act):\n'
+               '    act(ngp).__enter__()\n'
+               'print("C: activated", flush=True)\n'
+               'frame = np.zeros((1,) + tuple(ii.shape), dtype=np.uint8)\n'
+               'res = st.infer({ii.name: frame})\n'
+               'print("D: infer returned", flush=True)\n'
+               'names = sorted(res.keys()) if hasattr(res, "keys") else res\n'
+               'print("   outputs:", names, flush=True)\n'
+               'if hasattr(res, "keys"):\n'
+               '    for k in sorted(res.keys()):\n'
+               '        a = np.asarray(res[k])\n'
+               '        print("   %s %s %s" % (k, a.shape, a.dtype), flush=True)\n'
+               'print("E: done - inference works", flush=True)'),
         ("10. ng.activate(ngp).__enter__()",
          pre + 'cfg = hailo_configure_params(hef, hp)\n'
                'ng = vdev.configure(hef, cfg)[0]\n'
@@ -461,8 +497,9 @@ if cp is not None:
     out = {"steps": [], "hef_path": hef_abs or None,
            "why": "each step runs alone in a child process, so the first "
                   "CRASHED step is the culprit and the rest still get probed",
-           "caveat": "5 processes open the device one after another; that is "
-                     "safe but it is not a test of running them together"}
+           "caveat": "%d processes open the device one after another; that is "
+                     "safe but it is not a test of running them together"
+                     % len(steps)}
     if not hef_abs or not os.path.exists(hef_abs):
         out["note"] = ("no HEF at %r - the ladder cannot choose Hailo at all. "
                        "Compile one (training/compile_hef.md) before reading "
@@ -478,6 +515,10 @@ if cp is not None:
             rec["signal"] = r["signal"]
             rec["hailort_errors"] = _hailort_errors(r["stderr"])
             rec["stderr_tail"] = r["stderr"][-600:]
+            # What it managed to print says whether the crash was AT the call in
+            # the label or AFTER it - e.g. a surviving "streams entered" means the
+            # crash is in the teardown, not in entering the streams.
+            rec["stdout_tail"] = r["stdout"].strip()[-600:]
         elif r["rc"] == 0:
             rec["ok"] = True
             rec["stdout"] = r["stdout"].strip()[-300:]
@@ -486,6 +527,7 @@ if cp is not None:
                 rec["warnings"] = errs          # warnings can precede a crash
         else:
             rec["rc"] = r["rc"]
+            rec["stdout_tail"] = r["stdout"].strip()[-600:]
             rec["error"] = (r["stderr"] or r["stdout"]).strip().splitlines()[-1:] 
             rec["error"] = rec["error"][0] if rec["error"] else "failed"
             errs = _hailort_errors(r["stderr"])
@@ -1038,6 +1080,11 @@ def summarise(r):
                     L.append("             died by %s" % st["signal"])
                     for line in (st.get("hailort_errors") or [])[:4]:
                         L.append("             %s" % line)
+            _crashed_rec = next((r for r in _steps if r.get("signal")), {})
+            _got_to = [ln for ln in (_crashed_rec.get("stdout_tail") or "").splitlines()
+                       if ln.strip()]
+            if _got_to:
+                L.append("             last output before it died: %s" % _got_to[-1])
             _fell_back()
         elif hs.get("first_failure"):
             L.append("hailosteps : FAILED at: %s (%d/%d Hailo steps ok)"

@@ -217,12 +217,13 @@ class HailoYolo8Detector(Detector):
         try:
             hef = HEF(hef_path)
             self._vdev = VDevice()
-            # HailoRT 4.23 dropped ConfigureParams.create_from_hef in favour of
-            # hef.create_configure_params(StreamInterface.PCIe) — see
-            # hailo_decode.hailo_configure_params.
-            # Which HailoRT API generation produced these params is recorded, not
-            # assumed: the detector died with SIGSEGV in the very next line on a
-            # real Pi, and the generation in use was invisible.
+            # This comment used to claim HailoRT 4.23 dropped
+            # ConfigureParams.create_from_hef. It never did - that claim was
+            # written from memory and every published Pi 5 example uses it - and
+            # acting on it (preferring hef.create_configure_params) is what put a
+            # params object of the wrong generation into the next line and killed
+            # the detector with SIGSEGV on the real Pi. Do not reintroduce it.
+            # The generation actually used is recorded, not assumed.
             _api = []
             cfg = _hailo_configure_params(hef, hp, report=_api)
             self.configure_api = (_api[0] if _api else None)

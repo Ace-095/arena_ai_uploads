@@ -637,9 +637,45 @@ and step **5b** probes each generation separately and prints what each one does.
 Together they say either "generation was the problem" or "generation was not the
 problem" without any guessing from this side.
 
-### THE LEADING CAUSE, and what changed because of it
+### MEASURED at `c91b97a`: the crash MOVED
 
-The crash is at `vdev.configure(hef, cfg)` — the call immediately after
+Run on the Pi at commit `c91b97a` (issue #10 follow-up, 2026-10-13):
+
+```
+code       : c91b97a on arena/1c4bb365-arena-ai-uploads
+hailosteps : CRASHED at: 9. InferVStreams(ng, in, out).__enter__() (11/12 Hailo steps ok)
+             died by SIGSEGV
+```
+
+Read that against issue #10, where the step after `VDevice()` died. Now
+`hailo_configure_params()`, `vdev.configure()`, `create_params()` and the vstream
+params **all pass** — twelve named steps where there used to be one opaque "build
+the detector" — and the crash has moved forward to the streams.
+
+**So configure is fixed and the hypothesis was right about it.** That is not proof
+the old code crashed *there*: the old ladder could not see inside the constructor,
+so all that is established is that fixing the generation moved the failure along.
+The failure now sits where the detector first builds `InferVStreams`.
+
+Two details that narrow it further. Step 9 is the first step that constructs
+`InferVStreams`, and the only other step that does is step 12 (the whole
+constructor) — which also crashes. Steps 10 and 11 do not, and they pass. So the
+crash follows `InferVStreams` specifically, not device teardown in general.
+
+What the report could **not** answer, which is why the ladder changed again: a
+"CRASHED at step 9" cannot distinguish dying on the first line of step 9 from
+dying at process exit after the streams came up successfully. The child's prints
+are the only evidence, and they were being thrown away — a child's stdout is a
+pipe, so CPython block-buffers it and a native crash takes the buffer with it.
+Children now run with `-u`, a crashed step keeps its `stdout_tail`, and the summary
+prints `last output before it died: <line>`. Step 9b was added to settle it
+outright: it drives one real inference and prints `A:`…`E:` as it goes, so the
+surviving marker says whether the streams work and the crash is only in the
+teardown, or the streams never came up at all.
+
+### THE ORIGINAL LEADING CAUSE, and what changed because of it
+
+The crash was at `vdev.configure(hef, cfg)` — the call immediately after
 `_hailo_configure_params()`. Every published Raspberry Pi 5 + Hailo example
 (HailoRT 4.19 through 4.23: Hailo's own minimal working example, the AI Kit
 walkthroughs, the Frigate and UAV projects) builds those params with
