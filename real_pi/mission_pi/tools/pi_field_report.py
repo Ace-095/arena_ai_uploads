@@ -341,19 +341,107 @@ def sec_hailo_steps(args):
     cfg = _cfg(args.config)
     hef = ((cfg.get("detector") or {}).get("hef_path") or "")
     hef_abs = os.path.join(PI, hef) if hef and not os.path.isabs(hef) else hef
+    # The coarse step 5 ("build the detector") crashed on the real Pi with
+    # SIGSEGV while its four predecessors passed, which narrows it to everything
+    # AFTER VDevice() - about eight calls. So step 5 is now a ladder of its own:
+    # the same calls HailoYolo8Detector.__init__ makes, in order, each one doing
+    # strictly more than the last. The first to die is the culprit.
+    pre = ('import hailo_platform as hp\n'
+           'from hailo_platform import HEF, VDevice, InferVStreams, FormatType\n'
+           'from hailo_decode import hailo_configure_params, hailo_vstream_params\n'
+           'hef = HEF(%r)\n'
+           'vdev = VDevice()\n' % hef_abs)
     steps = [
-        ("import hailo_platform",
+        ("1. import hailo_platform",
          'import hailo_platform as hp; print("version:", '
          'getattr(hp, "__version__", "?"))'),
-        ("hailo_platform.Device.scan()",
+        ("2. hailo_platform.Device.scan()",
          'import hailo_platform as hp; print("devices:", '
          '[str(d) for d in hp.Device.scan()])'),
-        ("load the HEF file (hp.HEF)",
+        ("3. load the HEF file (hp.HEF)",
          'import hailo_platform as hp; hef = hp.HEF(%r); print("HEF ok:", '
          'type(hef).__name__)' % hef_abs),
-        ("open the device (hp.VDevice)",
+        ("4. open the device (hp.VDevice)",
          'import hailo_platform as hp; v = hp.VDevice(); print("VDevice ok")'),
-        ("build the detector the ladder would build",
+        ("5. hef.create_configure_params(StreamInterface.PCIe)",
+         pre + 'cfg = hailo_configure_params(hef, hp)\n'
+               'print("configure params ok:", type(cfg).__name__)'),
+        # Hypothesis to test, not assume: hailo_configure_params() tries several
+        # API generations and RETURNS THE FIRST THAT DOES NOT RAISE. On a runtime
+        # where the modern call exists but rejects the argument, it silently falls
+        # through to an older constructor whose params object the 4.2x
+        # configure() then reads as the wrong type - which is a C++ crash, not a
+        # Python one. This step reports every generation's availability and result
+        # so that stops being a guess.
+        ("5b. which configure-params API generation actually works",
+         pre + """
+iface = None
+for n in ("HailoStreamInterface", "StreamInterface"):
+    iface = getattr(hp, n, None)
+    if iface is not None:
+        break
+pcie = getattr(iface, "PCIe", "PCIe") if iface is not None else "PCIe"
+print("interface class:", type(iface).__name__ if iface is not None else "NONE",
+      "| PCIe =", pcie)
+mk = getattr(hef, "create_configure_params", None)
+print("hef.create_configure_params:", "present" if callable(mk) else "ABSENT")
+if callable(mk):
+    try:
+        print("  -> ok:", type(mk(pcie)).__name__)
+    except Exception as e:
+        print("  -> RAISED: %s: %s" % (type(e).__name__, e))
+cp = getattr(hp, "ConfigureParams", None)
+print("hp.ConfigureParams:", "present" if cp is not None else "ABSENT")
+if cp is not None:
+    for label, fn in (
+            ("create_from_hef(hef, interface=pcie)",
+             lambda: cp.create_from_hef(hef, interface=pcie)),
+            ("create_from_hef(hef)",
+             lambda: cp.create_from_hef(hef))):
+        try:
+            print("  %s -> ok: %s" % (label, type(fn()).__name__))
+        except Exception as e:
+            print("  %s -> RAISED: %s: %s" % (label, type(e).__name__, e))
+"""),
+        ("6. vdev.configure(hef, cfg)",
+         pre + 'cfg = hailo_configure_params(hef, hp)\n'
+               'ng = vdev.configure(hef, cfg)[0]\n'
+               'print("network group ok:", type(ng).__name__)'),
+        ("7. network_group.create_params()",
+         pre + 'cfg = hailo_configure_params(hef, hp)\n'
+               'ng = vdev.configure(hef, cfg)[0]\n'
+               'ngp = ng.create_params()\n'
+               'print("params ok:", type(ngp).__name__)'),
+        ("8. input/output vstream params",
+         pre + 'cfg = hailo_configure_params(hef, hp)\n'
+               'ng = vdev.configure(hef, cfg)[0]\n'
+               'ngp = ng.create_params()\n'
+               'ip = hailo_vstream_params(hp, ng, ngp, True, FormatType.UINT8)\n'
+               'op = hailo_vstream_params(hp, ng, ngp, False, FormatType.FLOAT32)\n'
+               'print("vstream params ok:", len(ip), "in,", len(op), "out")'),
+        ("9. InferVStreams(ng, in, out).__enter__()",
+         pre + 'cfg = hailo_configure_params(hef, hp)\n'
+               'ng = vdev.configure(hef, cfg)[0]\n'
+               'ngp = ng.create_params()\n'
+               'ip = hailo_vstream_params(hp, ng, ngp, True, FormatType.UINT8)\n'
+               'op = hailo_vstream_params(hp, ng, ngp, False, FormatType.FLOAT32)\n'
+               'st = InferVStreams(ng, ip, op)\n'
+               'st.__enter__()\n'
+               'print("InferVStreams entered")'),
+        ("10. ng.activate(ngp).__enter__()",
+         pre + 'cfg = hailo_configure_params(hef, hp)\n'
+               'ng = vdev.configure(hef, cfg)[0]\n'
+               'ngp = ng.create_params()\n'
+               'act = getattr(ng, "activate", None)\n'
+               'if callable(act):\n'
+               '    act(ngp).__enter__()\n'
+               '    print("activate entered")\n'
+               'else:\n'
+               '    print("no activate() on this runtime")'),
+        ("11. hef input/output vstream infos",
+         pre + 'print("inputs:", [i.name for i in hef.get_input_vstream_infos()],\n'
+               '      "outputs:", len(hef.get_output_vstream_infos()))'),
+        ("12. the whole constructor, as the ladder builds it",
          'import json, os, yaml, detector as D;'
          ' cfg = yaml.safe_load(open(%r)) or {};'
          ' det = D.get_detector(cfg.get("detector", {}) or {});'

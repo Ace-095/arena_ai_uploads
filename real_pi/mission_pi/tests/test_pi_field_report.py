@@ -350,32 +350,60 @@ class TestHailoSteps(unittest.TestCase):
                 "timed_out": False}
 
     def test_all_ok(self):
-        got = self._with_child([self.ok()] * 5)
+        got = self._with_child([self.ok()] * 13)
         self.assertEqual(got["verdict"], "ok - every step completed")
         self.assertIsNone(got["first_crash"])
         self.assertIsNone(got["first_failure"])
 
     def test_a_crash_names_the_step_and_keeps_probing(self):
-        got = self._with_child([self.ok(), self.ok(), self.ok(),
-                                self.crasher(), self.ok()])
-        self.assertEqual(got["first_crash"], "open the device (hp.VDevice)")
+        got = self._with_child([self.ok()] * 3 + [self.crasher()] + [self.ok()] * 9)
+        # substring, not equality: the step labels carry an ordinal prefix and
+        # pinning the exact string would break every time the ladder is reordered
+        self.assertIn("open the device (hp.VDevice)", got["first_crash"])
         self.assertIn("CRASHED", got["verdict"])
-        self.assertEqual(len(got["steps"]), 5,
-                         "probing stopped at the crash instead of continuing")
+        self.assertGreaterEqual(len(got["steps"]), 13,
+                                "probing stopped at the crash instead of continuing")
         bad = [s for s in got["steps"] if s.get("signal")][0]
         self.assertTrue(any("page size" in l for l in bad["hailort_errors"]),
                         "HailoRT's own error text was not captured")
 
+    def test_several_crashes_still_report_CRASHED_and_name_the_first(self):
+        """The realistic shape on the real Pi.
+
+        The ladder is cumulative - every step redoes the earlier calls - so ONE
+        bad call makes several consecutive steps die. A verdict that only says
+        CRASHED when exactly one step crashed would report a SIGSEGV as an
+        ordinary failure precisely when it matters most. Found by mutating that
+        condition: the mutation survived until this test existed.
+        """
+        # Choose the crashing step by its CODE, not by an index: positional
+        # arithmetic broke the moment a step was inserted, and pinning labels
+        # would break on every reorder. Steps 6-11 all contain this line, so this
+        # is exactly the multi-crash shape.
+        ok, crash = self.ok(), self.crasher()
+
+        def by_code(code, timeout=120, cwd=None):
+            return crash if "ng = vdev.configure(hef, cfg)" in code else ok
+        real, F._child = F._child, by_code
+        try:
+            got = F.sec_hailo_steps(make_args())
+        finally:
+            F._child = real
+        self.assertTrue(got["verdict"].startswith("CRASHED at:"), got["verdict"])
+        self.assertIn("vdev.configure", got["first_crash"])
+        self.assertGreater(len(got["steps"]), 5)
+
     def test_a_plain_failure_is_not_reported_as_a_crash(self):
         """The verdict bug: a machine with no hailo_platform reported 'all 5
         steps completed' while four had failed."""
-        got = self._with_child([self.failing()] * 4 + [self.ok()])
-        self.assertEqual(got["verdict"], "FAILED at: import hailo_platform")
+        got = self._with_child([self.failing()] * 4 + [self.ok()] * 9)
+        self.assertIn("import hailo_platform", got["verdict"])
+        self.assertTrue(got["verdict"].startswith("FAILED at:"), got["verdict"])
         self.assertIsNone(got["first_crash"])
-        self.assertEqual(got["first_failure"], "import hailo_platform")
+        self.assertIn("import hailo_platform", got["first_failure"])
 
     def test_a_missing_hef_is_called_out(self):
-        got = self._with_child([self.ok()] * 5)
+        got = self._with_child([self.ok()] * 13)
         self.assertIn("hef_path", got)
         if not (got["hef_path"] and os.path.exists(got["hef_path"])):
             self.assertIn("no HEF", got.get("note", ""))
@@ -384,8 +412,8 @@ class TestHailoSteps(unittest.TestCase):
         """A wedged device is not the same as a segfaulting one, and the report
         should not conflate them."""
         got = self._with_child([{"rc": None, "signal": None, "stdout": "",
-                                 "stderr": "", "timed_out": True}] * 5)
-        self.assertEqual(got["first_failure"], "import hailo_platform")
+                                 "stderr": "", "timed_out": True}] * 13)
+        self.assertIn("import hailo_platform", got["first_failure"])
         self.assertIsNone(got["first_crash"])
         self.assertIn("FAILED", got["verdict"])
 

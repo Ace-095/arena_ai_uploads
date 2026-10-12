@@ -536,6 +536,48 @@ Two things were wrong, and only one of them was the Pi's:
 2. **Hailo initialisation on this Pi is failing at a native level.** That is a
    genuine finding, not a tool bug, and it is the thing to fix next.
 
+### MEASURED on the real Pi (2026-10-13, report in issue #10)
+
+```
+board      : Raspberry Pi 5 Model B Rev 1.1 | 6.18.50+rpt-rpi-2712 | python 3.13.5 | 4 cores
+thermal    : 54.0 C | throttled_now=False throttled_ever=False
+memory     : 8062 MB total | 6.5% used | disk free 20.1 GB
+deps       : missing: onnx
+hailo      : platform=4.23.0 | devices=['0001:01:00.0'] | hef=True onnx=True
+hailosteps : CRASHED at: build the detector the ladder would build (4/5 steps ok)
+             died by SIGSEGV
+```
+
+That is a much narrower problem than "Hailo does not work":
+
+| Step | Result |
+|---|---|
+| `import hailo_platform` | **ok** — version 4.23.0 |
+| `Device.scan()` | **ok** — device `0001:01:00.0` is present |
+| `HEF(path)` | **ok** — the compiled model loads |
+| `VDevice()` | **ok** — the device opens |
+| build the detector | **SIGSEGV** |
+
+**So the HAT is detected, the driver is talking to it, and the HEF is valid.** The
+crash is in the code that runs *after* `VDevice()` — the configure/streams path in
+`HailoYolo8Detector.__init__` (`detector.py:218-250`), which is about eight calls.
+
+> **This also means `mission_pi` cannot start on this Pi.** `main.py:258` calls
+> `get_detector()` inside `try/except Exception` (`main.py:256-269`), and a
+> SIGSEGV is not an exception. The mission process dies at bring-up. Until the
+> crash is fixed the flight code needs `detector.kind` set to something other than
+> `auto`/`hailo`, or the HEF moved aside.
+
+**Two other things this report says, both of which matter:**
+
+* `deps: missing: onnx` — the ONNX runtime is not installed in
+  `/home/ace/real_pi/.venv`. So the ladder's second rung cannot load either: with
+  Hailo crashing and ONNX missing, the detector is falling through to the `.pt` or
+  classical rung. Install `onnxruntime` before judging any CPU-vs-Hailo number.
+* 26 `/dev/video*` nodes. That is the Pi 5's own codec/ISP devices, not cameras;
+  identifying which is the UC-517 needs a capture run (`--no-capture` was used
+  here). Expect one real camera among the noise.
+
 ### Read this first: the new `hailosteps` line
 
 `scout` now walks Hailo initialisation one step at a time, each in its own child
@@ -548,10 +590,24 @@ hailosteps : CRASHED at: open the device (hp.VDevice) (3/5 steps ok)
              [HailoRT] [error] CHECK failed - max_desc_page_size given 16384 ...
 ```
 
-The five steps are exactly what `HailoYolo8Detector.__init__` does, in order:
-`import hailo_platform` → `Device.scan()` → `HEF(path)` → `VDevice()` → build the
-detector. **The first step that dies is the culprit**; the ones after it still get
-probed.
+The steps are exactly what `HailoYolo8Detector.__init__` does, in order:
+`import hailo_platform` → `Device.scan()` → `HEF(path)` → `VDevice()` →
+`hef.create_configure_params()` → **which configure-params API generation exists
+and works** → `vdev.configure()` → `create_params()` → vstream params →
+`InferVStreams()` → `activate()` → `hef.get_*_vstream_infos()` → the whole
+constructor. **The first step that dies is the culprit**; the ones after it still
+get probed.
+
+The ladder is cumulative, so one bad call makes several consecutive steps die.
+That is expected: the report names the FIRST one, and only that one is the answer.
+
+The `5b.` step exists to settle a specific hypothesis rather than guess at it:
+`hailo_configure_params()` tries several HailoRT API generations and returns the
+first that does not raise. If the modern call exists but rejects its argument, the
+helper silently falls through to an older constructor whose params object the 4.2x
+`configure()` then reads as the wrong type — a C++ crash, not a Python one. Step
+`5b.` prints which generations exist and what each returns, so that stops being a
+guess.
 
 ### The two documented causes on a Pi 5, and their fixes
 
