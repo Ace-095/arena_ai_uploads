@@ -521,3 +521,121 @@ silently, because a comment failure deliberately does *not* mark the job done.
 | `refused: mission_pi is running` | stop `mission_pi` — it owns the camera and serial port |
 | Nothing happens at all | check `PI_AGENT_TOKEN`/`PI_AGENT_REPO`, then `journalctl -u pi-agent` |
 | It refuses its own commands | working as designed: the token belongs to a login that is not the operator |
+
+## 8. The Hailo crash round — run this next
+
+Context in one paragraph. The Pi's `scout` came back with the Hailo detector dying
+by **SIGSEGV** at `vdev.configure(hef, cfg)` (`HailoRT 4.23.0`, HEF loads, device
+opens). Every published Pi 5 + Hailo example builds those params with
+`ConfigureParams.create_from_hef(hef=hef, interface=HailoStreamInterface.PCIe)`;
+this repository tried `hef.create_configure_params(...)` **first**, on the strength
+of a comment claiming 4.23 dropped the older constructor. That order is now
+reversed, and the ladder reports which generation actually won. **It is still a
+hypothesis until the Pi runs it.**
+
+### Step 0 — pull it onto the Pi
+
+```
+cd ~/arena_ai_uploads
+git branch --show-current
+git fetch origin
+git pull --ff-only
+```
+
+`git branch --show-current` should print
+`arena/1c4bb365-arena-ai-uploads`. If it prints something else, stop and say so —
+the fix is on that branch, not on `main`.
+
+If `git pull --ff-only` refuses because of local changes, keep the changes and
+move on:
+
+```
+git stash
+git pull --ff-only
+git stash pop
+```
+
+### Step 1 — prove the new code is actually there
+
+Never trust a pull that reported success; check for the strings themselves.
+
+```
+cd ~/arena_ai_uploads/real_pi/mission_pi
+grep -c "the path production takes" tools/pi_field_report.py
+grep -c "5b. every configure-params API generation" tools/pi_field_report.py
+```
+
+Both must print `1`. If either prints `0`, the pull did not bring this commit:
+the rest of these steps would test the old code and tell you nothing.
+
+### Step 2 — the fast, targeted run (a couple of seconds)
+
+```
+cd ~/arena_ai_uploads/real_pi/mission_pi
+python3 tools/pi_field_report.py --sec hailo_steps
+```
+
+This runs **only** the thirteen-step Hailo ladder, each step in its own child
+process, and prints a verdict. It is read-only: it opens no camera and talks to no
+flight controller. Use the same Python you used for the earlier scout — if that
+was inside the venv, `source /home/ace/real_pi/.venv/bin/activate` first, because
+the ladder must run on the interpreter that has `hailo_platform`.
+
+### Step 3 — read the verdict
+
+Three outcomes, three different meanings. Look at the `hailosteps :` line.
+
+**(a) `ok - every step completed`** — the API generation *was* the cause. Then look
+at the `detector :` line: if it no longer says CRASHED, `mission_pi` can start with
+the HEF in place, and the Hailo rung of the detector is usable. That is the result
+that unblocks everything else.
+
+**(b) `CRASHED at: ... vdev.configure ...` (or later)** — the reorder was *not* the
+cause. The next suspect is already documented in
+`BENCH_RUNBOOK.md`, stage 0c: Pi 5 uses 16 KB kernel pages while the Hailo PCIe
+device declares 4096-byte max descriptor pages. Fix:
+
+```
+echo "options hailo_pci force_desc_page_size=4096" | sudo tee /etc/modprobe.d/hailo_pci.conf
+sudo reboot
+```
+
+then re-run Step 2. Also paste the `[HailoRT]` lines the report captured.
+
+**(c) `FAILED at: ...`** — a plain Python error, not a crash. The step name says
+where, and the report keeps the error text. That is a bug to fix in this repo, and
+the text is what I need.
+
+In all three cases, the useful thing to paste back is the whole `hailosteps`
+block plus the `detector` block, including any `[HailoRT] [error] ...` lines —
+and the new `which generation won:` line from step 5, which is the specific
+question this round is asking.
+
+### Step 4 — the camera, in the same pass
+
+```
+python3 tools/list_cams.py
+```
+
+The earlier report saw 26 `/dev/video*` nodes. Most are the Pi's own codec/ISP
+devices; `list_cams.py` marks each node `CAPTURE` or `skip` without opening a
+stream, and reports how `config.yaml` would assign the roles. What I need back is
+which node it says is the **bottom** camera, and whether `csi:` finds the UC-517 at
+all.
+
+### Step 5 — the full survey, when Steps 2-4 look sane
+
+```
+cd ~/arena_ai_uploads/real_pi/mission_pi
+python3 tools/pi_field_report.py --out-dir ~/pi_field_reports
+```
+
+The JSON lands in `~/pi_field_reports`. Paste the terminal output; the JSON is only
+needed if something needs to be dug into further.
+
+### Meanwhile, in the repository issue queue
+
+Issue #11 is queued with `/pi scout hardware=no`. The sandbox token can create an
+issue but cannot attach labels, so the `pi:job` label was not applied and the agent
+will not pick the job up on its own. Either add that label by hand in the browser,
+or just run Step 2 above directly — it is the same report.
