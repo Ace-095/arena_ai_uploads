@@ -21,8 +21,12 @@ export PI_AGENT_TOKEN="$(cat ~/.pi_agent_token)"
 export PI_AGENT_REPO="Ace-095/arena_ai_uploads"
 
 python3 tools/pi_agent.py --selftest        # must say "You are good to go"
-python3 tools/pi_agent.py --queue "/pi scout" && python3 tools/pi_agent.py --once
+python3 tools/pi_agent.py --queue "/pi scout"   # queues it AND runs it
 ```
+
+Every run now prints what it did — `no jobs waiting`, or `#8 replied (action
+scout, exit 0, 11.4s)`. If it prints nothing at all, something is wrong; it is
+never silent by design.
 
 Step-by-step instructions for each of those, including the token, follow in §4.
 
@@ -292,14 +296,33 @@ them looks wrong to you, stop and say so.
 ### Step 6 - first real job
 
 ```bash
-python3 tools/pi_agent.py --queue "/pi help" && python3 tools/pi_agent.py --once
+python3 tools/pi_agent.py --queue "/pi help"
 ```
 
-This creates a labelled issue, runs the action, and comments the result back.
-Then look at it:
+That creates a labelled issue, runs the action, and comments the result back.
+Expected output:
+
+```
+queued: queued /pi help as https://github.com/Ace-095/arena_ai_uploads/issues/8 (#8)
+running it now ...
+#8 replied (action help, exit 0, 0.1s)
+```
+
+Then the read-only survey:
 
 ```bash
-python3 tools/pi_agent.py --queue "/pi scout" && python3 tools/pi_agent.py --once
+python3 tools/pi_agent.py --queue "/pi scout"
+```
+
+`--queue` runs the job **by issue number**, immediately. It deliberately does not
+re-list the queue to find what it just created: a list that lags an issue's
+creation by even a moment would make the run silently do nothing, which is
+exactly what happened on the first attempt. `--no-run` queues without running, and
+`--once` drains anything queued elsewhere (the browser, or another machine):
+
+```bash
+python3 tools/pi_agent.py --queue "/pi scout" --no-run   # queue only
+python3 tools/pi_agent.py --once                         # run whatever is queued
 ```
 
 `scout` is the read-only field survey: board, thermal, deps, Hailo, the detector
@@ -328,8 +351,7 @@ cd ~/arena_ai_uploads/real_pi/mission_pi
 export PI_AGENT_TOKEN="$(cat ~/.pi_agent_token)"
 export PI_AGENT_REPO="Ace-095/arena_ai_uploads"
 
-python3 tools/pi_agent.py --queue "/pi fov dist_m=2.0 panel_mm=420 panel_mm_h=297 hardware=yes" \
-  && python3 tools/pi_agent.py --once
+python3 tools/pi_agent.py --queue "/pi fov dist_m=2.0 panel_mm=420 panel_mm_h=297 hardware=yes"
 ```
 
 * `dist_m` = what your tape says, in metres (here 2.0).
@@ -409,7 +431,9 @@ Run it as your normal user, never as root - it needs no root for anything.
 | `not queued: the pi:job label did NOT stick` | same cause; the issue was created but never queued — add the label in the browser or fix the token |
 | `401` / `token is valid` FAIL | wrong token, or it expired (check the expiry date from step 1) |
 | `need --repo owner/name` | `export PI_AGENT_REPO=...` is missing in this shell |
+| `no jobs waiting` | the queue is empty - nothing is labelled `pi:job`. Expected if you already ran it |
 | A job is silently ignored | no `pi:job` label, or you are not the issue's author, or it is already `pi:done` |
+| Nothing printed at all | should not happen: every path prints an outcome now. Check `~/.pi_agent.log` |
 | `refused: mission_pi is running` | stop `mission_pi`: it owns the camera and the serial port |
 | `FOV : NOT MEASURED - ...` then a reason | sheet off-centre, touching an edge, too small in frame, or not bright enough against the floor. The reason is printed after the dash — read it, it is specific |
 | `no camera detected for role 'bottom' - see list_cams above` | run `python3 tools/list_cams.py`, and make sure nothing else holds the camera |

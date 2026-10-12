@@ -719,7 +719,7 @@ class TestQueueJob(unittest.TestCase):
         self.t = A.FakeTransport(owner="owner")
 
     def test_a_good_command_is_queued_and_labelled(self):
-        ok, msg = A.queue_job(self.t, "/pi scout")
+        ok, msg, _n = A.queue_job(self.t, "/pi scout")
         self.assertTrue(ok, msg)
         # the label lives on the created issue (labels[1000] is only written by
         # set_labels, which queueing does not call)
@@ -728,19 +728,19 @@ class TestQueueJob(unittest.TestCase):
         self.assertEqual(self.t.issues[0]["body"], "/pi scout")
 
     def test_something_that_is_not_a_command_is_refused(self):
-        ok, msg = A.queue_job(self.t, "run the tests please")
+        ok, msg, _n = A.queue_job(self.t, "run the tests please")
         self.assertFalse(ok)
         self.assertIn("/pi", msg)
         self.assertEqual(self.t.issues, [], "a non-command created an issue")
 
     def test_an_unknown_action_is_refused_before_creating_an_issue(self):
-        ok, msg = A.queue_job(self.t, "/pi delete_everything")
+        ok, msg, _n = A.queue_job(self.t, "/pi delete_everything")
         self.assertFalse(ok)
         self.assertIn("not an action", msg)
         self.assertEqual(self.t.issues, [])
 
     def test_a_bad_parameter_is_refused_before_creating_an_issue(self):
-        ok, msg = A.queue_job(self.t, "/pi fov dist_m=abc panel_mm=420")
+        ok, msg, _n = A.queue_job(self.t, "/pi fov dist_m=abc panel_mm=420")
         self.assertFalse(ok)
         self.assertIn("must be a number", msg)
         self.assertEqual(self.t.issues, [])
@@ -754,7 +754,7 @@ class TestQueueJob(unittest.TestCase):
                 url, number, _got = A.FakeTransport.create_issue(
                     self, title, body, labels=())
                 return url, number, []          # what the real API returned
-        ok, msg = A.queue_job(DropsLabels(owner="owner"), "/pi scout")
+        ok, msg, _n = A.queue_job(DropsLabels(owner="owner"), "/pi scout")
         self.assertFalse(ok, "a job that was never queued reported success")
         self.assertIn("did NOT stick", msg)
         self.assertIn("Issues: Read and write", msg)
@@ -762,6 +762,126 @@ class TestQueueJob(unittest.TestCase):
     def test_the_issue_title_names_the_action(self):
         A.queue_job(self.t, "/pi fov dist_m=2.0 panel_mm=420 hardware=yes")
         self.assertIn("fov", self.t.issues[0]["title"])
+
+
+class TestItSaysWhatItDid(unittest.TestCase):
+    """The first real run on the Pi worked and printed nothing.
+
+    `--queue "/pi scout" && --once` queued the job and then found nothing - so
+    nothing ran, nothing was said, and the tool looked broken while behaving
+    correctly. Silence is the bug: every run now reports an outcome.
+    """
+
+    def setUp(self):
+        # A per-test temp dir. The first version used fixed /tmp paths, so the
+        # agent's STATE FILE survived between runs, the second run saw its own
+        # jobs as already done and skipped them, and the tests passed once and
+        # then failed forever after. Not hermetic - now it is.
+        self._real = A.GitHubTransport
+        self.fake = A.FakeTransport(owner="Ace-095",
+                                    repo="Ace-095/arena_ai_uploads")
+        A.GitHubTransport = lambda repo, token, **kw: self.fake
+        self._tmp = tempfile.mkdtemp()
+        self.state = os.path.join(self._tmp, "state.json")
+        self.logf = os.path.join(self._tmp, "agent.log")
+
+    def tearDown(self):
+        A.GitHubTransport = self._real
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _run(self, argv):
+        import contextlib
+        import io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = A.main(["--repo", "Ace-095/arena_ai_uploads",
+                         "--token-env", "DEFINITELY_NOT_SET"] + argv)
+        return rc, out.getvalue()
+
+    def test_an_empty_queue_says_so(self):
+        rc, out = self._run(["--once", "--state", self.state,
+                             "--log", self.logf])
+        self.assertEqual(rc, 0)
+        self.assertIn("no jobs waiting", out)
+
+    def test_queueing_also_runs_it_and_says_what_happened(self):
+        rc, out = self._run(["--queue", "/pi help", "--state", self.state,
+                             "--log", self.logf])
+        self.assertEqual(rc, 0)
+        self.assertIn("queued:", out)
+        self.assertIn("running it now", out)
+        self.assertIn("replied", out)
+        self.assertTrue(self.fake.comments, "the queued job never ran")
+
+    def test_no_run_only_queues(self):
+        rc, out = self._run(["--queue", "/pi help", "--no-run",
+                             "--state", self.state, "--log", self.logf])
+        self.assertEqual(rc, 0)
+        self.assertIn("queued for later", out)
+        self.assertEqual(self.fake.comments, {}, "it ran despite --no-run")
+
+    def test_a_rejected_command_exits_nonzero_and_says_why(self):
+        rc, out = self._run(["--queue", "/pi fov dist_m=abc",
+                             "--state", self.state, "--log", self.logf])
+        self.assertEqual(rc, 1)
+        self.assertIn("not queued", out)
+        self.assertIn("must be a number", out)
+        self.assertEqual(self.fake.issues, [], "a bad command created an issue")
+
+    def test_queueing_does_not_depend_on_re_listing_to_find_its_own_issue(self):
+        """The race that made the first real run look broken.
+
+        `--queue` creates the issue and `--once` re-lists to find it. If the list
+        filter lags the creation at all, --once finds nothing, runs nothing, says
+        nothing, and the tool looks broken while behaving correctly. Fetching the
+        issue BY NUMBER removes the dependency on listing entirely.
+
+        The lag is MODELLED here, not observed: with the fake's instant list this
+        test could not tell the two designs apart, so a mutation that reverted to
+        re-listing passed. The model makes the property testable.
+        """
+        class LaggingList(A.FakeTransport):
+            """An issue is not visible to the list the instant it is created -
+            which is what the two-command pattern has to survive."""
+            created_at = None
+
+            def create_issue(self, title, body, labels=(A.JOB_LABEL,)):
+                out = A.FakeTransport.create_issue(self, title, body, labels)
+                self.created_at = out[1]
+                return out
+
+            def list_jobs(self):
+                return [i for i in A.FakeTransport.list_jobs(self)
+                        if i["number"] != self.created_at]
+
+            def get_issue(self, number):
+                for it in self.issues:
+                    if it["number"] == number:
+                        return it
+                return None
+        lagging = LaggingList(owner="Ace-095", repo="Ace-095/arena_ai_uploads")
+        A.GitHubTransport = lambda repo, token, **kw: lagging
+        rc, out = self._run(["--queue", "/pi help", "--state", self.state,
+                             "--log", self.logf])
+        self.assertEqual(rc, 0)
+        self.assertTrue(lagging.comments,
+                        "the queued job never ran - it was found by re-listing, "
+                        "which the lag hides")
+        self.assertIn("replied", out)
+
+    def test_a_refusal_is_summarised_too(self):
+        """Not a permission problem - a refusal must still be visible."""
+        class Stranger(A.FakeTransport):
+            pass
+        t = Stranger(owner="Ace-095", login="someone-else")
+        A.GitHubTransport = lambda repo, token, **kw: t
+        w = A.Agent(t, ["Ace-095"], state_path=self.state, log=self.logf)
+        it = issue(number=3, body="/pi help", author="random-person")
+        t.issues = [it]
+        w.poll_once()
+        self.assertTrue(any("REFUSED" in x for x in w.last_summaries),
+                        "a refusal produced no summary: %s" % w.last_summaries)
 
 
 class TestCli(unittest.TestCase):

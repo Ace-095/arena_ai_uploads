@@ -776,6 +776,10 @@ class GitHubTransport(object):
                            % (self.repo, limit))
         return [i for i in (d or []) if "pull_request" not in i]
 
+    def get_issue(self, number):
+        _s, d = self._call("GET", "/repos/%s/issues/%s" % (self.repo, number))
+        return d
+
     def create_comment(self, number, body):
         _s, d = self._call("POST", "/repos/%s/issues/%s/comments"
                            % (self.repo, number), {"body": body})
@@ -880,6 +884,12 @@ class FakeTransport(object):
     def list_issues(self, limit=5):
         return [i for i in self.issues if i.get("state", "open") == "open"][:limit]
 
+    def get_issue(self, number):
+        for it in self.issues:
+            if it["number"] == number:
+                return it
+        return None
+
     def create_comment(self, number, body):
         self.comments.setdefault(number, []).append(body)
         return 4242
@@ -913,6 +923,10 @@ class Agent(object):
         self.state_path = state_path
         self.max_jobs = max(1, int(max_jobs))
         self.clock = clock
+        # What happened this poll. The first real run on the Pi did the right
+        # thing and printed NOTHING, so "did nothing" and "worked" looked
+        # identical - that ambiguity is what this exists to remove.
+        self.last_summaries = []
         self.seen = self._load_state()
 
     # -- state --------------------------------------------------------------
@@ -957,6 +971,7 @@ class Agent(object):
         except Exception as e:
             self.log("poll failed: %s" % redact(str(e)))
             return 0
+        self.last_summaries = []
         handled = 0
         for issue in (jobs or [])[:self.max_jobs]:
             try:
@@ -987,6 +1002,8 @@ class Agent(object):
                     author, number))
                 self.t.set_labels(number, remove=(JOB_LABEL,),
                                   add=(REFUSED_LABEL,))
+            self.last_summaries.append(
+                "#%s REFUSED: @%s is not allowed to give orders" % (number, author))
             return True
 
         job = parse_job(issue)
@@ -1028,8 +1045,14 @@ class Agent(object):
         self._save_state()
         if res.refused:
             self.t.set_labels(number, remove=(JOB_LABEL,), add=(REFUSED_LABEL,))
+            first = (res.out or "no reason given").splitlines()
+            self.last_summaries.append("#%s refused: %s"
+                                       % (number, first[0] if first else ""))
         else:
             self.t.set_labels(number, remove=(JOB_LABEL,), add=(DONE_LABEL,))
+            self.last_summaries.append(
+                "#%s replied (action %s, exit %s, %.1fs)"
+                % (number, job.action, res.rc, res.seconds))
         return True
 
     def _refusal_comment(self, author, number):
@@ -1125,8 +1148,19 @@ def selftest(transport, log=print):
                                   "pi_agent self-test, safe to delete"), True)[1]))
 
     # Borrow an open issue if there is one; otherwise make a throwaway.
-    found = step("list open issues (Issues: read)",
-                 lambda: transport.list_issues(5)) or []
+    # Capture the list out of band and report a SUMMARY: the first version
+    # printed a raw shortened API object, ~300 characters of url/node_id noise
+    # in the middle of a report meant to be read at a glance.
+    found_holder = {}
+
+    def list_and_summarise():
+        got = transport.list_issues(5)
+        found_holder["issues"] = got
+        return "%d open: %s" % (
+            len(got), ", ".join("#%s" % i.get("number") for i in got) or "none")
+
+    step("list open issues (Issues: read)", list_and_summarise)
+    found = found_holder.get("issues") or []
     issue_no, created_issue = None, False
     if found:
         issue_no = found[0].get("number")
@@ -1202,17 +1236,19 @@ def queue_job(transport, command, title=None):
     The command is parsed and validated with the SAME code the poller uses, so a
     typo is refused here with the same message the Pi would have sent back - it
     never becomes a mystery issue sitting unlabelled in the repository.
+
+    Returns (ok, message, issue_number_or_None).
     """
     body = command.strip()
     if not body.startswith("/pi"):
-        return False, "a command starts with `/pi` (for example `/pi scout`)"
+        return False, "a command starts with `/pi` (for example `/pi scout`)", None
     job = parse_job({"number": 0, "body": body, "user": {"login": "local"}})
     if job.error:
-        return False, job.error
+        return False, job.error, None
     action = REGISTRY.get(job.action)
     err = action.check(job.params)
     if err:
-        return False, err
+        return False, err, None
     title = title or ("pi: %s" % (job.action +
                                   (" " + " ".join("%s=%s" % kv for kv in
                                                   sorted(job.params.items()))
@@ -1223,8 +1259,8 @@ def queue_job(transport, command, title=None):
             "the issue was created (%s) but the `%s` label did NOT stick, so the "
             "agent will never pick it up. The token can create issues but not "
             "label them - it needs Issues: Read and write. Add the label by hand "
-            "in the browser, or fix the token and re-queue." % (url, JOB_LABEL))
-    return True, "queued %s as %s (#%s)" % (body, url, number)
+            "in the browser, or fix the token and re-queue." % (url, JOB_LABEL)), number
+    return True, "queued %s as %s (#%s)" % (body, url, number), number
 
 
 def _who():
@@ -1266,8 +1302,11 @@ def main(argv=None):
                          "needs, then exit. Creates and removes its own test "
                          "label; runs no action")
     ap.add_argument("--queue", metavar="COMMAND",
-                    help="validate a command and queue it as a labelled issue, "
-                         "then exit (e.g. --queue '/pi scout')")
+                    help="validate a command, queue it as a labelled issue, and "
+                         "run it (e.g. --queue '/pi scout'). Use --no-run to only "
+                         "queue it")
+    ap.add_argument("--no-run", action="store_true",
+                    help="with --queue: create the issue but do not run it now")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args(argv)
 
@@ -1316,9 +1355,32 @@ def main(argv=None):
         return 0 if ok else 1
 
     if args.queue:
-        ok, msg = queue_job(transport, args.queue)
+        ok, msg, number = queue_job(transport, args.queue)
         print(("queued: " if ok else "not queued: ") + msg)
-        return 0 if ok else 1
+        if not ok:
+            return 1
+        if args.no_run:
+            print("queued for later - run `--once` when you want it, or a "
+                  "`--loop` agent will pick it up")
+            return 0
+        # Run it BY NUMBER, immediately. The `--queue ... && --once` pattern this
+        # replaces made --once race its own issue into existence and it found
+        # nothing, which on the first real run looked exactly like a broken tool.
+        # Fetching the issue directly removes the race instead of waiting it out.
+        print("running it now ...")
+        try:
+            issue = transport.get_issue(number)
+        except Exception as e:
+            print("could not read back #%s: %s - it is queued; run `--once`"
+                  % (number, redact(str(e))))
+            return 1
+        agent = Agent(transport, allow, dry_run=False, log=args.log,
+                      verbose=args.verbose, state_path=args.state,
+                      max_jobs=args.max_jobs)
+        agent.handle(issue)
+        for line in agent.last_summaries:
+            print(line)
+        return 0
 
     agent = Agent(transport, allow, dry_run=args.dry_run, log=args.log,
                   verbose=args.verbose, state_path=args.state,
@@ -1337,6 +1399,14 @@ def main(argv=None):
     try:
         while True:
             n = agent.poll_once()
+            # Always say something. The first real run on the Pi worked and
+            # printed nothing, which is indistinguishable from doing nothing.
+            if n:
+                print("handled %d job(s)" % n)
+                for line in agent.last_summaries:
+                    print("  " + line)
+            else:
+                print("no jobs waiting")
             if n:
                 agent.log("handled %d job(s)" % n)
             if args.once:
