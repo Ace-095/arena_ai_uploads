@@ -228,8 +228,13 @@ def main():
     tuning = None
     if isinstance(cam, PiCamera):
         tuning = cam._load_tuning()
-    picam = (Picamera2(cam.index, tuning=tuning) if tuning is not None
-             else Picamera2(cam.index))
+    # The tuning reaches libcamera through LIBCAMERA_IPA_CONFIG_PATH, installed
+    # by CameraRig.detect() BEFORE the camera manager existed. Do NOT pass the
+    # dict here: picamera2 turns it into a global LIBCAMERA_RPI_TUNING_FILE
+    # override that is both too late (this process already has a manager - the
+    # 2026-10-13 sweep drove LensPosition against the stock tuning exactly this
+    # way) and wrong for any second camera in the process.
+    picam = Picamera2(cam.index)
     conf = {"size": tuple(cam.size), "format": "RGB888"}
     picam.configure(picam.create_video_configuration(main=conf))
     picam.start()

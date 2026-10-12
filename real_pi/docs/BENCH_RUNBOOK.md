@@ -833,6 +833,45 @@ settles it; a flat curve means the motor never moved.
 Still NOT YET MEASURED: VCM motion, real camera capture, the real lens FOV,
 end-to-end QR detection at altitude, any flight result.
 
+### MEASURED at `9db71dc`: the lens did not move - the tuning never reached libcamera
+
+`tools/focus_sweep.py --positions 0:0.3:0.05` on the Pi (2026-10-13) produced
+seven identical sharpness scores (0.7, flat curve) and, for every position:
+
+```
+Using tuning file /usr/share/libcamera/ipa/rpi/pisp/imx477.json     <- STOCK
+WARN Could not set AF_MODE - no AF algorithm
+WARN Could not set LENS_POSITION - no AF algorithm
+```
+
+**The shipped `models/imx477_af.json` never reached libcamera.** Verified in
+raspberrypi/libcamera source (`ipa_proxy.cpp`, `pipeline_base.cpp`): the tuning
+file is chosen **once**, when the pipeline handler registers the camera - which
+happens when the FIRST `CameraManager` starts in the process, i.e. during
+`CameraRig.detect()`'s `Picamera2.global_camera_info()`. picamera2's `tuning=`
+dict works by setting `LIBCAMERA_RPI_TUNING_FILE` inside the `Picamera2`
+**constructor** - after that moment it is a silent no-op. And the env var is a
+single-file override for EVERY camera in the process anyway.
+
+The mechanism that survives the ordering is `LIBCAMERA_IPA_CONFIG_PATH`: for
+each camera, libcamera looks for `<dir>/<rpi/pisp>/<sensor>.json` **before** its
+stock files. `cameras.install_tuning_env()` now materialises one file per
+configured sensor that has a `tuning_file` and prepends its cache to that path
+**at the top of `CameraRig.detect()`**, before any enumeration. Per-sensor
+naming means a second camera (e.g. the imx708 front) keeps its stock tuning.
+`focus_sweep.py` no longer passes the dict at all.
+
+Tests (`tests/test_tuning_env.py`, 5 functions): the file lands under the SENSOR
+name; only named sensors are overridden; **the override is already on the path
+when `global_camera_info()` runs** (the measured failure, pinned); the open path
+does not use the global dict override; junk never raises. Mutations each caught:
+no early install (`env: []` at enumeration), naming by file instead of sensor,
+dict override always used.
+
+**What the flat sweep did NOT establish:** whether the VCM hardware moves at
+all. That is still open, and the re-run with the tuning actually loaded is the
+test.
+
 ### THE ORIGINAL LEADING CAUSE, and what changed because of it
 
 The crash was at `vdev.configure(hef, cfg)` — the call immediately after

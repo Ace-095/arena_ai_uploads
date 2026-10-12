@@ -74,6 +74,141 @@ def default_tuning_path(sensor, dirs=None):
             return p
     return None
 
+def tuning_candidates(spec, here=None, cwd=None):
+    """The local files `tuning_file` could mean, de-duplicated, in search order.
+
+    Shared by the resolver and by the warning text, so a missing file's message
+    lists EXACTLY where we looked - the operator's only clue.
+    """
+    if not spec:
+        return []
+    here = os.path.dirname(os.path.abspath(__file__)) if here is None else here
+    cwd = os.getcwd() if cwd is None else cwd
+    spec = str(spec).strip()
+    if os.path.isabs(spec):
+        cand = [spec]
+    else:
+        # models/ is where the repo keeps its weights, so it is the obvious
+        # no-sudo drop-in for a tuning file we ship ourselves.
+        cand = [os.path.join(here, spec), os.path.join(cwd, spec),
+                os.path.join(here, "models", spec)]
+    seen, uniq = set(), []
+    for path in cand:
+        if path not in seen:
+            seen.add(path)
+            uniq.append(path)
+    return uniq
+
+
+def resolve_tuning_file(spec, here=None, cwd=None):
+    """Where `tuning_file` actually is on disk, or None. No libcamera involved.
+
+    NAME -> next to cameras.py, the working dir, models/ (the no-sudo copy that
+    survives OS updates), then libcamera's own IPA dirs. PATH -> exactly there.
+    Pure filesystem work, so it can run BEFORE any camera exists - which is the
+    only moment when the answer can still change what libcamera will load.
+    """
+    if not spec:
+        return None
+    for path in tuning_candidates(spec, here=here, cwd=cwd):
+        if os.path.isfile(path):
+            return path
+    if "/" not in spec:
+        for d in IPA_TUNING_DIRS:
+            path = os.path.join(d, spec)
+            if os.path.isfile(path):
+                return path
+    return None
+
+
+def _ipa_name():
+    """Which IPA dir libcamera will consult on this board (Pi 5 = rpi/pisp)."""
+    try:
+        with open("/proc/device-tree/model") as f:
+            model = f.read().lower()
+        if "pi 5" in model or "cm5" in model or "compute module 5" in model:
+            return "rpi/pisp"
+        if "pi 4" in model or "cm4" in model or "compute module 4" in model:
+            return "rpi/vc4"
+    except Exception:
+        pass
+    return ("rpi/pisp" if os.path.isdir(IPA_TUNING_DIRS[0])
+            else ("rpi/vc4" if os.path.isdir(IPA_TUNING_DIRS[1]) else "rpi/pisp"))
+
+
+def install_tuning_env(cfg=None, pairs=None, cache_root=None, ipa_name=None):
+    """Put per-sensor tuning overrides on libcamera's tuning search path. EARLY.
+
+    libcamera chooses each camera's tuning file ONCE, when its pipeline handler
+    registers the camera - which happens when the FIRST CameraManager starts in
+    this process (Picamera2.global_camera_info() inside CameraRig.detect()).
+    picamera2's `tuning=` dict sets LIBCAMERA_RPI_TUNING_FILE inside the
+    Picamera2 CONSTRUCTOR, which is after that. Measured on the UC-517
+    (2026-10-13): focus_sweep drove LensPosition against the stock imx477.json
+    ("Could not set LENS_POSITION - no AF algorithm", a perfectly flat curve)
+    while the repo shipped a working imx477_af.json and every gate in this
+    module said the AF algorithm was present. The dict hand-off silently did
+    nothing.
+
+    The mechanism that survives the ordering is LIBCAMERA_IPA_CONFIG_PATH: for
+    every camera, libcamera looks for <dir>/<ipaName>/<sensor>.json BEFORE its
+    own stock files (raspberrypi/libcamera ipa_proxy.cpp, ipaConfigurationFile).
+    One file is materialised per configured sensor that has a resolvable
+    `tuning_file`; sensors we do not name keep their STOCK tuning - a second
+    camera is never handed the first one's tuning, which is what the global
+    LIBCAMERA_RPI_TUNING_FILE override cannot promise.
+
+    MUST run before any libcamera enumeration. Never raises: a missing tuning
+    file is a warning, not a bring-up failure. Returns (installed, notes).
+    """
+    installed, notes = [], []
+    try:
+        import shutil
+        pairs = [tuple(x) for x in (pairs or [])]
+        if cfg is not None:
+            cam_cfg = cfg.get("cameras", {}) or {}
+            role_sensor = {}
+            try:
+                role_sensor = {v: k for k, v in
+                               CameraRig.DEFAULT_SENSOR_ROLE.items()}
+            except Exception:
+                role_sensor = {"front": "imx708", "bottom": "imx477"}
+            for role in ("front", "bottom"):
+                ccfg = cam_cfg.get(role) or {}
+                if not ccfg.get("tuning_file"):
+                    continue
+                sensor = (str(ccfg.get("match_name") or "").strip().lower()
+                          or role_sensor.get(role))
+                pairs.append((sensor, ccfg.get("tuning_file")))
+        root = cache_root or os.path.join(os.path.expanduser("~"), ".cache",
+                                          "mission_pi", "ipa")
+        ipa = ipa_name or _ipa_name()
+        for sensor, spec in pairs:
+            sensor = str(sensor or "").strip().lower()
+            if not sensor or not spec:
+                continue
+            src = resolve_tuning_file(spec)
+            if not src:
+                notes.append("tuning_file %r for %s not found anywhere - "
+                             "libcamera keeps its stock tuning for it"
+                             % (spec, sensor))
+                continue
+            dest = os.path.join(root, ipa, "%s.json" % sensor)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            shutil.copyfile(src, dest)
+            installed.append((sensor, dest))
+        if installed:
+            old = [x for x in
+                   os.environ.get("LIBCAMERA_IPA_CONFIG_PATH", "").split(os.pathsep)
+                   if x]
+            if root not in old:
+                os.environ["LIBCAMERA_IPA_CONFIG_PATH"] = \
+                    os.pathsep.join([root] + old)
+    except Exception as e:
+        notes.append("install_tuning_env failed: %r" % (e,))
+    return installed, notes
+
+
 try:
     from picamera2 import Picamera2
     _HAVE_PICAM = True
@@ -639,39 +774,19 @@ class Camera(_BaseCamera):
             return None
         import json
         spec = self.tuning_file
-        here = os.path.dirname(os.path.abspath(__file__))
-        candidates = []
-        if os.path.isabs(spec):
-            candidates.append(spec)
-        else:
-            candidates.append(os.path.join(here, spec))
-            candidates.append(os.path.join(os.getcwd(), spec))
-            # models/ is where the repo keeps its weights, so it is the
-            # obvious no-sudo drop-in for a tuning file we ship ourselves.
-            candidates.append(os.path.join(here, "models", spec))
-        # de-dup: cwd == the repo dir on the Pi, so the same path otherwise
-        # shows up twice in the warning and looks like a broken lookup
-        seen, uniq = set(), []
-        for p in candidates:
-            if p not in seen:
-                seen.add(p)
-                uniq.append(p)
-        candidates = uniq
-        # 1) A file we can read ourselves: absolute, repo-relative, in the
-        #    working dir, or shipped in models/. A copy in the repo needs no
-        #    sudo and survives OS updates, so it wins over the system one.
-        for path in candidates:
-            if os.path.isfile(path):
-                try:
-                    with open(path) as f:
-                        tuning = json.load(f)
-                    log.info("%s using tuning file %s", self.name, path)
-                    return tuning
-                except Exception as e:
-                    log.warning("%s tuning file %s unreadable (%r) — using the "
-                                "default tuning; autofocus controls may be "
-                                "absent", self.name, path, e)
-                    return None
+        path = resolve_tuning_file(spec)
+        if path:
+            try:
+                with open(path) as f:
+                    tuning = json.load(f)
+                log.info("%s using tuning file %s", self.name, path)
+                return tuning
+            except Exception as e:
+                log.warning("%s tuning file %s unreadable (%r) — using the "
+                            "default tuning; autofocus controls may be "
+                            "absent", self.name, path, e)
+                return None
+        candidates = tuning_candidates(spec)
         # 2) A bare NAME is resolved by libcamera in its own IPA dir
         #    (/usr/share/libcamera/ipa/rpi/pisp/...) — which is exactly where
         #    Arducam's imx477_af.json lands when it is installed system-wide.
@@ -736,8 +851,21 @@ class Camera(_BaseCamera):
         if not _HAVE_PICAM:
             raise RuntimeError("picamera2 not installed: %r" % (_PICAM_ERR,))
         tuning = self._load_tuning()
-        self._picam = (Picamera2(self.index, tuning=tuning)
-                       if tuning is not None else Picamera2(self.index))
+        installed = False
+        if self.tuning_file and self.model:
+            try:
+                installed = bool(install_tuning_env(
+                    pairs=[(self.model, self.tuning_file)])[0])
+            except Exception:
+                installed = False
+        if installed:
+            # The per-sensor path delivers the tuning; passing the dict as well
+            # would set LIBCAMERA_RPI_TUNING_FILE globally - a single-file
+            # override that can hand a second camera THIS camera's tuning.
+            self._picam = Picamera2(self.index)
+        else:
+            self._picam = (Picamera2(self.index, tuning=tuning)
+                           if tuning is not None else Picamera2(self.index))
         # The SENSOR NAME decides which default tuning libcamera picks, and
         # the camera knows it even when config never said: read it from the
         # opened device before judging the tuning (rig-supplied model is kept
@@ -1392,6 +1520,17 @@ class CameraRig:
         return c
 
     def detect(self):
+        # FIRST, before anything can start a libcamera CameraManager: the
+        # tuning file is chosen when the camera is registered (see
+        # install_tuning_env). One call here covers every consumer of the rig.
+        try:
+            _inst, _notes = install_tuning_env(self.cfg)
+            for sensor, dest in _inst:
+                log.info("tuning override for %s -> %s", sensor, dest)
+            for note in _notes:
+                log.warning("%s", note)
+        except Exception as e:
+            log.warning("tuning env install failed: %r", e)
         cam_cfg = self.cfg.get("cameras", {}) or {}
         front_cfg = cam_cfg.get("front", {}) or {}
         bottom_cfg = cam_cfg.get("bottom", {}) or {}
