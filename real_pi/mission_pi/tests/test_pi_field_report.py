@@ -349,6 +349,38 @@ class TestHailoSteps(unittest.TestCase):
         return {"rc": 1, "signal": None, "stdout": "", "stderr": err,
                 "timed_out": False}
 
+    def test_no_step_label_names_an_api_its_body_never_calls(self):
+        """A LABEL IS A CLAIM ABOUT THE CODE THAT RUNS.
+
+        Step 5 was labelled "hef.create_configure_params(StreamInterface.PCIe)"
+        while its body called hailo_configure_params(), so a report reading
+        "CRASHED at: 5. hef.create_configure_params" would have named a call
+        that never ran - the exact trap that produced the SIGSEGV hunt. Every
+        API a label names must actually appear in that step's program.
+        """
+        seen = []
+        real, F._child = F._child, (
+            lambda code, timeout=120, cwd=None: (
+                seen.append(code),
+                {"rc": 0, "signal": None, "stdout": "", "stderr": "",
+                 "timed_out": False})[1])
+        try:
+            got = F.sec_hailo_steps(make_args())
+        finally:
+            F._child = real
+        self.assertEqual(len(seen), 13, "one program per ladder step")
+        steps = list(zip([e["step"] for e in got["steps"]], seen))
+        apis = ("hef.create_configure_params", "hailo_configure_params",
+                "create_from_hef", "vdev.configure", "create_params",
+                "Device.scan", "InferVStreams", "activate", "vstream_infos",
+                "VDevice", "HEF")
+        for label, code in steps:
+            for api in apis:
+                if api in label:
+                    self.assertIn(api, code,
+                                  "%r is named in the label %r but is not in "
+                                  "that step's program" % (api, label))
+
     def test_all_ok(self):
         got = self._with_child([self.ok()] * 13)
         self.assertEqual(got["verdict"], "ok - every step completed")

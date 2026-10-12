@@ -364,9 +364,18 @@ def sec_hailo_steps(args):
          'type(hef).__name__)' % hef_abs),
         ("4. open the device (hp.VDevice)",
          'import hailo_platform as hp; v = hp.VDevice(); print("VDevice ok")'),
-        ("5. hef.create_configure_params(StreamInterface.PCIe)",
-         pre + 'cfg = hailo_configure_params(hef, hp)\n'
-               'print("configure params ok:", type(cfg).__name__)'),
+        # The label named hef.create_configure_params while the body called the
+        # helper, so a report reading "CRASHED at: 5. hef.create_configure_params"
+        # would have named a call that never ran. Label and body now agree: this
+        # is the helper production uses, and it says which generation won.
+        ("5. hailo_configure_params(hef, hp), the path production takes",
+         pre + """
+rep = []
+cfg = hailo_configure_params(hef, hp, report=rep)
+print("configure params ok:", type(cfg).__name__)
+print("which generation won:", rep[0]["api"] if rep else "NOT RECORDED")
+print("  and it returned a:", rep[0]["returns"] if rep else "?")
+"""),
         # Hypothesis to test, not assume: hailo_configure_params() tries several
         # API generations and RETURNS THE FIRST THAT DOES NOT RAISE. On a runtime
         # where the modern call exists but rejects the argument, it silently falls
@@ -374,7 +383,7 @@ def sec_hailo_steps(args):
         # configure() then reads as the wrong type - which is a C++ crash, not a
         # Python one. This step reports every generation's availability and result
         # so that stops being a guess.
-        ("5b. which configure-params API generation actually works",
+        ("5b. every configure-params API generation, probed on its own",
          pre + """
 iface = None
 for n in ("HailoStreamInterface", "StreamInterface"):
@@ -403,16 +412,6 @@ if cp is not None:
             print("  %s -> ok: %s" % (label, type(fn()).__name__))
         except Exception as e:
             print("  %s -> RAISED: %s: %s" % (label, type(e).__name__, e))
-# ...and which generation the REAL helper actually picks, which is what the
-# detector will use. This is the line that decides whether the SIGSEGV is a
-# params-generation problem or something else.
-try:
-    rep = []
-    hailo_configure_params(hef, hp, report=rep)
-    print("the helper picks:", rep[0]["api"] if rep else "nothing?")
-    print("  and it returned a:", rep[0]["returns"] if rep else "?")
-except Exception as e:
-    print("the helper raised: %s: %s" % (type(e).__name__, e))
 """),
         ("6. vdev.configure(hef, cfg)",
          pre + 'cfg = hailo_configure_params(hef, hp)\n'

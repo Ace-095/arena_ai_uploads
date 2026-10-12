@@ -580,34 +580,42 @@ crash is in the code that runs *after* `VDevice()` — the configure/streams pat
 
 ### Read this first: the new `hailosteps` line
 
-`scout` now walks Hailo initialisation one step at a time, each in its own child
+`scout` walks Hailo initialisation one step at a time, each step in its own child
 process, so the report names the step that died **and captures HailoRT's own error
-text** — which names the cause:
+text**. The line above is the real one from a Pi 5 (issue #10); it came from the
+earlier five-step ladder, which is why the count reads `4/5`:
 
 ```
-hailosteps : CRASHED at: open the device (hp.VDevice) (3/5 steps ok)
-             died by SIGBUS
-             [HailoRT] [error] CHECK failed - max_desc_page_size given 16384 ...
+hailosteps : CRASHED at: build the detector the ladder would build (4/5 steps ok)
+             died by SIGSEGV
 ```
 
-The steps are exactly what `HailoYolo8Detector.__init__` does, in order:
-`import hailo_platform` → `Device.scan()` → `HEF(path)` → `VDevice()` →
-`hef.create_configure_params()` → **which configure-params API generation exists
-and works** → `vdev.configure()` → `create_params()` → vstream params →
+The ladder is now thirteen steps, and they are exactly what
+`HailoYolo8Detector.__init__` does, in order: `import hailo_platform` →
+`Device.scan()` → `HEF(path)` → `VDevice()` → **`hailo_configure_params(hef, hp)`,
+the path production takes** → **every configure-params API generation, probed on
+its own** → `vdev.configure()` → `create_params()` → vstream params →
 `InferVStreams()` → `activate()` → `hef.get_*_vstream_infos()` → the whole
 constructor. **The first step that dies is the culprit**; the ones after it still
 get probed.
 
+Each step's label is a claim about the code it runs, and a test asserts it: an
+earlier version labelled step 5 `hef.create_configure_params` while its body
+called the helper, which would have put a call that never ran into the crash
+report.
+
 The ladder is cumulative, so one bad call makes several consecutive steps die.
 That is expected: the report names the FIRST one, and only that one is the answer.
 
-The `5b.` step exists to settle a specific hypothesis rather than guess at it:
+Steps 5 and 5b exist to settle a specific hypothesis rather than guess at it:
 `hailo_configure_params()` tries several HailoRT API generations and returns the
 first that does not raise. If the modern call exists but rejects its argument, the
 helper silently falls through to an older constructor whose params object the 4.2x
-`configure()` then reads as the wrong type — a C++ crash, not a Python one. Step
-`5b.` prints which generations exist and what each returns, so that stops being a
-guess.
+`configure()` then reads as the wrong type — a C++ crash, not a Python one. So
+step **5** calls the helper with `report=[…]` and prints **which generation won**,
+and step **5b** probes each generation separately and prints what each one does.
+Together they say either "generation was the problem" or "generation was not the
+problem" without any guessing from this side.
 
 ### THE LEADING CAUSE, and what changed because of it
 
