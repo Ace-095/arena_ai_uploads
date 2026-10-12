@@ -97,11 +97,46 @@ each input's provenance rather than inventing values.
 
 ### The two questions, kept apart
 
-* **Detection** needs a blob — tens of pixels is enough. Met at every altitude.
+* **Detection** needs the QR to be *found* — and "tens of pixels is enough" is
+  wrong as stated; see the measured table below.
 * **Decoding** needs the QR's *modules* sampled. Below ~1.2 px/module the finder
   patterns do not resolve, and no amount of upscaling invents modules the
   sensor never sampled. **Not met at 10 m, 12 m or 15 m with the configured
   lens and a 297 mm symbol.**
+
+#### Detection: measured, not assumed — SYNTHETIC, not flight evidence
+
+Tested with `tests/test_blob_fallback.py`: a *real* QR panel (v4, 41 modules
+incl. quiet zone) rendered on two textured grounds (dark soil, green grass) at
+six module scales, plus six decoys of the same footprint (blank white square,
+checkerboard, salt-pepper noise, stripes, dash "print", one concentric-square
+bullseye). 12 QR cases, 72 decoy cases. Two candidate sources:
+
+| module size | panel | contour scan (global Otsu + 4-gon blobs) | + OpenCV `QRCodeDetector` |
+|---:|---:|---|---|
+| 4.0 px | 164 px | finds the QR (2 of 2 grounds) | finds it, **decodes** the payload |
+| 2.5 px | 102 px | finds it on 1 of 2 grounds | finds it, **decodes** on 1 of 2 |
+| 1.6 px | 66 px | **finds it on 0 of 2** | **finds it on 2 of 2** |
+| 1.2 px | 49 px | no | no |
+| 1.0 px | 41 px | no | no |
+| 0.8 px | 33 px | no | no |
+
+Totals: contour-only **3/12** found, **12/72** decoy false positives; with the
+detector **5/12** found, **12/72** false positives. Below 1 px/module nothing
+measured here finds the QR at all — the finder pattern is under 7 px across,
+the resolution floor the established scanners assume.
+
+Why the contour path fails where it does: a high-contrast QR panel destroys a
+**global** Otsu threshold (its own black modules drag the threshold down until
+the panel is no longer one connected region — measured: 1 contour in the frame
+without a QR, 250 with one). It therefore fails hardest exactly where the
+last-resort search needs it. `QRCodeDetector` (quirc) is immune, because it
+scans for the finder pattern's 1:1:3:1:1 run signature instead of a blob.
+
+A hand-written 1:1:3:1:1 scanner was also prototyped and **rejected on its
+measurements**: 11/12 recall but 66/72 decoy false positives, firing on blank
+squares, checkers, noise and stripes alike. Delegating to the established
+implementation is the deliberate choice, not a shortcut.
 
 Two thresholds are reported because the repo contradicts itself slightly, and
 both numbers are useful:

@@ -17,6 +17,18 @@ find_candidates needs numpy + cv2 (same bench stack as decoder.py); the
 clustering and trend helpers are stdlib-only so the policy stays testable
 anywhere. Thresholds are starting guesses — tune from sim snapshots with
 tools/blob_bench.py, not by staring at this file.
+
+Candidate sources, and why there are two: the contour scan needs a clean blob
+out of a global Otsu threshold, which a high-contrast QR panel destroys (its own
+black modules drag the threshold down until the panel is no longer a connected
+region — measured: 1 contour in the frame without a QR, 250 with one). OpenCV's
+quirc-based QRCodeDetector is immune to that, because it scans for the finder
+pattern's 1:1:3:1:1 run signature instead of looking for a blob. Both are used,
+scored by one shared _measure() path, because they fail in different places
+(see tests/test_blob_fallback.py for the measured numbers). Consequence for
+anyone tuning the weights: the "runs" term does NOT separate a blank white
+square from a QR panel — a blank square scores 0.62 — so do not read a high
+score as evidence of QR structure.
 """
 import logging
 import math
@@ -31,6 +43,72 @@ except Exception:
     _np = None
     _cv2 = None
     _HAVE_CV2 = False
+
+
+_QR_DETECTOR = None
+_QR_DETECTOR_DEAD = False
+
+
+def _qr_detector():
+    """Cached cv2.QRCodeDetector (quirc), or None when unavailable.
+
+    Measured on 12 synthetic cases (real QR panel, 2 textured grounds x 6 module
+    scales) and 72 decoy cases (blank square, checkerboard, salt-pepper noise,
+    stripes, dash "print", single concentric-square bullseye); see
+    tests/test_blob_fallback.py, which pins every number quoted here.
+
+      * it finds the QR in 5/12 cases, against 3/12 for the contour path alone
+        - the two extra are 1.6 px/module on both grounds, a scale where the
+        contour path finds nothing at all;
+      * it produced 1 false positive in 72 decoy cases;
+      * it decodes the payload from about 2.5 px/module up, which the contour
+        path never does;
+      * below 1 px/module it is blind, like everything else measured here.
+
+    So it is used as a QR-SPECIFIC HYPOTHESIS SOURCE - it never decides
+    anything: the caller still only ever gets ranked boxes and scores, exactly
+    as before.
+    """
+    global _QR_DETECTOR, _QR_DETECTOR_DEAD
+    if _QR_DETECTOR is None and not _QR_DETECTOR_DEAD:
+        try:
+            _QR_DETECTOR = _cv2.QRCodeDetector()
+        except Exception as e:                 # old/odd OpenCV build
+            _QR_DETECTOR_DEAD = True
+            log.debug("QRCodeDetector unavailable: %r", e)
+    return _QR_DETECTOR
+
+
+def _qr_detector_boxes(gray, cfg):
+    """[(quad, ...)] reported by the QR detector; [] when it is off/missing.
+
+    cfg["qr_detector"] = False turns the extra cost off. Measured cost of
+    detect() alone: 55.6 ms at 2028x1520, 20.2 ms at 1014x760, 5.4 ms at
+    640x480; find_candidates is called about every blob_observe_s (~2 s), so
+    this is a few percent of that budget, not a per-frame cost.
+    """
+    if not cfg.get("qr_detector", True):
+        return []
+    det = _qr_detector()
+    if det is None:
+        return []
+    try:
+        res = det.detect(gray)
+    except Exception as e:
+        log.debug("QRCodeDetector.detect failed: %r", e)
+        return []
+    # 4.x/5.x -> (ok, points); some builds -> (ok, points, straight)
+    if not isinstance(res, tuple) or not res:
+        return []
+    ok = res[0]
+    pts = res[1] if len(res) > 1 else None
+    if not ok or pts is None or len(pts) == 0:
+        return []
+    try:
+        quads = _np.asarray(pts, dtype=_np.float32).reshape(-1, 4, 2)
+    except Exception:
+        return []
+    return [q.reshape(4, 1, 2) for q in quads]
 
 
 def _quad_angle_score(quad):
@@ -72,8 +150,18 @@ def _internal_runs(gray, quad, size=64):
     """B/W transitions inside the quad (warped square, middle rows/cols).
 
     A plain board shows ~0-4 runs; a QR v1 shows ~10+ (finder patterns +
-    data modules). Normalized to 0..1. This is the strongest single term:
-    it separates "white rectangle" from "QR-like structure".
+    data modules). Normalized to 0..1, weight 0.35.
+
+    MEASURED WEAKNESS, stated here because the obvious reading of a high score
+    is wrong: this counts TRANSITIONS, so it does not separate a blank white
+    square from a QR panel - a blank square only scores 0.62 because the other
+    five terms still pay out, and a checkerboard earns runs for having many
+    transitions and no QR structure at all. The ratio criterion that would
+    separate them (a finder pattern's black/white runs are always 1:1:3:1:1) was
+    prototyped and rejected: with a 50% tolerance it fires on noise, stripes and
+    checkers too (66 false positives in 72 decoy cases), which is why the
+    QR-specific work is delegated to OpenCV's detector instead. See
+    tests/test_blob_fallback.py.
     """
     try:
         src = _np.float32([p[0] for p in quad])
@@ -142,20 +230,40 @@ def _scan(gray, bw, cfg, ctx, img_area):
         (_cx, _cy), (rw, rh), _ang = _cv2.minAreaRect(c)
         if rw < 1 or rh < 1:
             continue
-        rectangularity = area / max(1.0, rw * rh)
-        aspect = min(rw, rh) / max(rw, rh)
-        aspect_t = 1.0 - min(1.0, abs(aspect - 0.85) / 0.5)
-        angles = _quad_angle_score(approx)
-        contrast = _local_contrast(gray, x, y, w, h)
-        runs = _internal_runs(gray, approx)
-        size_s = _size_score(max(rw, rh), ctx)
-        m = {"rect": round(rectangularity, 3), "aspect": round(aspect, 3),
-             "angles": round(angles, 3), "contrast": round(contrast, 3),
-             "runs": round(runs, 3), "size": round(size_s, 3)}
-        score = (0.35 * runs + 0.20 * rectangularity + 0.15 * contrast
-                 + 0.10 * aspect_t + 0.10 * angles + 0.10 * size_s)
-        found.append((x, y, w, h, score, m))
+        found.append(_measure(gray, approx, ctx, area=area, rw=rw, rh=rh))
     return found
+
+
+def _measure(gray, quad, ctx, area=None, rw=None, rh=None):
+    """(x, y, w, h, score, metrics) for one quad - the single scoring path.
+
+    Shared by the contour scan and the QR-detector hypotheses so both are
+    ranked on the same scale. Weights are unchanged from the original
+    implementation: they are a heuristic, and the measured weakness (a BLANK
+    white square scores 0.62 because runs=0 still earns rect+contrast+aspect+
+    angles+size) is corrected by the `qr_detector` flag below rather than by
+    re-tuning weights nobody has measured.
+    """
+    x, y, w, h = _cv2.boundingRect(quad)
+    if area is None:
+        area = _cv2.contourArea(quad)
+    if rw is None or rh is None:
+        (_c, (rw, rh), _a) = _cv2.minAreaRect(quad)
+        rw, rh = max(rw, 1.0), max(rh, 1.0)
+    rectangularity = area / max(1.0, rw * rh)
+    aspect = min(rw, rh) / max(rw, rh)
+    aspect_t = 1.0 - min(1.0, abs(aspect - 0.85) / 0.5)
+    angles = _quad_angle_score(quad)
+    contrast = _local_contrast(gray, x, y, w, h)
+    runs = _internal_runs(gray, quad)
+    size_s = _size_score(max(rw, rh), ctx)
+    m = {"rect": round(rectangularity, 3), "aspect": round(aspect, 3),
+         "angles": round(angles, 3), "contrast": round(contrast, 3),
+         "runs": round(runs, 3), "size": round(size_s, 3),
+         "qr_detector": 0.0}
+    score = (0.35 * runs + 0.20 * rectangularity + 0.15 * contrast
+             + 0.10 * aspect_t + 0.10 * angles + 0.10 * size_s)
+    return (x, y, w, h, score, m)
 
 
 def find_candidates(frame_bgr, cfg=None, ctx=None):
@@ -163,7 +271,11 @@ def find_candidates(frame_bgr, cfg=None, ctx=None):
 
     ctx: {alt_m, hfov_deg, img_w, img_h} for the size-plausibility term.
     Scans both polarities (bright panel on dark ground AND dark object on
-    bright ground). Never raises; [] when cv2 is missing.
+    bright ground) AND asks OpenCV's QR detector for QR-specific hypotheses,
+    because the two paths fail on different things: the contour path needs a
+    clean blob and finds nothing at 1.6 px/module, while the detector finds the
+    QR there but is blind far below 1 px/module. Neither decides anything --
+    this still only returns ranked boxes. Never raises; [] when cv2 is missing.
     """
     cfg = cfg or {}
     out = []
@@ -178,14 +290,45 @@ def find_candidates(frame_bgr, cfg=None, ctx=None):
                                 _cv2.THRESH_BINARY + _cv2.THRESH_OTSU)
         cands = _scan(gray, bw, cfg, ctx, w_img * h_img)
         cands += _scan(gray, 255 - bw, cfg, ctx, w_img * h_img)
+        # QR-specific hypotheses, scored by the SAME _measure path so they are
+        # ranked on one scale and cannot out-rank by construction. The
+        # `qr_detector` flag records provenance only. A score floor was tried
+        # and removed: it changed the score of 0 of 5 detector boxes measured
+        # (they already score 0.956-0.972), so it was dead logic.
+        for quad in _qr_detector_boxes(gray, cfg):
+            try:
+                bx, by, bwid, bhei, sc, m = _measure(gray, quad, ctx)
+            except Exception:
+                continue
+            if bwid < 8 or bhei < 8:
+                continue
+            if bwid * bhei > w_img * h_img * float(cfg.get("max_area_frac", 0.25)):
+                continue
+            m["qr_detector"] = 1.0
+            cands.append((bx, by, bwid, bhei, sc, m))
         cands.sort(key=lambda b: -b[4])
         for b in cands:
-            if all(_iou(b, k) < 0.5 for k in out):
-                out.append(b)
+            keep = None
+            for k in out:
+                if _iou(b, k) >= 0.5:
+                    keep = k
+                    break
+            if keep is None:
+                out.append([b[0], b[1], b[2], b[3], b[4], b[5]])
+                continue
+            # same box seen twice: keep the higher score, but never lose the
+            # detector flag or the low score of the geometry that found it
+            if b[5].get("qr_detector"):
+                keep[5]["qr_detector"] = 1.0
+            if b[4] > keep[4]:
+                keep[4] = b[4]
+                for key in ("runs", "contrast"):
+                    if b[5].get(key, 0) > keep[5].get(key, 0):
+                        keep[5][key] = b[5][key]
     except Exception as e:
         log.debug("find_candidates failed: %r", e)
         return []
-    return out[:int(cfg.get("max_cands", 10))]
+    return [tuple(b) for b in out[:int(cfg.get("max_cands", 10))]]
 
 
 def cluster_observations(obs, cfg=None):
