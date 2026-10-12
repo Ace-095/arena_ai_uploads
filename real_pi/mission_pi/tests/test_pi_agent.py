@@ -619,6 +619,86 @@ class TestSelftest(unittest.TestCase):
             A.run_argv = real
         self.assertEqual(calls, [], "the self-test executed something locally")
 
+    # ---- the two bugs that shipped and told a GOOD token it was broken --------
+
+    def test_a_working_token_is_never_reported_as_broken(self):
+        """Verbatim the verdict the live run produced: every required step passed
+        and the tool still said the permissions were MISSING, because it counted
+        its own duplicate label removal (a 404) as a required failure."""
+        class DoubleRemove(A.FakeTransport):
+            """Second removal of the same label 404s, like the real API."""
+            def remove_label(self, number, label):
+                present = any(l["name"] == label
+                              for it in self.issues if it["number"] == number
+                              for l in it["labels"])
+                if not present:
+                    raise RuntimeError('404 {"message": "Label does not exist"}')
+                A.FakeTransport.remove_label(self, number, label)
+        t = DoubleRemove(owner="owner")
+        t.issues = [issue(number=7, body="/pi help", labels=())]
+        ok, text = self.run_selftest(t)
+        self.assertTrue(ok, "a working token was reported as broken:\n" + text)
+        self.assertIn("You are good to go", text)
+        self.assertNotIn("MISSING", text)
+
+    def test_a_cleanup_failure_does_not_change_the_verdict(self):
+        class CannotDeleteComment(A.FakeTransport):
+            def delete_comment(self, comment_id):
+                raise RuntimeError("404 Not Found")
+        t = CannotDeleteComment(owner="owner")
+        t.issues = [issue(number=7, body="/pi help", labels=())]
+        ok, text = self.run_selftest(t)
+        self.assertTrue(ok, text)
+        self.assertIn("delete the test comment  (cleanup)", text)
+        self.assertIn("already gone", text)
+
+    def test_cleanup_steps_are_labelled_as_cleanup(self):
+        t = A.FakeTransport(owner="owner")
+        t.issues = [issue(number=7, body="/pi help", labels=())]
+        _ok, text = self.run_selftest(t)
+        self.assertIn("(cleanup)", text)
+
+    def test_the_label_is_removed_exactly_once(self):
+        """The duplicate is the bug: it removed the label in the permission
+        check and then again in cleanup, and the second one 404s."""
+        t = A.FakeTransport(owner="owner")
+        t.issues = [issue(number=7, body="/pi help", labels=())]
+        self.run_selftest(t)
+        removals = [c for c in t.calls if c[0] == "remove_label"]
+        self.assertEqual(len(removals), 1, "the label was removed %d times"
+                         % len(removals))
+
+    def test_the_real_transport_builds_routes_with_an_owner_and_repo(self):
+        """Every route must contain owner/repo.
+
+        This has to exercise GitHubTransport, not FakeTransport: the fake stubs
+        these methods out entirely, so an earlier version of this test asserted
+        against a stub that builds no URL at all and passed while
+        `/repos/issues/comments/{id}` (no owner/repo) was 404ing in production.
+        Verified against the live API: the correct route answers 403 with
+        documentation_url .../issues/comments#delete-an-issue-comment.
+        """
+        t = A.GitHubTransport("Ace-095/arena_ai_uploads", "fake-token-for-test")
+        calls = []
+        # *a: some routes pass a payload positionally (_call(method, path, body))
+        t._call = lambda method, path, *a, **kw: (calls.append((method, path)),
+                                                  (200, {}))[1]
+        t.delete_comment(12345)
+        t.remove_label(7, "pi:job")
+        t.add_labels(7, ["pi:job"])
+        t.create_comment(7, "hi")
+        t.close_issue(7)
+        t.create_label("pi:test")
+        t.delete_label("pi:test")
+        self.assertEqual(len(calls), 7)
+        for method, path in calls:
+            with self.subTest(path=path):
+                self.assertIn("/repos/Ace-095/arena_ai_uploads/", path,
+                              "%s is missing owner/repo" % path)
+        self.assertEqual(calls[0],
+                         ("DELETE", "/repos/Ace-095/arena_ai_uploads/"
+                                    "issues/comments/12345"))
+
     def test_a_bad_output_is_not_a_wall_of_json(self):
         t = A.FakeTransport(owner="owner")
         t.issues = [issue(number=9, body="/pi help", labels=())]

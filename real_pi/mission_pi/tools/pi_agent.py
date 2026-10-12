@@ -782,7 +782,12 @@ class GitHubTransport(object):
         return (d or {}).get("id")
 
     def delete_comment(self, comment_id):
-        self._call("DELETE", "/repos/issues/comments/%s" % comment_id)
+        # "/repos/issues/comments/{id}" (no owner/repo) 404s. Verified against the
+        # live API: the correct route answers 403 with documentation_url
+        # .../issues/comments#delete-an-issue-comment, i.e. the route is right
+        # and only the permission was missing.
+        self._call("DELETE", "/repos/%s/issues/comments/%s"
+                   % (self.repo, comment_id))
 
     def close_issue(self, number):
         self._call("PATCH", "/repos/%s/issues/%s" % (self.repo, number),
@@ -804,7 +809,11 @@ class GitHubTransport(object):
 class FakeTransport(object):
     """For tests and --dry-run: the same interface, no network, no side effects."""
 
-    def __init__(self, issues=(), owner="owner", login=None):
+    def __init__(self, issues=(), owner="owner", login=None, repo=None):
+        # `.repo` must exist here: the self-test reports "<repo> (owner <login>)"
+        # and a missing attribute made it print a FAILED repository check, i.e.
+        # it blamed the user's token for a gap in the test double.
+        self.repo = repo or ("%s/example" % owner)
         self.issues = list(issues)
         self.owner = owner
         self.login = login or owner
@@ -1063,87 +1072,101 @@ def selftest(transport, log=print):
     on one - and GitHub reports the resulting 403 as "Resource not accessible by
     integration", which says nothing about which permission to fix.
 
-    Everything it creates it also removes: one uniquely-named label, and one
-    throwaway issue if there was no open issue to borrow. Nothing of yours is
-    touched, and it never runs an action.
+    Everything it creates it also removes. It never runs an action.
+
+    Two lessons from the first version of this, both now pinned by tests:
+
+    * A cleanup step that fails must NOT be reported as a missing permission.
+      The first version decided what counted by substring-matching step names for
+      "delete"/"close", so its own duplicate label removal - which 404s because
+      the label was already gone - was counted as a required step, and the tool
+      told a perfectly good token that its permissions were missing. Blaming the
+      wrong thing is worse than saying nothing, so `required` is now explicit.
+    * Removing something that is already gone is success, not failure.
     """
-    steps = []
+    results = []          # (required, ok, name, detail, hint)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     temp_label = "pi:selftest-%s" % stamp
 
-    def step(name, fn, hint=""):
+    def _trim(text):
+        text = "" if text is None else str(text)
+        return text if len(text) <= 300 else text[:300] + " ...(truncated)"
+
+    def step(name, fn, hint="", required=True):
         try:
             got = fn()
-            detail = "" if got is None else str(got)
-            if len(detail) > 300:
-                detail = detail[:300] + " ...(truncated)"
-            steps.append((True, name, detail, hint))
+            results.append((required, True, name, _trim(got), hint))
             return got
         except Exception as e:
-            steps.append((False, name, redact(str(e)), hint))
+            results.append((required, False, name, redact(str(e)), hint))
             return None
+
+    def cleanup(name, fn):
+        """Already-gone counts as cleaned."""
+        try:
+            fn()
+            results.append((False, True, name, "", ""))
+        except Exception as e:
+            msg = redact(str(e))
+            gone = ("404" in msg or "Not Found" in msg or "does not exist" in msg
+                    or "already" in msg.lower())
+            results.append((False, gone, name, "already gone" if gone else msg,
+                            "a cleanup problem, not a permission problem"))
 
     login = step("token is valid (GET /user)", transport.whoami)
     # getattr: a transport missing `.repo` must not be reported as a token
     # problem. A self-test that blames the wrong thing is worse than no test.
-    owner = step("repo is readable (GET /repos)",
-                 lambda: "%s (owner %s)" % (getattr(transport, "repo", "?"),
-                                            transport.repo_owner()))
-    created_label = step("create a repo label (Issues: write)",
-                         lambda: (transport.create_label(
-                             temp_label, "ededed", "pi_agent self-test, safe to delete"
-                         ), True)[1])
+    step("repo is readable (GET /repos)",
+         lambda: "%s (owner %s)" % (getattr(transport, "repo", "?"),
+                                    transport.repo_owner()))
+    created_label = bool(step("create a repo label (Issues: write)",
+                              lambda: (transport.create_label(
+                                  temp_label, "ededed",
+                                  "pi_agent self-test, safe to delete"), True)[1]))
 
     # Borrow an open issue if there is one; otherwise make a throwaway.
-    issues = step("list open issues (Issues: read)",
-                  lambda: "%d open: %s" % (
-                      len(transport.list_issues(5)),
-                      ", ".join("#%s" % i.get("number")
-                                for i in transport.list_issues(5)))) or []
-    issues = transport.list_issues(5) if isinstance(issues, str) else issues
-    borrowed, issue_no, created_issue = False, None, False
-    if issues:
-        issue_no = issues[0].get("number")
-        borrowed = True
+    found = step("list open issues (Issues: read)",
+                 lambda: transport.list_issues(5)) or []
+    issue_no, created_issue = None, False
+    if found:
+        issue_no = found[0].get("number")
     else:
-        def make():
-            _url, number, _got = transport.create_issue(
-                "pi_agent self-test - safe to close", "/pi selftest-marker", ())
-            return number
-        issue_no = step("create an issue (Issues: write)", make)
+        issue_no = step("create an issue (Issues: write)",
+                        lambda: transport.create_issue(
+                            "pi_agent self-test - safe to close",
+                            "/pi selftest-marker", ())[1])
         created_issue = bool(issue_no)
 
     labelled = commented = None
     if issue_no:
-        labelled = step("label an issue (the one that usually fails)",
-                        lambda: (transport.add_labels(issue_no, [temp_label]),
-                                 True)[1],
-                        hint="needs Issues: Read and write, not just read")
+        labelled = bool(step("label an issue (the one that usually fails)",
+                             lambda: (transport.add_labels(
+                                 issue_no, [temp_label]), True)[1],
+                             hint="needs Issues: Read and write, not just read"))
         if labelled:
-            step("remove a label again",
+            # This is the DELETE-permission check. Its cleanup twin used to run
+            # again later and 404, which is what broke the verdict.
+            step("remove that label again",
                  lambda: (transport.remove_label(issue_no, temp_label), True)[1])
         commented = step("comment on an issue (how results come back)",
                          lambda: transport.create_comment(
                              issue_no, "pi_agent self-test comment - safe to delete"))
 
-    # --- clean up, whatever happened ---------------------------------------
     if commented:
-        step("delete the test comment",
-             lambda: (transport.delete_comment(commented), True)[1])
-    if labelled:
-        step("remove the test label",
-             lambda: (transport.remove_label(issue_no, temp_label), True)[1])
+        cleanup("delete the test comment", lambda: transport.delete_comment(commented))
     if created_label:
-        step("delete the test label from the repo",
-             lambda: (transport.delete_label(temp_label), True)[1])
+        cleanup("delete the test label from the repo",
+                lambda: transport.delete_label(temp_label))
     if created_issue and issue_no:
-        step("close the throwaway issue",
-             lambda: (transport.close_issue(issue_no), True)[1])
+        cleanup("close the throwaway issue",
+                lambda: transport.close_issue(issue_no))
 
-    ok = all(s[0] for s in steps if "delete" not in s[1] and "close" not in s[1])
+    missing = [r for r in results if r[0] and not r[1]]
+    ok = not missing
     lines = ["pi_agent self-test", "=" * 60]
-    for good, name, detail, hint in steps:
-        lines.append("  %s %s" % ("PASS" if good else "FAIL", name))
+    for required, good, name, detail, hint in results:
+        tag = "" if required else "  (cleanup)"
+        lines.append("  %s %s%s" % ("PASS" if good else "FAIL", name, tag))
         if detail:
             lines.append("       %s" % detail)
         if not good and hint:
@@ -1152,12 +1175,19 @@ def selftest(transport, log=print):
     if ok:
         lines.append("All required permissions are present. You are good to go.")
     else:
-        lines.append("Some permissions are MISSING. The agent will not be able to")
-        lines.append("work until they are granted. Fix the token:")
-        lines.append("  github.com/settings/tokens -> the token -> Issues: Read and write")
-        lines.append("  (a token needs 'Read and write' on Issues. 'Read' alone can")
-        lines.append("   create issues and labels, which is exactly what makes this")
-        lines.append("   failure so confusing.)")
+        lines.append("These permissions are MISSING, so the agent cannot work:")
+        for _req, _good, name, _d, _h in missing:
+            lines.append("  - %s" % name)
+        lines.append("")
+        lines.append("Fix the token: github.com/settings/tokens -> the token ->")
+        lines.append("  Issues: Read and write   (NOT Read-only)")
+        lines.append("A 'Read-only' Issues permission can still create issues and")
+        lines.append("labels, which is exactly what makes this failure confusing.")
+    if any(not r[0] and not r[1] for r in results):
+        lines.append("")
+        lines.append("(Some cleanup could not complete - that does not affect the")
+        lines.append(" verdict above, but it may have left a test label or comment")
+        lines.append(" behind.)")
     lines.append("")
     lines.append("Nothing was executed on this machine - this only talks to GitHub.")
     text = "\n".join(lines)
