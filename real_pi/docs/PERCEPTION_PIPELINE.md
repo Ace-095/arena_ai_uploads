@@ -398,7 +398,7 @@ New tests: **115**, all passing. Full existing suite re-run: **33 files passed,
 | `tests/test_perception_fsm.py` | 45 | **OK** |
 | `tests/test_perception_tap.py` | 26 | **OK** |
 | `tests/test_perception_bench.py` | 20 | **OK** |
-| `bash tools/run_tests.sh` (whole repo) | 42 files | **41 passed, 0 failed, 1 skipped** (2026-10-12; the skip is `test_sitl_flight.py` with no vehicle attached — with real SITL up it runs 25/25) |
+| `bash tools/run_tests.sh` (whole repo) | 43 files | **42 passed, 0 failed, 1 skipped** (2026-10-12; the skip is `test_sitl_flight.py` with no vehicle attached — with real SITL up it runs 25/25) |
 
 Skipped (self-skipping, hardware absent): `test_hef_and_focus.py`,
 and `test_fence_e2e_fake_fc.py` skipped in the loaded run.

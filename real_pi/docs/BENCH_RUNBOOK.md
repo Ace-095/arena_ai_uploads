@@ -427,3 +427,85 @@ payload either came out or it did not, and `match` confirms it was the right tex
 No Hailo and no real-camera numbers existed where this code was written. Everything
 Hailo-, camera- and flight-dependent is **NOT YET MEASURED** until you run these
 stages.
+
+---
+
+## Stage 0b — the one-run field survey (`tools/pi_field_report.py`)
+
+**Why this exists:** the machine that wrote this repo cannot reach a private LAN
+address, so the rig is only measurable from itself. Rather than have you run ten
+commands and read numbers off a screen, this collects everything into one JSON
+plus one short summary you can paste back.
+
+**It is read-only.** It writes no config, sets no camera control (no VCM/focus,
+no exposure), and sends no MAVLink. `--with-fc` is the ONLY path that touches the
+autopilot and it only reads (`fc_probe.py --fence` / `--fence-check`). A test
+fails if the source ever grows a call that actuates anything. It DOES open the
+camera, so **stop `mission_pi` first** — two processes cannot share a CSI camera
+and this would otherwise look like a camera fault.
+
+```bash
+cd ~/arena_ai_uploads/real_pi/mission_pi
+
+# 1. the plain survey (no camera? add --no-capture): ~10 s
+python3 tools/pi_field_report.py
+
+# 2. + read the Pixhawk (mission_pi STOPPED, vehicle DISARMED, props off)
+python3 tools/pi_field_report.py --with-fc
+
+# 3. MEASURE the real field of view (see the setup note below)
+python3 tools/pi_field_report.py --dist-m 2.00 --panel-mm 420 --panel-mm-h 297
+
+# 4. just one answer, quickly
+python3 tools/pi_field_report.py --sec fov --dist-m 2.00 --panel-mm 420
+
+# 5. + the whole test suite on the Pi itself
+python3 tools/pi_field_report.py --with-tests
+```
+
+### Measuring the FOV (this is the number every range calculation rests on)
+
+`config.yaml` still carries a **VENDOR-QUOTED 75°/60°** FOV. Until it is measured,
+every range figure in this repo is conditional. To turn it into a measurement:
+
+1. Put a **white sheet flat on a DARKER floor**, directly under the lens, **centred
+   in the picture**. A3 is ideal; `--panel-mm` is the sheet's **LONG side in mm**
+   (A3 = 420, A4 = 297).
+2. Measure **lens to sheet** with a tape — that is `--dist-m`.
+3. Run it. It refuses rather than guesses: the sheet must be centred, not touching
+   the frame edges, larger than 0.5 % of the picture and clearly brighter than the
+   ground. Every refusal prints why.
+4. Read `FOV: MEASURED hfov=… vfov=…`, then put those numbers into
+   `config.yaml` (`cameras.bottom.hfov_deg` / `vfov_deg`) — otherwise the UI's
+   coverage planner and the mission's footprint maths keep using the vendor value
+   (see `tests/test_ui_camera_specs.py`, which exists because they once drifted
+   33 % apart).
+
+**Accuracy, and its limits.** Recovering a *known* FOV from synthetic pictures is
+within **0.35°** across 75°, 66° and 50° lenses — that is asserted in
+`tests/test_pi_field_report.py`. Real-world caveats, all printed with the result:
+a single centred sheet measures the **CENTRE** field of view, corner distortion is
+not covered; the sheet must be flat and perpendicular to the lens; and the
+distance is only as good as your tape. A very wide lens far from a small sheet may
+find nothing measurable (at 100° and 3 m an A3 sheet is only ~0.3 % of the frame) —
+move it closer or use a bigger sheet.
+
+### What a field report does and does not prove
+
+| Row | Proves | Does NOT prove |
+|---|---|---|
+| `board` / `thermal` | the Pi's own model, temperature and **throttle flags** | that it can hold a framerate under load |
+| `deps` / `hailo` | whether `hailo_platform` and a device are present | that a HEF loads or runs |
+| `detector` | **which rung the ladder chose** (`IS_HAILO=true/false`) | Hailo accuracy or speed |
+| `cameras` | real capture size and `latest()` latency | image quality, motion blur, exposure |
+| `FOV` | the actual field of view, ±0.35° on synthetic input | how well the QR decodes in flight |
+| `decode` | the payload came out of a REAL frame (`decoded=true`) | that it decodes in flight, at speed, at 10–15 m |
+| `inference` | detector cost on real frames, on the chosen rung | end-to-end fps with capture + decode in the loop |
+| `fc` | firmware, capabilities, `FENCE_ENABLE`, fence readback | that the fence is *enforced* (storing ≠ arming) |
+| `tests` | the suite passes **on the Pi**, not just on a laptop | flight behaviour |
+
+A capture latency is only meaningful if `thermal` shows no throttle flags: a
+throttled Pi cannot hold a framerate and the numbers will lie.
+
+**Nothing here is a flight result.** It is bench evidence, and it is labelled as
+such in the JSON (`read_only: true`, per-section provenance).
