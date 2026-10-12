@@ -809,6 +809,30 @@ Structural test: the close is checked by parsing the child program for the
 `det.close()` **call** — an earlier version of that test matched a *comment*
 containing the same text and passed with the call deleted (caught by mutation).
 
+### MEASURED at `9db71dc`: `chosen=hailo`, and the AF tuning is wired
+
+```
+detector   : chosen=hailo | IS_HAILO=True
+repo-local /home/ace/arena_ai_uploads/real_pi/mission_pi/models/imx477_af.json -> used before libcamera's own copy
+```
+
+The detector section builds the real detector and reports the Hailo rung with no
+crash — the bring-up path at `main.py:258` confirmed with the production
+constructor. And the shipped AF tuning (`models/imx477_af.json`, Arducam's
+`rpi.af` tuning) is found and preferred over libcamera's own copy.
+
+The stock `imx477.json` still has no `rpi.af` and the system path is still
+missing its `imx477_af.json` — those lines are correct and unchanged; what
+changed is that the stack now has an AF-capable tuning to load.
+`tools/focus_sweep.py` loads the mission's tuning and REFUSES to sweep without
+`rpi.af` (it gates `LensPosition` on the same algorithm), so the next question is
+physical: **does the VCM actually move?** — the overlay note says the installed
+`imx477` dtbo does not advertise a `vcm` parameter. A sweep with a moving peak
+settles it; a flat curve means the motor never moved.
+
+Still NOT YET MEASURED: VCM motion, real camera capture, the real lens FOV,
+end-to-end QR detection at altitude, any flight result.
+
 ### THE ORIGINAL LEADING CAUSE, and what changed because of it
 
 The crash was at `vdev.configure(hef, cfg)` — the call immediately after
