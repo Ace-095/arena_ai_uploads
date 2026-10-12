@@ -752,6 +752,63 @@ any flight result. Next probes are `--sec detector` (the detector ladder as
 `get_detector()` itself runs it) and `tools/list_cams.py` (which node is the
 downward camera), then the full survey.
 
+### MEASURED at `47f5a50`: the camera identity. And a dead autofocus.
+
+`tools/list_cams.py` on the Pi (2026-10-13):
+
+```
+[csi] picamera2: OK   ... Adding camera '/base/axi/pcie@1000120000/rp1/i2c@80000/imx477@1a'
+  csi idx 0: imx477
+[usb] V4L2 capture nodes: none   (all 26 /dev/video* are PiSP/codec nodes)
+cam2 (bottom): imx477  device=csi imx477 (idx 0)  size=(2028, 1520)
+MISSING ROLE(S): front (not a failure)
+```
+
+**The downward camera is now a measured fact**: one camera, the CSI IMX477 (the
+UC-517), 2028×1520, assigned `bottom` — matching `cameras.py`'s
+`DEFAULT_SENSOR_ROLE {imx477: bottom}` and `config.yaml`. No USB cameras. The
+`front` role is unassigned, which the single-camera path handles.
+
+**The autofocus cannot work as installed** — and this matters more than it
+sounds. `list_cams.py` found `pisp/imx477_af.json` **MISSING** and the stock
+`imx477.json` carries **no `rpi.af`** algorithm, so libcamera's
+`Could not set AF_MODE - no AF algorithm` is now fully explained (see
+`CAMERA_AND_PIXHAWK_SETUP.md` §1.3: the eight AF controls in the control list
+prove nothing — the algorithm lives in the tuning file). `config.yaml` sets
+`autofocus: true` + `tuning_file: imx477_af.json` for the bottom camera, so the
+config expects a file the Pi does not have. Consequences to treat as real:
+
+- until Arducam's `imx477_af.json` is in place (it needs no sudo — next to
+  `config.yaml` or in `models/`), the VCM **will not move** and the lens is
+  wherever it was left;
+- QR module sharpness at 10–15 m is a focus question first (blur < 3 px is in
+  the decode budget), so this must be settled before any range claim means
+  anything;
+- `config.yaml`'s own note: set `autofocus: false`, measure the fixed position
+  with `tools/focus_sweep.py` (it prints the dioptre line; 0 = infinity,
+  0.067 = 15 m).
+
+Also from that run: `dtoverlay=imx477,vcm` loads an overlay that does not
+advertise a `vcm` parameter — likely a newer Arducam build wiring the lens
+unconditionally — harmless but unverified; the §1.3 focus check is the test.
+
+### The detector section's verdict was false once - fixed
+
+`--sec detector` at `47f5a50` printed
+`detector : CRASHED by SIGSEGV - the ladder could not be built` — while
+`hailosteps`, running the same constructor one step away, showed
+`last output before it died: chosen: hailo`. The probe's child **did** build the
+detector and print its PIJSON result, then died at process teardown because the
+probe never called `det.close()` (the construct-and-abandon shape that is now
+ladder step 12's job alone), and the handler threw the result away because the
+process had a signal. Two fixes: the probe now closes the detector like
+`main.py`'s `finally`, and a result printed before a crash is **used**, with the
+crash reported after it (`crashed_after_result`) instead of erasing it. The
+summary reads `chosen=...` plus `the probe then died by ... AFTER reporting`.
+Structural test: the close is checked by parsing the child program for the
+`det.close()` **call** — an earlier version of that test matched a *comment*
+containing the same text and passed with the call deleted (caught by mutation).
+
 ### THE ORIGINAL LEADING CAUSE, and what changed because of it
 
 The crash was at `vdev.configure(hef, cfg)` — the call immediately after

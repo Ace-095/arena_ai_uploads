@@ -19,6 +19,7 @@ Everything else here is graceful degradation: on a machine with no camera, no
 Hailo and no FC (which is exactly where these tests DO run) every section must
 return an explanation instead of raising.
 """
+import ast
 import importlib.util
 import shutil
 import inspect
@@ -469,6 +470,89 @@ class TestTheReportSaysWhichCodeProducedIt(unittest.TestCase):
         self.assertNotIn("code       :", text)
 
 
+def calls_on(code, obj, method):
+    """True only when the program really CALLS obj.method().
+
+    assertIn("det.close()", child) once passed with the real call deleted:
+    an explanatory comment INSIDE the child-code string also contains that
+    text. A comment is not a call, so this parses the program instead.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return False
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == method
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == obj):
+            return True
+    return False
+
+
+class TestTheDetectorSection(unittest.TestCase):
+    """The Pi's detector section printed its answer, then died at teardown -
+    and the report threw the answer away and said "the ladder could not be
+    built". A crash after reporting is two facts, not zero."""
+
+    def _run(self, result):
+        real, F._child = F._child, (lambda code, timeout=180, cwd=None: result)
+        try:
+            return F.sec_detector(make_args())
+        finally:
+            F._child = real
+
+    def test_a_crash_after_reporting_is_not_a_missing_result(self):
+        got = self._run({"rc": -11, "signal": "SIGSEGV",
+                         "stdout": 'PIJSON{"chosen": "hailo", "is_hailo": true}\n',
+                         "stderr": "", "timed_out": False})
+        self.assertEqual(got.get("chosen"), "hailo")
+        self.assertTrue(got.get("crashed"))
+        self.assertTrue(got.get("crashed_after_result"))
+        text = F.summarise({"sections": {"detector": got}})
+        self.assertIn("chosen=hailo", text)
+        self.assertIn("AFTER reporting", text)
+        self.assertNotIn("could not be built", text)
+
+    def test_the_detector_probe_closes_the_detector(self):
+        """Production closes it (main.py's finally). Probing by abandonment is
+        the teardown-by-GC shape that SIGSEGVs on this Pi - it is what crashed
+        ladder step 12 while 12b, the same constructor with close(), was clean."""
+        seen = []
+        real, F._child = F._child, (
+            lambda code, timeout=180, cwd=None: (
+                seen.append(code),
+                {"rc": 0, "signal": None,
+                 "stdout": 'PIJSON{"chosen": "hailo", "is_hailo": true}\n',
+                 "stderr": "", "timed_out": False})[1])
+        try:
+            F.sec_detector(make_args())
+        finally:
+            F._child = real
+        self.assertTrue(seen, "the probe child never ran")
+        self.assertTrue(calls_on(seen[0], "det", "close"),
+                        "the probe does not actually close the detector:\n%s"
+                        % seen[0])
+
+    def test_a_crash_before_any_result_still_says_it_could_not_be_built(self):
+        got = self._run({"rc": -11, "signal": "SIGSEGV", "stdout": "",
+                         "stderr": "", "timed_out": False})
+        self.assertTrue(got.get("crashed"))
+        self.assertNotIn("chosen", got)
+        self.assertNotIn("crashed_after_result", got)
+        text = F.summarise({"sections": {"detector": got}})
+        self.assertIn("could not be built", text)
+
+    def test_the_result_still_arrives_when_the_child_is_clean(self):
+        got = self._run({"rc": 0, "signal": None,
+                         "stdout": 'PIJSON{"chosen": "hailo", "is_hailo": true}\n',
+                         "stderr": "", "timed_out": False})
+        self.assertEqual(got.get("chosen"), "hailo")
+        self.assertFalse(got.get("crashed"))
+        text = F.summarise({"sections": {"detector": got}})
+        self.assertIn("chosen=hailo | IS_HAILO=True", text)
+
+
 class TestHailoSteps(unittest.TestCase):
     def _with_child(self, results):
         """results: list of dicts, one per probe step, in order."""
@@ -577,13 +661,13 @@ class TestHailoSteps(unittest.TestCase):
         programs = dict(zip([e["step"] for e in got["steps"]], seen))
         nine = [c for l, c in programs.items() if l.startswith("9. ")][0]
         nineb = [c for l, c in programs.items() if l.startswith("9b. ")][0]
-        self.assertIn("st.__exit__", nine,
-                      "step 9 enters InferVStreams and never leaves it")
+        self.assertTrue(calls_on(nine, "st", "__exit__"),
+                        "step 9 enters InferVStreams and never leaves it")
         self.assertIn("InferVStreams exited cleanly", nine)
-        self.assertIn("st.__exit__", nineb,
-                      "step 9b enters InferVStreams and never leaves it")
-        self.assertIn("act_cm.__exit__", nineb,
-                      "step 9b activates and never deactivates")
+        self.assertTrue(calls_on(nineb, "st", "__exit__"),
+                        "step 9b enters InferVStreams and never leaves it")
+        self.assertTrue(calls_on(nineb, "act_cm", "__exit__"),
+                        "step 9b activates and never deactivates")
         self.assertIn("F: closed cleanly", nineb)
 
     def test_the_constructor_can_be_closed_the_way_main_py_closes_it(self):
@@ -601,7 +685,9 @@ class TestHailoSteps(unittest.TestCase):
             F._child = real
         programs = dict(zip([e["step"] for e in got["steps"]], seen))
         self.assertIn(CTOR_CLOSE, programs, "the closed-constructor step is missing")
-        self.assertIn("det.close()", programs[CTOR_CLOSE])
+        self.assertTrue(calls_on(programs[CTOR_CLOSE], "det", "close"),
+                        "12b does not actually close the detector:\n%s"
+                        % programs[CTOR_CLOSE])
         self.assertIn("closed cleanly", programs[CTOR_CLOSE])
 
     def test_no_constructor_step_counts_as_a_hailo_step(self):

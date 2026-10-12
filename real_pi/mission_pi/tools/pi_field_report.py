@@ -289,6 +289,13 @@ def sec_detector(args):
     """
     out = {"probe": "child process (a native crash in Hailo/ONNX must not kill "
                     "the survey)"}
+    # The child closes the detector before it exits - the lifecycle main.py
+    # lives (its finally calls det.close()). Leaving the detector for the
+    # garbage collector at process exit is the teardown-by-GC shape that
+    # SIGSEGVs on this Pi: it crashed ladder step 12 while 12b, the same
+    # constructor with close(), was clean. This comment is deliberately OUTSIDE
+    # the child code string - a comment inside it mentioning det.close() made
+    # assertIn("det.close()", child) pass with the real call deleted.
     code = """
 import json, os
 cfg = __import__("yaml").safe_load(open(%r)) or {}
@@ -301,27 +308,38 @@ for attr in ("input_size", "tile_bottom", "tile_front", "conf", "conf_thr",
     if hasattr(det, attr):
         info[attr] = getattr(det, attr)
 print("PIJSON" + json.dumps(info))
+det.close()
 """ % os.path.abspath(args.config)
     res = _child(code, timeout=180)
+    # A crash at teardown must not throw away the result the child printed
+    # before it. On the Pi this section read "CRASHED - the ladder could not be
+    # built" while hailosteps, running the same constructor, showed
+    # "last output before it died: chosen: hailo" - the ladder WAS built and its
+    # answer was printed; the process then died closing up. With -u the print
+    # survives the signal, so use it and say the crash came after.
+    marker = [l for l in res["stdout"].splitlines() if l.startswith("PIJSON")]
+    if marker:
+        try:
+            out.update(json.loads(marker[-1][len("PIJSON"):]))
+        except Exception as e:
+            out["error"] = "could not parse the child's result: %s" % e
     if res["signal"]:
         out["crashed"] = True
         out["signal"] = res["signal"]
-        out["error"] = ("the detector ladder died by %s. A native accelerator "
-                        "killed the process; see hailo_steps for the step and "
-                        "the HailoRT message" % res["signal"])
+        if "chosen" in out:
+            out["crashed_after_result"] = True
+        else:
+            out["error"] = ("the detector ladder died by %s. A native accelerator "
+                            "killed the process; see hailo_steps for the step and "
+                            "the HailoRT message" % res["signal"])
         out["hailort_errors"] = _hailort_errors(res["stderr"])
         out["stderr_tail"] = res["stderr"][-1200:]
+        out["stdout_tail"] = res["stdout"].strip()[-600:]
     elif res["timed_out"]:
         out["crashed"] = True
         out["error"] = "timed out after 180s"
     else:
-        marker = [l for l in res["stdout"].splitlines() if l.startswith("PIJSON")]
-        if marker:
-            try:
-                out.update(json.loads(marker[-1][len("PIJSON"):]))
-            except Exception as e:
-                out["error"] = "could not parse the child's result: %s" % e
-        else:
+        if not marker:
             out["error"] = "no result from the child (rc=%s)" % res["rc"]
         if res["rc"] not in (0, None) and "error" not in out:
             out["rc"] = res["rc"]
@@ -1161,7 +1179,15 @@ def summarise(r):
             L.append("             %s" % hs["note"])
     d = s.get("detector") or {}
     if d:
-        if d.get("crashed"):
+        if d.get("crashed") and d.get("crashed_after_result"):
+            L.append("detector   : chosen=%s | IS_HAILO=%s"
+                     % (d.get("chosen"), d.get("is_hailo")))
+            L.append("             the probe then died by %s AFTER reporting - the "
+                     "result above was printed before the crash and is real"
+                     % d.get("signal"))
+            for line in (d.get("hailort_errors") or [])[:4]:
+                L.append("             %s" % line)
+        elif d.get("crashed"):
             L.append("detector   : CRASHED by %s - the ladder could not be built"
                      % d.get("signal"))
             for line in (d.get("hailort_errors") or [])[:4]:
