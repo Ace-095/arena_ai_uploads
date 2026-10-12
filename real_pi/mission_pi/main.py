@@ -217,15 +217,22 @@ def camera_summary(started, failed, assigned=()):
 
     and the operator went looking for a vision bug with two dead cameras.
     `assigned` is what the rig *thinks* it has; `started` is what actually runs.
+
+    State is ALWAYS one of bringup.Bringup.STATES. `ok()` and `_stage_locked`
+    understand only those, so a half-way word like "degraded" would report
+    stage=ready with ready=false — the very inconsistency this is meant to
+    prevent. A partial start is therefore "failed" (the author's documented
+    intent: /health must not read ready when a camera never came up); the
+    detail says exactly how far it got, and an ERROR line is pushed alongside.
     """
     started = list(started)
     failed = list(failed)
     if started and not failed:
         return "ok", "%d running: %s" % (len(started), ", ".join(sorted(started)))
     if started and failed:
-        return "degraded", ("%d running (%s), %d FAILED to start (%s)"
-                            % (len(started), ", ".join(sorted(started)),
-                               len(failed), ", ".join(sorted(failed))))
+        return "failed", ("only %d of %d cameras running (%s); FAILED: %s"
+                          % (len(started), len(started) + len(failed),
+                             ", ".join(sorted(started)), ", ".join(sorted(failed))))
     if failed:
         return "failed", "%d camera(s) FAILED to start: %s" % (
             len(failed), ", ".join(sorted(failed)))
@@ -322,9 +329,23 @@ def bring_up_thread(cfg, args, fc, rig, det_box, streams, mission, hub, bu):
                                 profile = "front_qr_boost"
                             else:
                                 profile = qr_boost_cfg.get("mode", "qr_boost_day")
+                        # A camera that never started cannot have a profile
+                        # applied to it, and reporting one here would be a
+                        # statement about a device that is not running.
+                        if cam_name not in started:
+                            continue
                         try:
                             cam.apply_qr_profile(profile)
-                            say("cameras", "ok", "%s QR boost: %s" % (cam_name, profile))
+                            # NOT say("cameras", "ok", ...): this line is about
+                            # ONE camera's profile, and marking the `cameras`
+                            # subsystem from here used to overwrite a real
+                            # `cameras=failed` (erasing the failure and moving
+                            # /health's stage off it). Per-camera information
+                            # goes to the log + UI feed, never to the bring-up
+                            # ledger's subsystem state.
+                            log.info("%s QR boost: %s (contrast high, sat low, "
+                                     "sharp high, QR pops vs ground)",
+                                     cam_name, profile)
                             hub.push("log", {"level": "INFO",
                                              "msg": "%s QR boost %s — contrast high, sat low, sharp high, QR pops vs ground" % (cam_name, profile)})
                         except Exception as e:
@@ -360,8 +381,25 @@ def bring_up_thread(cfg, args, fc, rig, det_box, streams, mission, hub, bu):
     try:
         streams.sync(rig)
         streams.start_all()
-        say("streams", "ok" if streams.streams else "skipped",
-            streams.describe())
+        # `streams.streams` non-empty only means stream OBJECTS were built: the
+        # stream manager happily adopts a camera that never started and then
+        # emits empty frames forever. Reporting that as "ok" told the operator
+        # the UI was fine while every tile was black. With no running camera
+        # there is nothing to serve, so say so.
+        _live = [n for n, c in rig.cams.items() if getattr(c, "running", False)]
+        if not streams.streams:
+            say("streams", "skipped", streams.describe())
+        elif not _live:
+            say("streams", "failed",
+                "no camera is running — UI tiles will stay black (%s)"
+                % streams.describe())
+            hub.push("log", {"level": "ERROR",
+                             "msg": "streams have no running camera — the UI "
+                                    "tiles will stay black until the camera "
+                                    "bring-up above is fixed"})
+        else:
+            say("streams", "ok", "%s | serving %s"
+                % (streams.describe(), ", ".join(sorted(_live))))
     except Exception as e:
         bu.fail("streams", e)
 

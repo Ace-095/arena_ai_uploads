@@ -255,6 +255,13 @@ class Bringup:
     by the operator's browser) — hence the lock and the JSON-safe snapshot.
     """
 
+    # The COMPLETE set of states a subsystem may hold. `_stage_locked` and
+    # `ok()` only understand these: a state from outside this list is neither
+    # "failed" (so it never blocks readiness) nor in ("ok", "skipped") (so
+    # `ok()` is False) — which produces a /health pair that contradicts
+    # itself. `mark()` therefore warns on anything else.
+    STATES = ("pending", "ok", "failed", "skipped")
+
     def __init__(self):
         self._lock = threading.RLock()
         self.t0 = time.time()
@@ -270,7 +277,29 @@ class Bringup:
 
     # -- writers ---------------------------------------------------------
     def mark(self, subsystem, state, detail=None):
+        """Record a subsystem state.
+
+        DELIBERATELY a plain setter, including failed -> pending -> ok: that is
+        the FC connect retry (main.py records the first failure, marks
+        `pending` while retrying, then `ok` when a later attempt succeeds). A
+        "sticky failure" rule here would freeze the FC at failed while it was
+        happily reconnecting — verified, and a worse bug than the one it would
+        fix. So the invariant is enforced at the CALL SITE instead: a
+        per-camera informational line must not assert a subsystem state (see
+        the QR-boost loop in main.py, pinned by
+        tests/test_bringup_reporting.py).
+
+        An unknown state is logged, never raised: `ok()` and `_stage_locked`
+        only understand STATES, so a foreign value would produce a /health pair
+        that contradicts itself (that is exactly how a "degraded" cameras state
+        once reported stage=ready with ready=false).
+        """
         with self._lock:
+            if state not in self.STATES:
+                # Never raise: bring-up must not take the box down (see fail()).
+                log.warning("bring-up: unknown state %r for %s (want one of %s) "
+                            "— readiness accounting does not understand it",
+                            state, subsystem, "/".join(self.STATES))
             self.state[subsystem] = state
             if detail is not None:
                 self.detail[subsystem] = str(detail)
