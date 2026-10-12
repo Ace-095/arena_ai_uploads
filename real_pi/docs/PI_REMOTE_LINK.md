@@ -136,19 +136,46 @@ command that opens hardware is in step 7.
 
 ### Step 0 - get the code onto the Pi
 
-The agent lives on this branch, not on `main`:
-
 ```bash
 cd ~/arena_ai_uploads
-git branch --show-current              # what are we on?
+git branch --show-current                 # what are we on?
 git fetch origin
 git checkout arena/1c4bb365-arena-ai-uploads
-git pull
-ls real_pi/mission_pi/tools/pi_agent.py     # must exist now
+ls real_pi/mission_pi/tools/pi_*.py       # both tools must exist now
 ```
 
-If `git checkout` complains about local changes, tell me what it said - do not
-force it, your Pi may have edits worth keeping.
+That works on a normal clone. **On a `--single-branch` clone it fails**, and the
+error is misleading:
+
+```
+error: pathspec 'arena/1c4bb365-arena-ai-uploads' did not match any file(s) known to git
+Already up to date.
+ls: cannot access 'real_pi/mission_pi/tools/pi_agent.py': No such file or directory
+```
+
+`git fetch origin` looks like it worked and the branch looks like it does not
+exist. Neither is true: a single-branch clone records a **narrow fetch refspec**,
+so it never fetched that branch — and git's checkout guessing deliberately ignores
+remote refs that do not match the configured refspec, so even fetching the ref by
+hand is not enough. Confirm it, then widen the refspec once:
+
+```bash
+git config --get remote.origin.fetch      # +refs/heads/main:refs/remotes/origin/main  <- the culprit
+
+# one time only, and then this clone behaves like a normal one forever
+git config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
+git fetch origin
+git checkout arena/1c4bb365-arena-ai-uploads
+git pull                                  # now tracks properly
+```
+
+Expect `Switched to a new branch ... set up to track 'origin/arena/1c4bb365-arena-ai-uploads'`
+and `git rev-parse --short HEAD` to print `7087900`. All of the above was run
+against your repository before being written down, on a clone made the same way
+as yours.
+
+If instead `git checkout` complains about *local changes*, stop and tell me what
+it said — do not force it, your Pi may have edits worth keeping.
 
 ### Step 1 - create the token
 
