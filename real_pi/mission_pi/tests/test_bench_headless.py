@@ -417,6 +417,27 @@ def test_live_focus_keys_step_and_clamp():
           B.focus_text(None))
 
 
+def test_a_commanded_focus_move_is_only_claimed_when_the_lens_confirms_it():
+    """set_controls() with a rejected LensPosition raises nothing - the first
+    version of the live keys printed "manual lens 2.10 dpt" for every press and
+    the lens never moved. Only the lens's own read-back counts."""
+    ok = B.focus_verdict(1.0, 1.0)
+    check("a confirmed move is stated plainly",
+          ok == B.focus_text(1.0), ok)
+    check("within tolerance still counts as confirmed",
+          B.focus_verdict(1.0, 1.03) == B.focus_text(1.03),
+          B.focus_verdict(1.0, 1.03))
+    no_report = B.focus_verdict(1.0, None)
+    check("no read-back is UNCONFIRMED, never a claimed move",
+          "UNCONFIRMED" in no_report and "1.00" in no_report, no_report)
+    mismatch = B.focus_verdict(1.0, 0.0)
+    check("a lens that reports elsewhere is NOT APPLIED",
+          "NOT APPLIED" in mismatch and "0.00" in mismatch, mismatch)
+    check("an unusable command claims nothing",
+          B.focus_verdict(None, None) == "lens -",
+          B.focus_verdict(None, None))
+
+
 def test_preset_boost_reaches_the_camera():
     """Pressing 1-7 in the bench changed the detector's conf/tiling but NOT the
     camera, so the window kept the same exposure and look whatever preset was
@@ -541,6 +562,7 @@ if __name__ == "__main__":
     test_headless_decision()
     test_preset_keys_are_ints()
     test_live_focus_keys_step_and_clamp()
+    test_a_commanded_focus_move_is_only_claimed_when_the_lens_confirms_it()
     test_preset_boost_reaches_the_camera()
     test_focus_score_and_vision_hint()
     test_bench_stamps_which_code_it_is()

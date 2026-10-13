@@ -295,6 +295,35 @@ def nudge_focus(pos, delta, lo=FOCUS_LO, hi=FOCUS_HI):
     return round(max(lo, min(hi, pos + float(delta))), 3)
 
 
+def focus_verdict(commanded, reported, tol=0.06):
+    """What may be HONESTLY said after commanding a lens move. Pure.
+
+    set_controls() with a rejected LensPosition raises nothing - libcamera
+    merely logs "Could not set LENS_POSITION - no AF algorithm" and the lens
+    stays put. The first version of these keys printed "manual lens 2.10 dpt"
+    for every press and the operator watched a lens that never moved: a
+    commanded number is not a result. Only the lens's own report counts.
+    """
+    try:
+        commanded = float(commanded)
+    except (TypeError, ValueError):
+        return "lens -"
+    if reported is None:
+        return ("lens %.2f dpt UNCONFIRMED - the lens reports no LensPosition "
+                "(the set was probably rejected; look for the libcamera WARN)"
+                % commanded)
+    try:
+        reported = float(reported)
+    except (TypeError, ValueError):
+        return "lens %.2f dpt UNCONFIRMED (bad read-back %r)" % (commanded,
+                                                                 reported)
+    if abs(reported - commanded) <= tol:
+        return focus_text(reported)
+    return ("lens %.2f dpt NOT APPLIED - the lens reports %.2f (see the "
+            "'Could not set LENS_POSITION' WARN)"
+            % (commanded, reported))
+
+
 def focus_text(dpt):
     """'lens 0.07 dpt (15.00 m)' for the HUD, or a dash when unknown. Pure."""
     try:
@@ -421,6 +450,10 @@ class CSISource:
         print("[camera] CSI %s (%s) model=%s size=%s autofocus=%s"
               % (pick.name, pick.facing, pick.model, self._size,
                  getattr(pick, "autofocus", None)))
+        print("[camera] tuning=%s rpi.af=%s focus_controls=%s"
+              % (getattr(pick, "tuning_source", None),
+                 getattr(pick, "af_algorithm", None),
+                 getattr(pick, "focus_controls", None)))
         _qb = getattr(pick, "qr_boost", None) or {}
         print("[detector-input] %s  (config.yaml qr_boost.detect_raw)"
               % ("RAW / gamma-corrected" if _qb.get("detect_raw")
@@ -695,9 +728,23 @@ def main():
             print("[focus] set_controls failed: %r (the tuning has no rpi.af, "
                   "or the lens is not driven)" % e)
             return None
+        reported = None
+        if manual and pos is not None:
+            try:
+                reported = (picam.capture_metadata() or {}).get("LensPosition")
+            except Exception:
+                reported = None
+            verdict = focus_verdict(pos, reported)
+            if "NOT APPLIED" in verdict or "UNCONFIRMED" in verdict:
+                # do NOT move the state - a phantom position makes every
+                # later step land somewhere else than the lens really is
+                focus_state["manual"] = manual
+                return "%s %s" % ("manual" if manual else "AF", verdict)
+            reported = float(reported)
         focus_state["manual"] = manual
         if pos is not None:
-            focus_state["pos"] = float(pos)
+            focus_state["pos"] = float(reported if reported is not None
+                                       else pos)
         return "%s %s" % ("manual" if manual else "AF",
                           focus_text(focus_state["pos"]))
 
@@ -924,6 +971,13 @@ def main():
                   ".hef for 15 m real-time (training/compile_hef.md)")
 
     cap.release()
+    # a Hailo detector abandoned at process exit dies in teardown-by-GC and
+    # takes the exit code with it (the ladder's step-12 shape). main.py closes
+    # the detector in its finally; so does this.
+    try:
+        det.close()
+    except Exception:
+        pass
     if _show:
         cv2.destroyAllWindows()
     print("[done] frames=%d raw_boxes=%d filter_kept=%d (rejected %d)"
