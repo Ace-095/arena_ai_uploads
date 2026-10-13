@@ -393,6 +393,30 @@ def test_tuning_lookup_dedupes_and_looks_in_models():
           "not found" in text, text)
 
 
+def test_live_focus_keys_step_and_clamp():
+    """[ ] step 0.05 dpt, - = step 0.25, and every step lands INSIDE the
+    motor's range (0..12 dpt from Arducam's rpi.af tuning)."""
+    check("fine step down", B.FOCUS_KEYS["["] == -0.05, repr(B.FOCUS_KEYS))
+    check("fine step up", B.FOCUS_KEYS["]"] == 0.05, repr(B.FOCUS_KEYS))
+    check("coarse step down", B.FOCUS_KEYS["-"] == -0.25, repr(B.FOCUS_KEYS))
+    check("coarse step up", B.FOCUS_KEYS["="] == 0.25, repr(B.FOCUS_KEYS))
+    check("a step lands", B.nudge_focus(1.0, 0.05) == 1.05,
+          repr(B.nudge_focus(1.0, 0.05)))
+    check("clamped at the far end", B.nudge_focus(0.02, -0.05) == 0.0,
+          repr(B.nudge_focus(0.02, -0.05)))
+    check("clamped at the near end", B.nudge_focus(11.98, 0.25) == 12.0,
+          repr(B.nudge_focus(11.98, 0.25)))
+    check("an unknown start begins at infinity focus",
+          B.nudge_focus(None, 0.05) == 0.05, repr(B.nudge_focus(None, 0.05)))
+    check("the HUD label carries distance",
+          B.focus_text(0.067) == "lens 0.07 dpt (14.93 m)",
+          B.focus_text(0.067))
+    check("infinity is named, not divided",
+          B.focus_text(0.0) == "lens 0.00 dpt (inf)", B.focus_text(0.0))
+    check("unknown reads as a dash", B.focus_text(None) == "lens -",
+          B.focus_text(None))
+
+
 def test_preset_boost_reaches_the_camera():
     """Pressing 1-7 in the bench changed the detector's conf/tiling but NOT the
     camera, so the window kept the same exposure and look whatever preset was
@@ -516,6 +540,7 @@ def test_bench_stamps_which_code_it_is():
 if __name__ == "__main__":
     test_headless_decision()
     test_preset_keys_are_ints()
+    test_live_focus_keys_step_and_clamp()
     test_preset_boost_reaches_the_camera()
     test_focus_score_and_vision_hint()
     test_bench_stamps_which_code_it_is()

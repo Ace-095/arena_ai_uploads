@@ -12,7 +12,14 @@ qr_filter.py — no duplicated logic), and draws:
     speck, odd shape); shown only while fakes are not hidden (key f)
 
 HUD (top-left): preset, conf, tile grid, require-decode, filter floor,
-`raw:N filt:M` counts (raw detector boxes vs filter survivors) + fps.
+`raw:N filt:M` counts (raw detector boxes vs filter survivors) + fps +
+the live sharpness score (`focus`) and the lens state.
+
+LIVE FOCUS (CSI cameras with a motorised lens): `[` `]` step the lens
+position by 0.05 dpt, `-` `=` by 0.25 dpt (0 = infinity, 1 = 1 m,
+0.067 = 15 m), and `a` toggles the autofocus loop back on. The first focus
+key switches the camera to MANUAL hold - nothing pulls the lens back after
+that, which is exactly what the AF loop was doing to the operator's hand.
 
 Why: a diamond window grill read as "qr" at conf 0.16-0.24 and filled the
 view with orange boxes. Default conf is now 0.35 + a geometry gate
@@ -266,6 +273,36 @@ def build_detector(args, conf_thr, prefer, kind="yolo"):
 #: with nothing in the output saying whether that was the lens, the light or
 #: the surface — hence a number in every stats line.
 MIN_FOCUS = 25.0
+
+
+#: Interactive focus keys -> delta in dioptres (libcamera's LensPosition unit:
+#: 0 = infinity, 1 = 1 m, 0.067 = 15 m). A plain map so key handling stays a
+#: lookup and this map is the testable thing.
+FOCUS_KEYS = {"[": -0.05, "]": 0.05, "-": -0.25, "=": 0.25}
+
+#: The rpi.af "normal" range from Arducam's tuning - the motor's real bounds.
+FOCUS_LO, FOCUS_HI = 0.0, 12.0
+
+
+def nudge_focus(pos, delta, lo=FOCUS_LO, hi=FOCUS_HI):
+    """New lens position in dioptres, clamped to the motor's range. Pure.
+
+    The bench lens went out and back by itself while the AF loop ran - a step
+    must land INSIDE the mechanical range or libcamera silently keeps the old
+    position and the operator chases a lens that "refuses" to move.
+    """
+    pos = 0.0 if pos is None else float(pos)
+    return round(max(lo, min(hi, pos + float(delta))), 3)
+
+
+def focus_text(dpt):
+    """'lens 0.07 dpt (15.00 m)' for the HUD, or a dash when unknown. Pure."""
+    try:
+        dpt = float(dpt)
+    except (TypeError, ValueError):
+        return "lens -"
+    dist = "inf" if dpt <= 1e-6 else "%.2f m" % (1.0 / dpt)
+    return "lens %.2f dpt (%s)" % (dpt, dist)
 
 
 def focus_score(frame, cv2mod=None):
@@ -626,16 +663,57 @@ def main():
             "--conf 0.10 and read maxconf= in the line above; (4) --no-tile is "
             "~9x faster (one inference) at the cost of small-QR reach at 15 m")
 
+    focus_state = {"pos": None, "manual": None}
+
+    def apply_focus(pos, manual):
+        """Drive the lens from the keyboard - the same control dict
+        cameras._open sends (AfMode Manual+LensPosition, or Continuous for
+        AF). Returns a status label, or None when nothing moved."""
+        cam = getattr(cap, "cam", None)
+        picam = getattr(cam, "_picam", None) if cam is not None else None
+        if picam is None:
+            print("[focus] this source has no motorised lens - use --source csi")
+            return None
+        try:
+            from libcamera import controls as CTRLS
+        except Exception as e:
+            print("[focus] libcamera controls unavailable: %r" % e)
+            return None
+        if focus_state["pos"] is None:
+            try:
+                focus_state["pos"] = float(
+                    (picam.capture_metadata() or {}).get("LensPosition") or 0.0)
+            except Exception:
+                focus_state["pos"] = 0.0
+        ctrl = {"AfMode": (CTRLS.AfModeEnum.Manual if manual
+                           else CTRLS.AfModeEnum.Continuous)}
+        if manual and pos is not None:
+            ctrl["LensPosition"] = float(pos)
+        try:
+            picam.set_controls(ctrl)
+        except Exception as e:
+            print("[focus] set_controls failed: %r (the tuning has no rpi.af, "
+                  "or the lens is not driven)" % e)
+            return None
+        focus_state["manual"] = manual
+        if pos is not None:
+            focus_state["pos"] = float(pos)
+        return "%s %s" % ("manual" if manual else "AF",
+                          focus_text(focus_state["pos"]))
+
     def hud(frame, raw_n, filt_n, payload_any, sharp=-1.0):
         lines = [
             "preset: %-10s conf %.2f  tile %s  req-decode: %s"
             % (active or "none", conf, "3x3" if tiled else "off",
                "ON " if qf.require_decode_for_cue else "off"),
             "filter: conf>=%.2f side>=%dpx aspect %.1f-%.1f | raw:%d filt:%d "
-            "| %.1f fps | focus %.0f"
+            "| %.1f fps | focus %.0f | %s %s"
             % (qf.min_conf, qf.min_side_px, qf.aspect_min, qf.aspect_max,
-               raw_n, filt_n, fps, sharp),
-            "keys: f fakes  v req-decode  k/l conf  t tile  p 1-8 preset  q quit",
+               raw_n, filt_n, fps, sharp,
+               "manual" if focus_state["manual"] else "AF",
+               focus_text(focus_state["pos"])),
+            "keys: f fakes  v req-decode  k/l conf  t tile  p 1-8 preset  "
+            "[ ] focus  - = coarse  a AF  q quit",
         ]
         y = 26
         for ln in lines:
@@ -769,7 +847,8 @@ def main():
                     print("[bench] wrote %s" % path)
 
         if _show:
-            cv2.imshow("QR bench (f/v/k/l/t/p/1-8/q)", _view(frame, args.view_width))
+            cv2.imshow("QR bench (f/v/k/l/t/p/1-8/[ ]/-/=/a/q)",
+                           _view(frame, args.view_width))
             k = cv2.waitKey(1) & 0xFF
             if k in (ord("q"), 27):
                 break
@@ -790,6 +869,16 @@ def main():
             elif k == ord("t"):
                 tiled = not tiled
                 print("[key] tiled: %s" % tiled)
+            elif chr(k) in FOCUS_KEYS:
+                new = nudge_focus(focus_state["pos"], FOCUS_KEYS[chr(k)])
+                lbl = apply_focus(new, True)
+                if lbl:
+                    print("[focus] %s" % lbl)
+            elif k == ord("a"):
+                to_manual = not bool(focus_state["manual"])
+                lbl = apply_focus(focus_state["pos"], to_manual)
+                if lbl:
+                    print("[focus] %s" % lbl)
             elif k == ord("p"):
                 active = names[(names.index(active) + 1) % len(names)] \
                     if active in names else names[0]
