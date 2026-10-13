@@ -654,6 +654,12 @@ def main():
             cap = CSISource(src, cfg)
         except Exception as e:
             print("ERROR: CSI source unavailable: %r" % e)
+            # an abandoned Hailo detector dies in teardown-by-GC and the
+            # Segmentation fault buries the ERROR line that matters
+            try:
+                det.close()
+            except Exception:
+                pass
             return 2
     else:
         cap = cv2.VideoCapture(int(src) if src.isdigit() else src)
@@ -661,6 +667,10 @@ def main():
             print("ERROR: cannot open source %r (need cv2 with V4L2/GStreamer, "
                   "or a file/URL). For the Pi's CSI camera use "
                   "--source csi:bottom" % src)
+            try:
+                det.close()
+            except Exception:
+                pass
             return 2
     is_file = os.path.isfile(str(src))
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1280
