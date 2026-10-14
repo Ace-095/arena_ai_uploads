@@ -438,6 +438,60 @@ def test_a_commanded_focus_move_is_only_claimed_when_the_lens_confirms_it():
           B.focus_verdict(None, None))
 
 
+def test_a_box_decode_does_not_search_the_rest_of_the_frame():
+    """A detector box IS the crop. The old cascade searched the full frame and
+    2x2 tiles INSIDE the per-box call too - up to 36 decode attempts on the
+    wrong boxes, measured at 6.9 s for one ceiling-fan frame and a 0.2 fps
+    preview. Callers that want a full-frame pass make it themselves (mission.py
+    and every bench tool already do)."""
+    import numpy as np
+    import decoder as DEC
+    calls = []
+
+    def counting(gray):
+        calls.append(gray.shape)
+        return None
+
+    real, real_tiles = DEC._try_backends, DEC._tiles
+    DEC._try_backends = counting
+
+    def bomb(*a, **kw):
+        raise AssertionError("the tile stage ran inside a box call")
+
+    DEC._tiles = bomb
+    try:
+        frame = np.zeros((1200, 1600, 3), dtype=np.uint8)   # big: tiles WOULD run
+        out = DEC.decode_frame(frame, (100, 100, 200, 200))
+    finally:
+        DEC._try_backends, DEC._tiles = real, real_tiles
+    check("nothing decodes on a black box", out is None, repr(out))
+    check("no attempt ever saw a full-frame-sized image",
+          calls and max(max(s[:2]) for s in calls) < 800,
+          "shapes: %r" % (calls,))
+    check("the ROI variants ran (bounded by variants, not the frame)",
+          0 < len(calls) <= 8, "backend calls: %d" % len(calls))
+
+
+def test_the_budget_stops_a_runaway_cascade():
+    import numpy as np
+    import decoder as DEC
+    calls = []
+
+    def counting(gray):
+        calls.append(None)
+        return None
+
+    real = DEC._try_backends
+    DEC._try_backends = counting
+    try:
+        frame = np.zeros((1200, 1600, 3), dtype=np.uint8)
+        out = DEC.decode_frame(frame, budget_s=0.0)   # no box: full cascade
+    finally:
+        DEC._try_backends = real
+    check("a zero budget does zero work", out is None and not calls,
+          "backend calls: %d" % len(calls))
+
+
 def test_preset_boost_reaches_the_camera():
     """Pressing 1-7 in the bench changed the detector's conf/tiling but NOT the
     camera, so the window kept the same exposure and look whatever preset was
@@ -563,6 +617,8 @@ if __name__ == "__main__":
     test_preset_keys_are_ints()
     test_live_focus_keys_step_and_clamp()
     test_a_commanded_focus_move_is_only_claimed_when_the_lens_confirms_it()
+    test_a_box_decode_does_not_search_the_rest_of_the_frame()
+    test_the_budget_stops_a_runaway_cascade()
     test_preset_boost_reaches_the_camera()
     test_focus_score_and_vision_hint()
     test_bench_stamps_which_code_it_is()

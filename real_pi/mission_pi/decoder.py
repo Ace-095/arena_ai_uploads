@@ -12,6 +12,7 @@ Decoders: pyzbar first (most robust), cv2.QRCodeDetector second.
 Everything degrades gracefully if a backend is missing.
 """
 import logging
+import time
 
 log = logging.getLogger("decoder")
 
@@ -127,14 +128,30 @@ def _upscale(gray, min_side=360):
     return cv2.resize(gray, (int(w * k), int(h * k)), interpolation=cv2.INTER_CUBIC)
 
 
-def decode_frame(frame_bgr, bbox=None, margin=0.35):
+def decode_frame(frame_bgr, bbox=None, margin=0.35, budget_s=None):
     """Decode a QR payload from a BGR frame.
 
     bbox: optional (x, y, w, h) candidate from the detector.
+    budget_s: optional wall-clock cap on the whole call (None = no cap).
     Returns payload string or None. Never raises on bad input.
+
+    A bbox call runs the ROI stage ONLY. The full-frame and 2x2-tile stages
+    exist for images where nothing told us where the QR is - a one-shot photo,
+    or a caller's own full-frame pass (mission.py and every bench tool already
+    make that pass separately, right after the per-box call). Running them
+    INSIDE a per-box call cost up to 42 decode attempts on the wrong boxes:
+    measured on the Pi 5, a frame of ceiling-fan false boxes took 6.9 SECONDS
+    in decode alone and the live preview crawled at 0.2 fps. The detector's
+    box is the crop; if the crop will not decode, searching the rest of the
+    frame is the caller's next call, not this one's hidden one.
     """
     if not _HAVE_CV2 or frame_bgr is None:
         return None
+    t0 = time.time()
+
+    def _over():
+        return budget_s is not None and (time.time() - t0) > float(budget_s)
+
     try:
         h_img, w_img = frame_bgr.shape[:2]
         # 1) ROI path — with QR boost
@@ -149,23 +166,32 @@ def decode_frame(frame_bgr, bbox=None, margin=0.35):
                     if roi is not None:
                         roi = _upscale(roi)
                         for v in _variants(roi):
+                            if _over():
+                                return None
                             out = _try_backends(v)
                             if out:
                                 return out
+            return None          # the box is the crop - nothing else to search
         # 2) full frame
         gray = _to_gray(frame_bgr)
         for v in _variants(gray):
+            if _over():
+                return None
             out = _try_backends(v)
             if out:
                 return out
         # 3) 2x2 overlapping tiles (small/far QRs)
         if max(w_img, h_img) > 900:
             for (x1, y1, x2, y2) in _tiles(w_img, h_img):
+                if _over():
+                    return None
                 tile = gray[y1:y2, x1:x2]
                 if tile.size == 0:
                     continue
                 tile = _upscale(tile, min_side=700)
                 for v in _variants(tile):
+                    if _over():
+                        return None
                     out = _try_backends(v)
                     if out:
                         return out

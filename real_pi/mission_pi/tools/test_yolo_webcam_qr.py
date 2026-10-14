@@ -693,6 +693,8 @@ def main():
     fps = 0.0
     t_last_line = 0.0
     last_focus = [-1.0]    # sharpness, refreshed once a second (see below)
+    det_ms_avg = [0.0]     # rolling stage timings: detect (Hailo) vs decode (CPU)
+    dec_ms_avg = [0.0]
     t_run_start = time.time()
     n_line_prev = 0
     t_line_prev = t_run_start
@@ -802,6 +804,7 @@ def main():
         fps = 0.9 * fps + 0.1 * (1.0 / dt) if fps else 1.0 / dt
 
         # ---- detect (tiled for 15 m) ----
+        _t0 = time.time()
         try:
             if tiled and det.name != "classical":
                 raw = detect_tiles(det, frame, rows=3, cols=3,
@@ -811,6 +814,7 @@ def main():
         except Exception as e:
             print("[detect] %r" % e)
             raw = []
+        det_ms = 1000.0 * (time.time() - _t0)
         n_raw += len(raw)
         # ---- fake-QR filter (the grill killer) ----
         kept = qf.filter_boxes(raw)
@@ -819,14 +823,20 @@ def main():
         rejected = [b for b in raw if id(b) not in kept_ids]
 
         # ---- decode survivors (best conf first) ----
+        # two boxes max, ROI-only inside decode_frame, hard time budget: a
+        # ceiling fan once filled 71 false boxes and each failed decode used to
+        # search the WHOLE frame + tiles (up to 36 attempts, measured 6.9 s for
+        # one frame). The preview must stay a preview.
         payload_any = None
         payload_box = None
-        for b in sorted(kept, key=lambda b: -b.conf)[:3]:
-            p = decode_frame(frame, (b.x, b.y, b.w, b.h))
+        _t1 = time.time()
+        for b in sorted(kept, key=lambda b: -b.conf)[:2]:
+            p = decode_frame(frame, (b.x, b.y, b.w, b.h), budget_s=0.25)
             if p:
                 payload_any = p
                 payload_box = b
                 break
+        dec_ms = 1000.0 * (time.time() - _t1)
         if qf.require_decode_for_cue and payload_box is None:
             kept = []  # strict: nothing counts until a box actually decodes
 
@@ -856,6 +866,10 @@ def main():
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1,
                             cv2.LINE_AA)
         fsharp = last_focus[0]      # refreshed once a second, not per frame
+        det_ms_avg[0] = det_ms if det_ms_avg[0] <= 0 else \
+            0.9 * det_ms_avg[0] + 0.1 * det_ms
+        dec_ms_avg[0] = dec_ms if dec_ms_avg[0] <= 0 else \
+            0.9 * dec_ms_avg[0] + 0.1 * dec_ms
         hud(frame, len(raw), len(kept), payload_any, fsharp)
 
         maxconf = max([b.conf for b in raw], default=0.0)
@@ -884,10 +898,11 @@ def main():
                 if isinstance(peak, (int, float)) and peak >= 0 else "nms=n/a ")
             print("[bench] frame=%d raw=%d filt=%d maxconf=%.2f %s"
                   "payload=%r frame_mean=%.0f frame_std=%.0f focus=%.0f "
-                  "fps=%.1f (%.0f ms/frame)"
+                  "fps=%.1f (%.0f ms/frame, det=%.0fms dec=%.0fms)"
                   % (n_frames, n_raw, n_filt, maxconf, extra, payload_any,
                      fmean, fstd, fsharp, win_fps,
-                     1000.0 / max(1e-3, win_fps)))
+                     1000.0 / max(1e-3, win_fps),
+                     det_ms_avg[0], dec_ms_avg[0]))
             if not hinted_vision:
                 msg = vision_hint(fmean, fstd, fsharp)
                 if msg:
