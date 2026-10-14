@@ -872,6 +872,43 @@ dict override always used.
 all. That is still open, and the re-run with the tuning actually loaded is the
 test.
 
+### Camera Module 3 (imx708) attached - and a kernel-level Hailo finding
+
+**`csi: none found` after the swap is the boot config, not the ribbon.**
+`/boot/firmware/config.txt` has `camera_auto_detect=0` (third-party modules
+need manual overlays), so ANY camera needs its own `dtoverlay` line. The imx708
+(Pi Camera Module 3) has none - `list_cams.py` predicted exactly this in its
+verdict: "with auto-detect off, any OTHER CSI camera (e.g. Pi Cam 3) also needs
+its own line: dtoverlay=imx708". Fix: add `dtoverlay=imx708` under `[all]` (or
+replace the `imx477,vcm` line if the UC-517 is gone), reboot.
+
+Good news on focus: the stock `imx708.json` tuning CARRIES `rpi.af` (measured
+by `list_cams.py` on 2026-10-13: "imx708.json contains rpi.af -> autofocus is
+AVAILABLE"). Camera Module 3 autofocuses natively - no vendor tuning file, no
+`install_tuning_env` needed for it. Note the geometry changes with this module
+(66 deg H / 41 deg V per config.yaml front section) - the UC-517's 75/60
+numbers do NOT transfer.
+
+**KERNEL-LEVEL FINDING - recorded as a limitation.** `dmesg` after the bench
+run shows a kernel oops inside the Hailo driver:
+
+```
+Call trace:
+  find_vma+0x6c/0x80 (P)
+  hailo_vdma_buffer_map+0x8c/0x620 [hailo_pci]
+  hailo_vdma_buffer_map_ioctl+0xdc/0x350 [hailo_pci]
+  hailo_vdma_ioctl+0xcc/0x260 [hailo_pci]
+```
+
+at ~96 s uptime, i.e. during the bench's Hailo initialisation. The oops was
+survived ("end trace") and the detector reported ready - and the earlier bench
+session DECODED a real QR with det=hailo, so the device functions - but a
+kernel oops in the VDMA buffer mapping is the shape of a Hailo-driver vs
+kernel-version mismatch (this board runs 6.18.50; Hailo's driver is known to
+lag new kernels). Treat Hailo as measured-working-but-at-risk: watch dmesg
+after runs, and if inference ever dies first, look at a hailort/driver update
+before anything else.
+
 ### THE ORIGINAL LEADING CAUSE, and what changed because of it
 
 The crash was at `vdev.configure(hef, cfg)` — the call immediately after
