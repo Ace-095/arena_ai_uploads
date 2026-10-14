@@ -280,6 +280,12 @@ MIN_FOCUS = 25.0
 #: lookup and this map is the testable thing.
 FOCUS_KEYS = {"[": -0.05, "]": 0.05, "-": -0.25, "=": 0.25}
 
+#: filter-floor keys -> delta on qr_filter.min_conf (the conf a box must CLEAR
+#: to survive the fake-QR filter). The detector can see a box at 0.32 that the
+#: filter then throws away at 0.35 - and with no way to move the floor live the
+#: bench reads "raw=3 filt=0" with the QR right there in the picture.
+FLOOR_KEYS = {"z": -0.05, "x": 0.05}
+
 #: The rpi.af "normal" range from Arducam's tuning - the motor's real bounds.
 FOCUS_LO, FOCUS_HI = 0.0, 12.0
 
@@ -771,8 +777,8 @@ def main():
                raw_n, filt_n, fps, sharp,
                "manual" if focus_state["manual"] else "AF",
                focus_text(focus_state["pos"])),
-            "keys: f fakes  v req-decode  k/l conf  t tile  p 1-8 preset  "
-            "[ ] focus  - = coarse  a AF  q quit",
+            "keys: f fakes  v req-decode  k/l conf  z/x filter-floor  t tile  "
+            "p 1-8 preset  [ ] focus  - = coarse  a AF  q quit",
         ]
         y = 26
         for ln in lines:
@@ -896,10 +902,12 @@ def main():
                 "nms_max=%.2f filled=%d "
                 % (peak, st.get("filled", 0))
                 if isinstance(peak, (int, float)) and peak >= 0 else "nms=n/a ")
-            print("[bench] frame=%d raw=%d filt=%d maxconf=%.2f %s"
+            _cs = sorted((b.conf for b in raw), reverse=True)[:3]
+            print("[bench] frame=%d confs=[%s] raw=%d filt=%d maxconf=%.2f %s"
                   "payload=%r frame_mean=%.0f frame_std=%.0f focus=%.0f "
                   "fps=%.1f (%.0f ms/frame, det=%.0fms dec=%.0fms)"
-                  % (n_frames, n_raw, n_filt, maxconf, extra, payload_any,
+                  % (n_frames, " ".join("%.2f" % c for c in _cs),
+                     n_raw, n_filt, maxconf, extra, payload_any,
                      fmean, fstd, fsharp, win_fps,
                      1000.0 / max(1e-3, win_fps),
                      det_ms_avg[0], dec_ms_avg[0]))
@@ -919,7 +927,7 @@ def main():
                     print("[bench] wrote %s" % path)
 
         if _show:
-            cv2.imshow("QR bench (f/v/k/l/t/p/1-8/[ ]/-/=/a/q)",
+            cv2.imshow("QR bench (f/v/k/l/z/x/t/p/1-8/[ ]/-/=/a/q)",
                            _view(frame, args.view_width))
             k = cv2.waitKey(1) & 0xFF
             if k in (ord("q"), 27):
@@ -951,6 +959,11 @@ def main():
                 lbl = apply_focus(focus_state["pos"], to_manual)
                 if lbl:
                     print("[focus] %s" % lbl)
+            elif chr(k) in FLOOR_KEYS:
+                qf.min_conf = round(max(0.05, min(0.99,
+                    qf.min_conf + FLOOR_KEYS[chr(k)])), 2)
+                print("[key] filter floor -> %.2f (boxes must clear this)"
+                      % qf.min_conf)
             elif k == ord("p"):
                 active = names[(names.index(active) + 1) % len(names)] \
                     if active in names else names[0]
