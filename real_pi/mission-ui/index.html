@@ -289,6 +289,16 @@
       <p class="hint">Ground rule: use <b>dark</b> (night + --tiled) or <b>kabaddi</b> (ground level) — require-decode presets raise a flight cue ONLY from a box that decoded a real payload, so a window grill can never steer the drone. Flight 15 m search: <b>day</b> (bbox cues still steer at range). Same table as tools/test_yolo_webcam_qr.py and config.yaml qr_presets. REST: POST /api/qr/preset {"preset":"dark"}.</p>
     </div>
 
+    <div class="card" id="cardScan">
+      <h2>QR SCAN (manual)</h2>
+      <div class="kv"><span>scan</span>
+        <button id="btnQrScan" class="btn small" style="background:#38bdf8;color:#111;">start scan</button>
+        <b id="qrScanInfo" style="font-size:11px;">off — the mission starts scanning on its DO_SPRAYER trigger</b>
+      </div>
+      <div class="kv"><span>payload</span><b id="qrScanPayload">—</b></div>
+      <p class="hint">Runs QR detection + decode on the Pi <b>right now</b>, with no mission and no DO_SPRAYER in the flight plan — a bench check, a camera aim test, a hand-held sweep. Perception only: this switch can never move the aircraft (<code>drives_flight: false</code>). REST: POST /api/scan {"on":true}.</p>
+    </div>
+
     <div class="card" id="cardQr">
       <h2>QR / RESULT</h2>
       <div class="kv"><span>streak</span><b id="qrStreak">—</b></div>

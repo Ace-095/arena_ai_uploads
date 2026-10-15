@@ -1009,3 +1009,43 @@ the probe now captures the HailoRT error text that distinguishes them. Until the
 detector builds, **every Hailo number in this repository is unmeasured** and the
 ladder is falling back to CPU — which, per the brief, must be visible rather than
 silent. `IS_HAILO=false` in the report is that visibility.
+
+---
+
+## Manual QR scan button (UI) — verified on x86, SYNTHETIC + fake_sitl
+
+Added for the bench: a **QR SCAN (manual)** card in mission-ui and
+`GET/POST /api/scan` in server.py (`ScanService`). It starts QR detection +
+decode **without a mission and without any DO_SPRAYER command in the flight
+plan** — the mission's own trigger path (sprayer seqs / MISSION_CURRENT) is
+untouched. Perception only: `drives_flight: false`, nothing is ever sent to
+the FC from this path.
+
+Verified **2026-10-15, x86 sandbox, SYNTHETIC frames + fake_sitl over TCP —
+NOT flight evidence**:
+
+* `tools/fake_sitl.py --ports 5760,5762` + `main.py --device tcp:127.0.0.1:5762`
+  with file cameras playing `/tmp/qr10m` (24 synthetic A3-QR frames, 28–40 px,
+  2028×1520, from `tools/make_demo_frames.py`).
+* `POST /api/scan {"on":true}` → `{running:true, tiles:"3x3",
+  detector:"yolo_onnx", opened_camera:false}` (mission camera REUSED), then
+  `{frames:6, fps:0.33, boxes:1, payload:"MISSION-QR-001"}` → `{"on":false}`
+  → stopped, mission still `WAIT_TRIGGER`, both cameras still running.
+* Mission FSM over the same TCP link: `QR_SEEN` pre-confirm → `QR CONFIRMED
+  via cam2` → relay to MP → GUIDED → FAILSAFE (trigger timeout) — full sweep
+  `MISSION_PI_SITL=tcp:127.0.0.1:5762 tests/test_sitl_flight.py` = **25/25 OK**.
+* `tests/test_scan_service.py` = 15/15: no camera → error text not exception;
+  no detector (or `get_detector`→None) → error text AND an opened camera is
+  released; start twice idempotent; stop-when-stopped no-op; running mission
+  camera never stopped by the scan; dead frame source doesn't kill the loop;
+  3×3 tiles really run (9 detect calls/frame); bad HTTP bodies → 400.
+
+Two honesty bugs this round caught and fixed: feeding the detector the
+**boosted** frame (31 false boxes; `latest(detect=True)` is the detector-correct
+frame per `qr_boost.detect_raw`) and an EMA fps that reported **478 fps** for a
+0.33 fps scan (first-iteration dt ≈ µs). fps is now frames/second-since-start.
+
+Also new: `test_yolo_webcam_qr.py --source <folder>` (DirSource) — the bench
+window/headless mode can now play a `make_demo_frames.py` corpus directly:
+`[done] frames=24 raw_boxes=23 filter_kept=23`, payload `MISSION-QR-001`
+decoded (x86 ONNX, ~1 s/frame — on the Pi with the HEF this is the Hailo path).

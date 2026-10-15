@@ -21,6 +21,10 @@ Contract (must match mission-ui js/links.js + js/camera.js):
   GET /api/fsm/status           contract alias -> {state, phase, detail, ...}
   GET /api/qr/status            contract alias -> {payload, streak, required,
                                 confirmed} (curl-able from the laptop)
+  GET/POST /api/scan            manual QR scan button {"on": true|false} ->
+                                {running, payload, boxes, fps, tiles, error,
+                                drives_flight:false}. Works with NO mission
+                                and NO DO_SPRAYER in the plan; perception only.
   POST /api/fsm/start|abort     contract aliases of takeover/abort (bench).
   GET /                         human landing page: alive? bring-up? urls?
   POST /api/mission/takeover    LOCAL USE ONLY (bench/SSH): force GUIDED
@@ -150,8 +154,197 @@ def _require_api():
         raise RuntimeError("fastapi/uvicorn not installed (%r)" % (_API_ERR,))
 
 
+class ScanService(object):
+    """A standalone QR scan loop the UI can switch on - WITHOUT a mission.
+
+    The mission starts scanning when the flight plan reaches a sprayer/trigger
+    command (DO_SPRAYER 216 and friends). The operator asked for a button that
+    starts the scan IRRESPECTIVE of that - bench work, a hand-held check, a
+    camera aim test. This is perception only: it detects and decodes and
+    reports; it never sends anything to the flight controller, so it cannot
+    move the aircraft (the same contract as the perception tap:
+    perception_only=true, drives_flight=false).
+
+    Cases it must survive, because a bench button that throws is a bench nobody
+    trusts: no camera (error in status, not an exception); no detector (same);
+    start twice (idempotent); stop when not running (no-op); a mission camera
+    already running (REUSED, never double-opened, and never stopped by us);
+    a camera WE opened (we stop it on scan stop); a dead frame source (the
+    loop idles, status keeps saying running with stale fps).
+    """
+
+    def __init__(self, rig, mission=None):
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self.rig = rig
+        self.mission = mission
+        self.thread = None
+        self._cam = None
+        self._det = None
+        self.state = {"running": False, "error": None, "payload": None,
+                      "boxes": 0, "frames": 0, "fps": 0.0,
+                      "started_at": None, "opened_camera": False,
+                      "detector": None, "tiles": None,
+                      "perception_only": True, "drives_flight": False}
+
+    def status(self):
+        with self._lock:
+            return dict(self.state)
+
+    def _cfg(self):
+        cfg = getattr(self.mission, "cfg", None)
+        return cfg if isinstance(cfg, dict) else {}
+
+    def start(self):
+        with self._lock:
+            if self.state["running"]:
+                return dict(self.state)
+            self._stop.clear()
+            cam, opened = None, False
+            try:
+                cams = dict(getattr(self.rig, "cams", None) or {})
+                cam = next((c for c in cams.values()
+                            if getattr(c, "running", False)), None)
+                if cam is None:
+                    cams = self.rig.detect() or {}
+                    cam = (next((c for c in cams.values()
+                                 if getattr(c, "facing", "") == "bottom"), None)
+                           or next(iter(cams.values()), None))
+                    if cam is None:
+                        raise RuntimeError("no camera detected - run "
+                                           "tools/list_cams.py")
+                    cam.start()
+                    opened = True
+            except Exception as e:
+                self.state.update(running=False, opened_camera=False,
+                                  error="camera: %r" % (e,))
+                return dict(self.state)
+            det = None
+            try:
+                from detector import get_detector
+                det = get_detector(self._cfg().get("detector", {}) or {})
+                if det is None:
+                    raise RuntimeError("no detector available (get_detector "
+                                       "returned None)")
+            except Exception as e:
+                if opened:
+                    try:
+                        cam.stop()
+                    except Exception:
+                        pass
+                self.state.update(running=False, opened_camera=False,
+                                  error="detector: %r" % (e,))
+                return dict(self.state)
+            self._cam, self._det = cam, det
+            rows, cols = self._tiles()
+            self._tiles_rc = (rows, cols)
+            self.state.update(running=True, error=None, payload=None, boxes=0,
+                              frames=0, fps=0.0, started_at=time.time(),
+                              opened_camera=opened,
+                              tiles="%dx%d" % (rows, cols),
+                              detector=getattr(det, "name", type(det).__name__))
+            self.thread = threading.Thread(target=self._loop, name="qr-scan",
+                                           daemon=True)
+            self.thread.start()
+            return dict(self.state)
+
+    def stop(self):
+        with self._lock:
+            if not self.state["running"]:
+                return dict(self.state)
+            self._stop.set()
+            th = self.thread
+        if th is not None:
+            th.join(timeout=3.0)
+        with self._lock:
+            if self.state.get("opened_camera") and self._cam is not None:
+                try:
+                    self._cam.stop()
+                except Exception:
+                    pass
+            self._cam, self._det, self.thread = None, None, None
+            self.state.update(running=False, opened_camera=False)
+            return dict(self.state)
+
+    def _tiles(self):
+        """Tile grid of the mission's current QR preset - the SAME table the
+        bench tool and the mission use (config.yaml qr_presets). Default 3x3:
+        at 10-15 m an A3 QR is ~28-40 px in a 2028x1520 frame, which a single
+        640-px network pass cannot see (the pixel-budget math in
+        docs/arena_test1/00_DETECTION_AT_10_15M_A3_QR_HEF.md). Tiles are the
+        researched, mission-proven answer, so the manual scan uses them too."""
+        try:
+            from qr_filter import load_presets
+            name = getattr(self.mission, "preset_name", "day") or "day"
+            pres = load_presets(self._cfg()) or {}
+            grid = (pres.get(name) or {}).get("tile_grid", [3, 3])
+            return int(grid[0]), int(grid[1])
+        except Exception:
+            return 3, 3
+
+    def _detect(self, frame):
+        from detector import detect_tiles
+        rows, cols = getattr(self, "_tiles_rc", None) or self._tiles()
+        if rows > 1 or cols > 1:
+            return detect_tiles(self._det, frame, rows=rows, cols=cols) or []
+        return self._det.detect(frame) or []
+
+    def _grab(self):
+        cam = self._cam
+        try:
+            if hasattr(cam, "latest"):
+                # detect=True -> whichever frame the DETECTOR should see
+                # (config qr_boost.detect_raw decides raw vs boosted) - the
+                # same frame the mission feeds its own detector. The boosted
+                # frame is for the human eye; feeding it to YOLO invents
+                # boxes (31 false positives measured vs ~1 real).
+                got = cam.latest(detect=True)
+                return got[0] if isinstance(got, tuple) else got
+            ok, frame = cam.read()
+            return frame if ok else None
+        except Exception:
+            return None
+
+    def _loop(self):
+        from decoder import decode_frame
+        t0 = time.time()
+        while not self._stop.is_set():
+            # fps is the MEAN OBSERVATION rate: frames processed / seconds
+            # since start. An EMA of 1/dt was tried twice and lied both
+            # times (478 fps for a 0.3 fps scan - the first iteration's dt
+            # is microseconds and the decay never catches up). A mean cannot
+            # spike, cannot go stale-high, and matches what the operator
+            # sees in `frames` anyway.
+            frame = self._grab()
+            if frame is None:
+                time.sleep(0.1)
+                continue
+            boxes, payload = [], None
+            try:
+                boxes = self._detect(frame)
+            except Exception:
+                boxes = []
+            try:
+                qf = getattr(self.mission, "qf", None)
+                if qf is not None:
+                    boxes = qf.filter_boxes(boxes)
+                for b in sorted(boxes, key=lambda b: -b.conf)[:2]:
+                    payload = decode_frame(frame, (b.x, b.y, b.w, b.h),
+                                           budget_s=0.25)
+                    if payload:
+                        break
+            except Exception:
+                payload = None
+            with self._lock:
+                n = self.state["frames"] + 1
+                elapsed = max(1e-3, time.time() - t0)
+                self.state.update(boxes=len(boxes), payload=payload,
+                                  frames=n, fps=n / elapsed)
+            time.sleep(0.02)
+
+
 def create_app(rig, mission, fc, streams=None, bringup=None, pulse_s=2.0,
-               port=8000):
+               port=8000, scan=None):
     """rig: CameraRig, mission: Mission (or None pre-start), fc: FCLink.
     streams: streamm1.StreamManager (or None -> /stream/* answers 404 and
     the UI falls back to snapshot polling).
@@ -166,6 +359,7 @@ def create_app(rig, mission, fc, streams=None, bringup=None, pulse_s=2.0,
     app.add_middleware(CORSMiddleware, allow_origins=["*"],
                        allow_methods=["*"], allow_headers=["*"])
     hub = Hub()
+    scan = scan if scan is not None else ScanService(rig, mission)
     t0 = time.time()
     pulse_s = max(0.5, float(pulse_s or 2.0))
 
@@ -558,6 +752,28 @@ def create_app(rig, mission, fc, streams=None, bringup=None, pulse_s=2.0,
     # ADDITIVE: a new endpoint, no change to any existing route or to the
     # flight path. `drives_flight` is always false — this is a perception
     # output, and NOT evidence that it is safe to descend near a target.
+    # ---- standalone QR scan (UI button; perception-only, never flight) ----
+    @app.get("/api/scan")
+    async def scan_status():
+        return scan.status()
+
+    @app.post("/api/scan")
+    async def scan_switch(req: Request):
+        """POST /api/scan {"on": true|false}. The state IS the answer: an
+        error (no camera, no detector) arrives as status.error with
+        running=false, never as a stack trace in the browser."""
+        try:
+            body = await req.json()
+        except Exception:
+            body = {}
+        on = body.get("on") if isinstance(body, dict) else None
+        if on is True:
+            return scan.start()
+        if on is False:
+            return scan.stop()
+        return JSONResponse({"detail": "body must be {\"on\": true|false}"},
+                            400)
+
     @app.get("/api/perception")
     async def perception_status():
         try:

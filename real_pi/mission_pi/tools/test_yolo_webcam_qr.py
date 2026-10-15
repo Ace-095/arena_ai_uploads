@@ -410,6 +410,69 @@ def frame_stats(frame):
         return -1.0, -1.0
 
 
+class DirSource:
+    """A FOLDER of frames behind the tiny cv2.VideoCapture interface.
+
+    tools/make_demo_frames.py writes synthetic bench corpora (A3 QR at the
+    calculated 10 m / 15 m pixel sizes) and its own output says "play them
+    back with kind: file" — but the bench window could not actually open a
+    folder, so the dry-run path on a fresh Pi was broken. This closes that
+    gap: same detect/decode/HUD code, deterministic frames, finite stream
+    (ends after the last frame, like a video file).
+    """
+
+    def __init__(self, path, fps=4.0):
+        import glob
+        files = sorted(glob.glob(os.path.join(str(path), "*.png")))
+        files += sorted(glob.glob(os.path.join(str(path), "*.jpg")))
+        if not files:
+            raise RuntimeError("no .png/.jpg frames in %r" % (path,))
+        self.files = files
+        self.dt = 1.0 / max(0.1, float(fps))
+        self.i = 0
+        self._next_t = 0.0
+        self.size = self._shape(files[0])
+
+    @staticmethod
+    def _shape(path):
+        import cv2
+        img = cv2.imread(path)
+        if img is None:
+            raise RuntimeError("cannot read first frame %r" % (path,))
+        return img.shape[1], img.shape[0]
+
+    def isOpened(self):
+        return True
+
+    def read(self):
+        if self.i >= len(self.files):
+            return False, None
+        import cv2
+        now = time.monotonic()
+        if self._next_t and now < self._next_t:
+            time.sleep(min(self._next_t - now, 1.0))
+        self._next_t = max(now, self._next_t) + self.dt
+        frame = cv2.imread(self.files[self.i])
+        self.i += 1
+        return (frame is not None), frame
+
+    def get(self, prop):
+        import cv2
+        if prop == cv2.CAP_PROP_FRAME_WIDTH:
+            return self.size[0]
+        if prop == cv2.CAP_PROP_FRAME_HEIGHT:
+            return self.size[1]
+        if prop == cv2.CAP_PROP_POS_FRAMES:
+            return self.i
+        return 0
+
+    def set(self, prop, val):
+        return False  # fixed-size frames; resizing a corpus would be a lie
+
+    def release(self):
+        pass
+
+
 class CSISource:
     """The Pi's OWN CSI camera, behind the tiny cv2.VideoCapture interface.
 
@@ -662,6 +725,20 @@ def main():
             print("ERROR: CSI source unavailable: %r" % e)
             # an abandoned Hailo detector dies in teardown-by-GC and the
             # Segmentation fault buries the ERROR line that matters
+            try:
+                det.close()
+            except Exception:
+                pass
+            return 2
+    elif os.path.isdir(str(src)):
+        # folder of frames (tools/make_demo_frames.py output) — the bench
+        # dry-run: same code path, deterministic synthetic QR.
+        try:
+            cap = DirSource(src)
+            print("[source] folder playback: %d frame(s) from %s"
+                  % (len(cap.files), src))
+        except Exception as e:
+            print("ERROR: cannot play folder %r: %r" % (src, e))
             try:
                 det.close()
             except Exception:

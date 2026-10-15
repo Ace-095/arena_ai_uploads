@@ -978,6 +978,59 @@ function boot() {
       });
     });
 
+    // ---- manual QR scan: works WITHOUT a mission / DO_SPRAYER trigger ----
+    // Server contract (server.py ScanService): GET /api/scan -> state;
+    // POST /api/scan {"on":bool} -> same state. Errors arrive INSIDE the
+    // state (running=false + error text) so the UI never has to guess.
+    const btnQrScan = $('btnQrScan');
+    const qrScanInfo = $('qrScanInfo');
+    const qrScanPayload = $('qrScanPayload');
+    let scanPoll = null;
+
+    function renderScan(d) {
+      if (!btnQrScan) return;
+      const on = !!(d && d.running);
+      btnQrScan.textContent = on ? 'stop scan' : 'start scan';
+      btnQrScan.style.background = on ? '#f87171' : '#38bdf8';
+      btnQrScan.disabled = false;
+      if (qrScanInfo) {
+        if (d && d.error) qrScanInfo.textContent = 'error: ' + d.error;
+        else if (on) qrScanInfo.textContent = 'running — ' + (d.detector || '?') +
+          ', tiles ' + (d.tiles || '?') + ', ' + (d.fps || 0).toFixed(1) + ' fps, ' +
+          (d.frames || 0) + ' frames' + (d.opened_camera ? '' : ' (mission camera reused)');
+        else qrScanInfo.textContent = 'off';
+      }
+      if (qrScanPayload) qrScanPayload.textContent =
+        (d && d.payload) ? d.payload
+        : ((d && on && d.boxes) ? 'boxes: ' + d.boxes + ' (no decode yet)' : '—');
+      if (on && !scanPoll) scanPoll = setInterval(fetchScanStatus, 1500);
+      if (!on && scanPoll) { clearInterval(scanPoll); scanPoll = null; }
+    }
+
+    function fetchScanStatus() {
+      if (!S.piUrl) return;
+      fetch(S.piUrl + '/api/scan', { cache: 'no-store' })
+        .then((r) => r.json()).then(renderScan)
+        .catch(() => { if (qrScanInfo) qrScanInfo.textContent = 'no Pi link'; });
+    }
+
+    if (btnQrScan) btnQrScan.addEventListener('click', () => {
+      if (!S.piUrl) { log('ERROR', 'Connect the Pi first — then the scan button works without any mission'); return; }
+      btnQrScan.disabled = true;
+      const on = btnQrScan.textContent.indexOf('start') === 0;
+      postJson(S.piUrl + '/api/scan', { on }).then((d) => {
+        renderScan(d);
+        if (d && d.error) log('ERROR', 'QR scan: ' + d.error);
+        else log('INFO', 'QR scan ' + (on ? 'STARTED' : 'stopped') +
+          ' — perception only, DO_SPRAYER not required');
+      }).catch((e) => {
+        btnQrScan.disabled = false;
+        log('ERROR', 'QR scan failed: ' + e.message);
+        if (qrScanInfo) qrScanInfo.textContent = 'Pi unreachable: ' + e.message;
+      });
+    });
+    fetchScanStatus();
+
     // ---- legacy fence tools (still supported) ----
     const btnDraw = $('btnDraw');
     if (btnDraw) btnDraw.addEventListener('click', () => {
