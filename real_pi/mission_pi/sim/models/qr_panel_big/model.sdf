@@ -1,0 +1,34 @@
+<?xml version="1.0"?>
+<!--
+  Big QR panel TRIPLE SIZE (3.564 x 5.04 m, 12x A3 linear, 3x previous double 1.188x1.68, lying flat).
+  User fix 2026-09-17: "double triple the size btw it's small" — was 1.188x1.68 4x-A3, now 3.564x5.04 12x-A3.
+  Same texture ratio as A3 — reuse same PNG (make_qr_panel.py --full, QR covers entire panel 95% fill).
+  Triple size = ~408px @15m huge, easy detection, fallback for classical.
+-->
+<sdf version="1.9">
+  <model name="qr_panel_big">
+    <static>true</static>
+    <link name="panel">
+      <pose>0 0 0.02 0 0 0</pose>
+      <visual name="face">
+        <geometry>
+          <box><size>3.564 5.04 0.03</size></box>
+        </geometry>
+        <material>
+          <diffuse>1 1 1 1</diffuse>
+          <specular>0.05 0.05 0.05 1</specular>
+          <pbr>
+            <metal>
+              <albedo_map>model://qr_panel_big/materials/textures/qr.png</albedo_map>
+            </metal>
+          </pbr>
+        </material>
+      </visual>
+      <collision name="surface">
+        <geometry>
+          <box><size>3.564 5.04 0.03</size></box>
+        </geometry>
+      </collision>
+    </link>
+  </model>
+</sdf>

@@ -1,0 +1,129 @@
+# Gazebo SITL + YOLO — 5763 version — FIX for MP setWPTotal timeout + lag + home not set
+# Root cause: SITL's default 5760 is for MAVProxy internal, --out tcp:0.0.0.0:5760 conflicts,
+# MAVProxy fails to bind 5760, falls back to 5763, MP connects to 5763 which is Pi's port,
+# contention causes lag + setWPTotal timeout + home not set
+#
+# Correct: SITL --out tcp:0.0.0.0:5762 for MP, --out tcp:0.0.0.0:5763 for Pi, no 5760 external
+# MP connects to TCP 192.168.1.10:5762 (NOT 5670 typo, NOT 5760 conflict, NOT 5763 Pi port)
+# Pi uses tcp:127.0.0.1:5763 (this config)
+#
+# Run:
+#   Terminal 1: gz sim -v 4 -r sim/worlds/mission_world.sdf
+#   Terminal 2: /usr/bin/python3 tools/gz_cam_bridge.py --port 8099 --qr-boost --verbose
+#   Terminal 3: cd ~/ardupilot/ArduCopter && ../Tools/autotest/sim_vehicle.py -v ArduCopter -f gazebo-iris --model JSON --map --console --out tcp:0.0.0.0:5762 --out tcp:0.0.0.0:5763 --out udp:127.0.0.1:14550
+#   Terminal 4: python3 main.py --config config.gazebo.yolo.5763.yaml
+#   Windows MP: TCP 192.168.1.10:5762
+
+server: { host: 0.0.0.0, port: 8000 }
+
+stream:
+  fps: 12
+  width: 960
+  quality: 70
+
+blob:
+  enabled: true
+  top_k: 3
+  per_candidate_s: 20
+  global_cap_s: 60
+  observe_every_s: 2.0
+  min_support: 2
+  cluster_radius_m: 2.0
+  commit_score: 0.7
+  trend_gain: 0.03
+  trend_slack: 0.05
+
+coverage:
+  cell_m: 5.0
+  push_every_s: 5.0
+  center_tol_m: 3.0
+  settle_s: 2.0
+  max_misses: 2
+
+fc:
+  conn: "tcp:127.0.0.1:5763"
+
+flight:
+  max_alt_m: 15.0
+  min_alt_m: 2.0
+  max_speed_ms: 3.0
+
+cameras:
+  front:
+    kind: url
+    backend: mjpeg
+    size: [2560, 1440]
+    hfov_deg: 68.0
+    rotation_deg: 0
+    jpeg_quality: 80
+    device: "http://127.0.0.1:8099/front.mjpg"
+    qr_boost:
+      enabled: true
+      profile: "front_qr_boost"
+      software_mode: "qr_boost"
+  bottom:
+    kind: url
+    backend: mjpeg
+    size: [2560, 1440]
+    hfov_deg: 68.0
+    rotation_deg: 0
+    jpeg_quality: 80
+    device: "http://127.0.0.1:8099/bottom.mjpg"
+    qr_boost:
+      enabled: true
+      profile: "bottom_qr_boost"
+      software_mode: "ground_suppress"
+
+qr_boost:
+  enabled: true
+  profile: "auto"
+  mode: "qr_boost_day"
+  software_mode: "qr_boost"
+
+detector:
+  kind: yolo
+  model_path: models/qr_yolov8n.pt
+  hef_path: models/qr_yolov8n.hef
+  input_size: 640
+  conf_thr: 0.25
+  iou_thr: 0.45
+  tile_bottom: true
+  tile_grid: [3, 3]
+  tile_overlap: 0.25
+  full_decode_every_n: 3
+  cue_frames: 2
+
+decode:
+  required_streak: 3
+  miss_tolerance: 2
+
+mission:
+  max_alt_m: 15.0
+  sweep_alt_m: 12.0
+  approach_stair_m: [12.0, 9.0, 7.0]
+  grid_overlap: 0.35
+  edge_margin_m: 2.5
+  resweep_alt_m: 10.0
+  search_speed_ms: 1.0
+  yaw_steps: 12
+  yaw_settle_s: 1.0
+  trigger_timeout_s: 900
+  search_timeout_s: 900
+  approach_timeout_s: 240
+  min_batt_pct: 0
+  arrive_m: 2.0
+  post_action: RTL
+  trigger_seq: null
+  trigger_cmds: [216, 222, 223, 42600]
+  trigger_require_auto: true
+  trigger_peek_ahead: false
+  nofence_half_m: 20.0
+  coverage_mode: "fov_optimal"
+  min_overlap: 0.2
+
+relay:
+  interval_s: 2.0
+  window_s: 15.0
+  store_forward: true
+  store_path: logs/pending_results.jsonl
+  flush_poll_s: 5.0

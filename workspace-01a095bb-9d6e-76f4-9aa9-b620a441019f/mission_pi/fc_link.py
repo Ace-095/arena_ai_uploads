@@ -575,6 +575,83 @@ class FCLink:
             mavutil.mavlink.MAV_MISSION_TYPE_FENCE, timeout)
         return [(m.x / 1e7, m.y / 1e7) for m in items]
 
+    def upload_fence(self, vertices_latlon, timeout=12.0):
+        """Upload fence inclusion polygon to FC — UI now drives fence via Pi, MP sees instantly.
+
+        vertices_latlon: [(lat,lon), ...] at least 3, closed or open.
+        Uses MAV_MISSION_TYPE_FENCE, MISSION_ITEM_INT with MAV_CMD 5001 (inclusion).
+        After upload, MP Fence tab shows it instantly because FC broadcasts fence.
+        Returns vertex count. Raises FCError on failure.
+        """
+        _require_pymavlink()
+        if len(vertices_latlon) < 3:
+            raise FCError("fence needs >=3 vertices")
+        # Close polygon if not closed
+        verts = list(vertices_latlon)
+        if verts[0] != verts[-1]:
+            verts.append(verts[0])
+        ts, tc = self.target_system, self.target_component
+        mtype = mavutil.mavlink.MAV_MISSION_TYPE_FENCE
+        # Prepare mission items: first is return point? For fence, items are polygon
+        # Use MAV_CMD_NAV_FENCE_POLYGON_VERTEX_INCLUSION = 5001
+        items = []
+        for i, (lat, lon) in enumerate(verts):
+            # param1 = vertex count for first item, 0 otherwise
+            p1 = len(verts) if i == 0 else 0
+            items.append((i, 5001, p1, lat, lon))
+        q = self.subscribe(["MISSION_REQUEST", "MISSION_REQUEST_INT", "MISSION_ACK"])
+        try:
+            # Send count
+            self._send(self.conn.mav.mission_count_send, ts, tc, len(items), mtype)
+            # Wait for requests and send items
+            deadline = time.time() + timeout
+            sent = set()
+            while len(sent) < len(items) and time.time() < deadline:
+                try:
+                    m = q.get(timeout=1.0)
+                except queue.Empty:
+                    continue
+                if m.get_type() not in ("MISSION_REQUEST", "MISSION_REQUEST_INT"):
+                    continue
+                if m.mission_type != mtype:
+                    continue
+                seq = int(m.seq)
+                if seq in sent or seq >= len(items):
+                    continue
+                idx, cmd, p1, lat, lon = items[seq]
+                # Send MISSION_ITEM_INT
+                self._send(self.conn.mav.mission_item_int_send,
+                           ts, tc, seq, mtype,
+                           cmd, 0, 0,  # current, autocontinue
+                           float(p1), 0, 0, 0,  # param1-4
+                           int(lat * 1e7), int(lon * 1e7), 0)  # x,y,z
+                sent.add(seq)
+            # Wait for ack
+            ack = self.wait_for(["MISSION_ACK"], lambda m: m.mission_type == mtype, 4.0)
+            if ack is None:
+                raise FCError("no MISSION_ACK after fence upload")
+            if ack.type != mavutil.mavlink.MAV_MISSION_ACCEPTED:
+                raise FCError("fence upload rejected: ack type %d" % ack.type)
+            log.info("fence uploaded: %d verts via Pi", len(verts))
+            return len(verts)
+        finally:
+            self.unsubscribe(q)
+
+    def clear_fence(self, timeout=6.0):
+        """Clear fence on FC — UI clear fence button."""
+        _require_pymavlink()
+        ts, tc = self.target_system, self.target_component
+        mtype = mavutil.mavlink.MAV_MISSION_TYPE_FENCE
+        try:
+            self._send(self.conn.mav.mission_clear_all_send, ts, tc, mtype)
+            ack = self.wait_for(["MISSION_ACK"], lambda m: m.mission_type == mtype, timeout)
+            if ack and ack.type == mavutil.mavlink.MAV_MISSION_ACCEPTED:
+                log.info("fence cleared via Pi")
+                return True
+            return False
+        except Exception as e:
+            raise FCError("clear_fence failed: %r" % e)
+
     def find_sprayer_seqs(self, plan, cmds=(216, 222, 223, 42600)):
         """All mission seqs whose command is a sprayer/trigger command.
 

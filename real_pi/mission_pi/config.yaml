@@ -1,0 +1,469 @@
+# ============================================================================
+# real_pi — ONE config for the whole Pi 5 + Pixhawk + UI stack.
+#
+#   python3 main.py            # picks THIS file up (default config.yaml)
+#
+# Everything the stack does lives in this file: HTTP server, video stream
+# (watchdog + adaptive), camera auto-detect, Pixhawk USB auto-connect, YOLO
+# (Hailo first, CPU fallback), decode confirm, flight ceiling + sweep, and
+# the two-stage QR -> Mission Planner relay.  Change a number, save, restart
+# mission_pi — no code edits.
+# ============================================================================
+
+server:
+  host: 0.0.0.0          # MUST be 0.0.0.0 — the laptop UI reaches the Pi over LAN
+  port: 8000             # paste http://<pi-ip>:8000 into the UI's Pi-link box
+
+# ----------------------------------------------------------------------------
+# Video stream to the UI (this is the one that "always stuck" — fixed here)
+#   * first_frame_wait_s : the stream waits this long for the first frame;
+#                          still nothing -> 503 -> UI falls back to polling
+#                          (a dead socket can never hold a tile hostage).
+#   * watchdog_s         : camera frames older than this -> the stream
+#                          thread RESTARTS the camera (bounded, cooled down).
+#   * adaptive           : encoder watches its own load and degrades
+#                          fps/width/quality under Pi 5 load (YOLO tiles!)
+#                          instead of freezing; restores when headroom back.
+# ----------------------------------------------------------------------------
+stream:
+  fps: 12                # UI MJPEG tick (1 encode per cam, shared by all tiles)
+  width: 960             # stream pixels only — capture/detect stay FULL-res
+  quality: 70
+  watchdog_s: 6.0
+  adaptive: true
+  min_fps: 4
+  min_width: 480
+  min_quality: 40
+  first_frame_wait_s: 8.0
+
+# ----------------------------------------------------------------------------
+# Cameras — AUTO-DETECT on the Pi 5 (CSI + USB, no manual device numbers)
+#
+# Each role (front/bottom) fills in this order:
+#   1. explicit kind (usb/url/file/mirror) — if you set one, it wins;
+#   2. CSI camera whose sensor matches `match_name` (picamera2/libcamera);
+#   3. USB V4L2 camera matching `match_vidpid` (vvvv:pppp) or `match_name`
+#      (substring of the USB product string);
+#   4. the first remaining free USB capture node (deterministic order).
+#
+# Run  python3 tools/list_cams.py  to see exactly what THIS Pi sees and
+# what it would assign to cam1/cam2.  Cameras are re-scanned every
+# auto_rescan_s (hot-plug: unplug/replug a USB cam mid-mission works);
+# POST /api/cameras/rescan forces it on demand.
+# ----------------------------------------------------------------------------
+cameras:
+  auto_detect: true
+  auto_rescan_s: 30          # 0 = disable the timer (manual rescan only)
+  single_cam_role: bottom    # if exactly ONE camera is found, it is THIS role
+  # A camera that a rescan cannot see is only DROPPED once it has stopped
+  # delivering frames for this many seconds — one failed probe (libcamera
+  # busy, a USB/I2C glitch) must not blank a live feed mid-flight. A camera
+  # that is really unplugged goes stale and is dropped on the following scan.
+  rescan_keep_grace_s: 5.0
+  front:
+    kind: auto               # auto | rpi | usb | url | file | mirror
+    match_name: imx708       # CSI: "Pi Camera Module 3" (IMX708)
+    match_vidpid: ""         # USB: e.g. "174c:55e8" (leave "" to auto-pick)
+    size: [4608, 2592]
+    hfov_deg: 66.0
+    vfov_deg: 41.0
+    autofocus: true
+    rotation_deg: 0
+    jpeg_quality: 80
+    qr_boost:
+      enabled: true
+      profile: front_qr_boost
+      software_mode: qr_boost
+  # --------------------------------------------------------------------------
+  # BOTTOM = the downward QR camera. Two IMX477 modules fit here and they are
+  # NOT interchangeable: both report the sensor string "imx477", but the lens,
+  # the FOV and the focus mechanism differ. Get the lens numbers right or the
+  # 15 m footprint / coverage grid / detection math is wrong.
+  #
+  #   Arducam UC-517  = IMX477 HQ module + motorised (VCM) focus lens.
+  #                     Autofocus works, but only with Arducam's tuning file,
+  #                     and the Pi 5 boot config must load the VCM driver:
+  #                       /boot/firmware/config.txt
+  #                         camera_auto_detect=0
+  #                         [all]
+  #                         dtoverlay=imx477,vcm
+  #                       (append ,cam0 if that camera is on the CAM0 port)
+  #                     Check the tuning file exists:
+  #                       ls /usr/share/libcamera/ipa/rpi/pisp/imx477_af.json
+  #                     Boot config, cable and FOV measuring:
+  #                       ../docs/CAMERA_AND_PIXHAWK_SETUP.md
+  #   Waveshare IMX477 IR-CUT B = fixed focus, 2.7 mm, 113 deg diagonal.
+  #
+  # After any hardware change run `python3 tools/list_cams.py`: it prints the
+  # real sensor string + libcamera index for THIS Pi and what these keys
+  # assign. If more than one camera reports imx477, uncomment csi_index so
+  # "bottom" is a certainty instead of enumeration order.
+  # --------------------------------------------------------------------------
+  bottom:
+    kind: auto
+    match_name: imx477       # UC-517 and Waveshare both report imx477
+    # csi_index: 1           # pin the exact libcamera index for this role
+                             # (needed when two cameras share a sensor string)
+    match_vidpid: ""
+    size: [2028, 1520]       # 40 fps binned — SNR + fps sweet spot for 15 m
+    # --- Arducam UC-517 (ACTIVE) ------------------------------------------
+    # Vendor figures for the motorised-focus module's stock M12 lens
+    # (3.9 mm f/2.8, quoted 75 deg H). Arducam ships other lenses on the same
+    # sensor (6 mm CS-mount 65 deg H, 100 deg H AF module), so MEASURE the
+    # real ground footprint at 15 m before trusting any of these four numbers
+    # -- hfov/vfov drive the footprint, mm/px, coverage grid and cue geometry.
+    hfov_deg: 75.0
+    vfov_deg: 60.0
+    diagonal_fov_deg: 90.0
+    focal_length_mm: 3.9
+    aperture: 2.8
+    autofocus: true          # VCM lens: needs tuning_file + the ,vcm overlay
+    tuning_file: imx477_af.json   # Arducam AF tuning for the Pi 5 (pisp) IPA
+    # For a DOWNWARD camera one measured lens position beats continuous
+    # autofocus (contrast-detect AF hunts over low-texture ground). Positions
+    # are libcamera dioptres: 0 = infinity, 0.067 = 15 m. Set autofocus:false
+    # first, then measure with tools/focus_sweep.py — it prints this line.
+    # lens_position: 0.067
+    # --- Waveshare IMX477 IR-CUT B (previous hardware; uncomment to revert) -
+    # hfov_deg: 100.0
+    # vfov_deg: 75.0
+    # diagonal_fov_deg: 113.0
+    # focal_length_mm: 2.7
+    # aperture: 2.8
+    # autofocus: false       # fixed focus — verify 15 m sharpness first!
+    rotation_deg: 0
+    jpeg_quality: 80
+    qr_boost:
+      enabled: true
+      profile: bottom_qr_boost
+      software_mode: ground_suppress
+
+# Global QR boost defaults (per-role settings above win).
+qr_boost:
+  enabled: true
+  profile: auto
+  mode: qr_boost_day
+  software_mode: qr_boost
+  # Which frame the DETECTOR eats (the window always shows this same frame):
+  #   false — the software-boosted one (CLAHE + unsharp + green suppress):
+  #           contrast helps the EYE, but it amplifies night noise and the
+  #           model was trained on ordinary frames. Computed on demand, only
+  #           when a caller asks for the boosted frame.
+  #   true (DEFAULT) — the raw / gamma-corrected frame, exactly what the model
+  #           saw in training. No software boost cost on the detector path.
+  # FIELD A/B (30 s, no code change): point the camera at the QR, run the
+  # bench, note `nms_max=` in the stats line, flip this to true, run again and
+  # compare. Higher nms_max + more boxes wins. Startup prints which one is live:
+  #   [detector-input] RAW / gamma-corrected   (or: software-boosted)
+  detect_raw: true
+
+# ----------------------------------------------------------------------------
+# Pixhawk — AUTO-CONNECT over USB (cable straight into a Pi 5 USB port)
+#
+# Leave conn EMPTY for full auto-detect: /dev/serial/by-id/* (ArduPilot /
+# Pixhawk names first — stable across re-plugs), then /dev/ttyACM*, then
+# /dev/ttyUSB*. Every candidate is tried at every baud in `bauds` and the
+# first one that answers a VEHICLE heartbeat wins.  Re-plug / reboot /
+# port-change recovery: the FC watchdog (dead_s) notices a missing heartbeat
+# and RE-DETECTS automatically (link_lost -> link_restored in the UI log).
+#
+#   conn: tcp:127.0.0.1:5762   # only for SITL/Gazebo bench
+#   conn: /dev/ttyACM0         # or pin a specific device
+# ----------------------------------------------------------------------------
+fc:
+  conn: ""                 # "" = AUTO-DETECT (the real-flight default)
+  bauds: [115200, 57600, 921600]
+  dead_s: 10.0             # no vehicle heartbeat for 10 s => link lost
+  retry_s: 5.0             # reconnect cadence while the link is down
+  connect_timeout_s: 0     # 0 = keep retrying forever (UI stays up either way)
+
+# ----------------------------------------------------------------------------
+# QR detection — YOLO, Hailo AI HAT FIRST, CPU fallback (no drone crash)
+#
+#   kind: auto ladder (every rung falls through to the next):
+#     1. Hailo  : models/qr_yolov8n.hef + hailo_platform (the AI HAT)
+#     2. ONNX   : models/qr_yolov8n.onnx + onnxruntime (light on ARM)
+#     3. .pt    : models/qr_yolov8n.pt + ultralytics (torch, heavier)
+#     4. classical: cv2 + pyzbar (no model — weak past ~8 m, day-one fallback)
+#
+# 15 m A3 panel answer: the bottom frame is run as a 3x3 TILE grid
+# (tile_bottom) so a 34 px QR becomes ~150 px on the network input.
+# ----------------------------------------------------------------------------
+detector:
+  kind: auto               # auto | hailo | yolo | classical | custom | none
+  hef_path: models/qr_yolov8n.hef     # used by the Hailo rung (if present)
+  # Hailo NMS boxes are 5 values: y_min, x_min, y_max, x_max, score (HailoRT's
+  # own layout), normalised 0..1. If a run EVER draws boxes mirrored across the
+  # frame diagonal (QR low in the view, box shown to the left), set xyxy here —
+  # no code change, and the bench prints which order it used.
+  nms_order: yxyx
+  prefer: [onnx, pt]       # CPU rung order (onnx first on the Pi 5)
+  input_size: 640
+  conf_thr: 0.25           # START value — the active preset (below) overrides
+  iou_thr: 0.45            #   it at startup and on every preset switch
+  preset: day              # ACTIVE qr_presets entry (runtime: POST /api/qr/preset)
+  tile_bottom: true        # helps small QR candidates; cannot guarantee 15 m decode
+  tile_front: false        # enable for distant Cam3 QRs; 3x3 = 9 inferences/frame
+  tile_grid: [3, 3]
+  tile_overlap: 0.25
+  full_decode_every_n: 3   # full-frame decode attempt every Nth frame
+  cue_frames: 2            # STEERING gate: consecutive qualifying processed frames PER CAMERA
+                           # strict presets require decoded boxes; misses reset pending streak
+
+# ----------------------------------------------------------------------------
+# FAKE-QR FILTER + ENVIRONMENT PRESETS (the window-grill fix)
+#
+# A diamond window grill read as "qr" at conf 0.16-0.24 and filled the view
+# with orange boxes — useless on the ground. Every detector box must now
+# pass these gates before it can draw an overlay or steer the drone:
+#
+#   min_conf           0.35  — above the grill band (real 15 m QRs score ~0.5)
+#   min_side_px        15    — kill specks
+#   aspect_min..max    0.4-2.5 — QRs are ~square; grill shards are diamonds
+#   require_decode_for_cue — when true, a FLIGHT CUE only comes from a box
+#                            that actually decoded a payload (only real QRs
+#                            trigger the mission). Presets set this per
+#                            environment (see below); the decode/consensus
+#                            path was ALREADY decode-only.
+#
+# PRESETS: one named environment setting (detector conf, tile grid, decode
+# cadence, cue strictness, ISP boost). Switch at runtime with
+#   curl -X POST http://<pi>:8000/api/qr/preset -d '{"preset":"dark"}'
+# or keys p / 1-7 in tools/test_yolo_webcam_qr.py.
+#
+# RECOMMENDED (from the field report):
+#   * unsure / mixed light: preset `auto` (key 8 in the bench) — auto exposure
+#     plus auto recovery, so the picture can never be black. On ANY preset a
+#     manual daylight profile now hands exposure back to the AE by itself when
+#     the frame goes dark (see `[cameras] ... AUTO EXPOSURE restored` in the
+#     log) and re-applies your profile once the scene is bright again.
+#   * ground runs (kabaddi/night): preset `dark` or `kabaddi` — always
+#     require-decode.  Night + tiled: conf 0.30 + dark boost.
+#   * flight 15 m search: preset `day` (default).
+# ----------------------------------------------------------------------------
+qr_filter:
+  min_conf: 0.35
+  min_side_px: 15
+  aspect_min: 0.4
+  aspect_max: 2.5
+  require_decode_for_cue: false
+
+qr_presets:
+  day:          # key 1 — daylight 15 m search (default)
+    conf_thr: 0.35
+    tile_grid: [3, 3]
+    full_decode_every_n: 3
+    require_decode_for_cue: false
+    boost: qr_boost_day
+    desc: "daylight 15 m search (default)"
+  far:          # key 2 — max range, more recall
+    conf_thr: 0.30
+    tile_grid: [3, 3]
+    full_decode_every_n: 3
+    require_decode_for_cue: false
+    boost: qr_boost_day
+    desc: "max range 15 m — more recall, still above grill conf"
+  dark:         # key 3 — night ground (a.k.a. dark_qr_boost)
+    conf_thr: 0.30
+    tile_grid: [3, 3]
+    full_decode_every_n: 2
+    require_decode_for_cue: true
+    boost: qr_boost_lowlight
+    desc: "night ground (dark_qr_boost) — only decodes count"
+  kabaddi:      # key 4 — ground level, close range
+    conf_thr: 0.30
+    tile_grid: [1, 1]
+    full_decode_every_n: 1
+    require_decode_for_cue: true
+    boost: qr_boost_lowlight
+    desc: "ground level, close range — full frame, only real QRs trigger"
+  low:          # key 5 — indoor low light
+    conf_thr: 0.25
+    tile_grid: [3, 3]
+    full_decode_every_n: 2
+    require_decode_for_cue: true
+    boost: qr_boost_lowlight
+    desc: "indoor low light — sensitive but strict on cues"
+  aggressive:   # key 6 — bright high-contrast day
+    conf_thr: 0.25
+    tile_grid: [3, 3]
+    full_decode_every_n: 2
+    require_decode_for_cue: false
+    boost: qr_boost_aggressive
+    desc: "bright high-contrast day — detector sensitivity up"
+  bench:        # key 7 — SITL/bench
+    conf_thr: 0.35
+    tile_grid: [1, 1]
+    full_decode_every_n: 1
+    require_decode_for_cue: false
+    boost: normal
+    desc: "SITL/bench — full frame, fastest, no boost"
+  auto:         # key 8 — ANY light: the camera never goes black
+    conf_thr: 0.30
+    tile_grid: [3, 3]
+    full_decode_every_n: 2
+    require_decode_for_cue: false
+    boost: qr_boost_auto
+    desc: "auto exposure + auto recovery: daylight, dusk or a dark room — try this when you do not want to think about the light"
+
+# ----------------------------------------------------------------------------
+# PERCEPTION LAYER — temporal tracking + a perception state machine.
+#
+# ADDITIVE AND OBSERVATION-ONLY. This section configures a read-only layer
+# that observes the frames, boxes and payloads the mission ALREADY computes
+# and turns them into a stabilised, structured perception result:
+#
+#   SEARCHING -> CANDIDATE_DETECTED -> TARGET_TRACKING -> QR_DECODING
+#             -> PAYLOAD_VALIDATED -> RESULT_REPORTED
+#
+# It never commands the vehicle, never alters a box or a payload on its way
+# back out, and `mission.py` is untouched. Read it live at GET /api/perception.
+# Set `enabled: false` and restart to switch the whole layer off.
+#
+# WHY: every stage before this was per-frame. Two boxes in two frames were not
+# known to be the same object, so a single blurred frame was indistinguishable
+# from "the target is gone", and a jittering box kept moving the decoder's ROI.
+# `tracker.py` fixes the first, this state machine the second.
+#
+# The numbers below are STARTING POINTS for a bench calibration, not measured
+# constants — `blur_min` in particular is scene- and lens-dependent. Measure
+# with:  python3 tools/perception_bench.py make --out /tmp/qrbench
+#        python3 tools/perception_bench.py run  --corpus /tmp/qrbench --md r.md
+# ----------------------------------------------------------------------------
+perception:
+  enabled: true              # false = the tap is never installed (no-op)
+  # --- image quality gate -----------------------------------------------
+  # Judged on TWO patches on purpose: blur on the QR ROI (that is the detail
+  # that matters), exposure on a downscaled centre crop of the SCENE (a QR is
+  # ~50% black, so a percentile test on the ROI always reports "dark").
+  blur_min: 18.0             # Laplacian variance floor (CALIBRATE on your lens)
+  luma_min: 25.0             # mean grey below this = underexposed
+  luma_max: 235.0            # above this = blown highlights
+  dark_pct_min: 8.0          # 5th-percentile grey floor
+  exposure_s: 0.002          # ASSUMED shutter, for the blur ESTIMATE only
+  max_motion_blur_px: 3.0    # speed x exposure x px/m budget
+  require_quality_for_decode: true   # do not spend decode CPU on a blurred frame
+  # --- tracker (temporal association + smoothing) ------------------------
+  min_hits: 2                # frames a target must persist before it is trusted
+  max_misses: 8              # dropped frames tolerated before the track dies
+  max_age_s: 2.0             # ...or this much wall time
+  stale_s: 0.5               # a target unseen this long is "stale", not present
+  smooth: 0.5                # box EMA; a real size change SNAPS instead (approach stair)
+  # --- decode cadence ----------------------------------------------------
+  decode_every_n: 2          # the tap gets the mission's decodes; this only
+                             # applies when decode_own is on (bench/standalone)
+  decode_own: false          # true = the pipeline decodes the ROI itself
+                             # (used by tools/perception_bench.py, not the flight loop)
+  min_roi_side_px: 28        # below this a decode attempt cannot succeed — skip it
+  roi_margin: 0.35
+  roi_upsample: 3.0
+  perspective_fix: true      # warp a tilted panel back to square before decoding
+  # --- payload trust -----------------------------------------------------
+  required_streak: 2         # frames agreeing before a payload is PUBLISHED
+  miss_tolerance: 1
+  validate: true
+  payload_min_len: 1
+  payload_max_len: 128
+  payload_pattern: ""        # optional regex, e.g. "^MISSION-"
+  duplicate_window_s: 30.0   # a payload is reported once per window
+  # --- recovery ----------------------------------------------------------
+  lost_grace_s: 1.5          # a gap this short is a dropped frame, not a loss
+  error_recover_s: 5.0       # detector/Hailo errors: return to SEARCHING after this
+  max_consecutive_errors: 5  # ...and only latch ERROR after this many in a row
+  history: 60                # transitions kept for the log
+
+# ----------------------------------------------------------------------------
+# Decode confirm — how many CONSECUTIVE identical decodes confirm a payload
+# (drives mission completion). The MP message itself does NOT wait for this:
+# see `relay` below — QR_SEEN goes out on the very first decode.
+# ----------------------------------------------------------------------------
+decode:
+  required_streak: 3
+  miss_tolerance: 2        # blank/disagreeing frames tolerated mid-streak
+
+# ----------------------------------------------------------------------------
+# FLIGHT CEILING + SWEEP — "the config adjusts the drone's max and sweep"
+#
+#   flight.max_alt_m   : HARD ceiling — every altitude command the Pi sends
+#                        (sweep, approach, resweep) is clamped to this.
+#   mission.sweep_alt_m: the altitude the search grid actually flies.
+#
+# 15 m A3 setup (the target spec). Drop max_alt_m to 10 and sweep to 10 for
+# the 10 m panel: detection margin improves, grid footprint shrinks — the
+# grid spacing re-computes from your camera FOV automatically.
+# ----------------------------------------------------------------------------
+flight:
+  max_alt_m: 15.0
+  min_alt_m: 2.0
+  max_speed_ms: 3.0
+
+blob:
+  enabled: true            # last-resort ground hypotheses after resweep
+  top_k: 3
+  per_candidate_s: 20
+  global_cap_s: 60
+  observe_every_s: 2.0
+  min_support: 2
+  cluster_radius_m: 2.5
+  commit_score: 0.7
+  trend_gain: 0.03
+  trend_slack: 0.05
+
+coverage:
+  cell_m: 5.0
+  push_every_s: 5.0
+  center_tol_m: 3.0
+  settle_s: 2.0
+  max_misses: 2
+
+mission:
+  max_alt_m: 15.0          # ceiling (mirrors flight.max_alt_m)
+  sweep_alt_m: 15.0        # search grid altitude (<= max_alt_m)
+  approach_stair_m: [12.0, 9.0, 7.0]   # descend while centered on the cue
+  grid_overlap: 0.35       # 35% overlap for the 15 m panel
+  edge_margin_m: 2.5       # grid legs stop this far INSIDE the fence
+  resweep_alt_m: 10.0      # 2nd grid at 10 m if the 1st finds nothing (0=off)
+  search_speed_ms: 2.0     # slow during search = more frames over the QR
+  yaw_steps: 12
+  yaw_settle_s: 1.0
+  trigger_timeout_s: 600
+  search_timeout_s: 300    # ONE budget shared by yaw + grid + resweep
+  approach_timeout_s: 240
+  min_batt_pct: 25         # below this -> failsafe (RTL/land, no crash)
+  arrive_m: 2.0
+  link_timeout_s: 0        # 0 = WAIT FOREVER for the FC link (real-flight
+                           # default: bring-up keeps retrying in the
+                           # background; the UI stays up the whole time)
+  post_action: RTL         # RTL | AUTO | LOITER | LAND after transmit
+  trigger_seq: null
+  trigger_cmds: [216, 222, 223, 42600]
+  trigger_require_auto: true
+  trigger_peek_ahead: false
+  coverage_mode: fov_optimal
+  min_overlap: 0.2
+  # nofence_half_m: 50.0   # home box half-size when the FC has no fence
+
+# ----------------------------------------------------------------------------
+# QR -> Mission Planner: TWO-STAGE, NO DELAY
+#
+#   Stage 1 (announce): the FIRST single-frame decode puts
+#             QR_SEEN:<payload> on MAVLink STATUSTEXT — the Pixhawk
+#             forwards it to every GCS, so it lands in MP's Messages tab
+#             within one telemetry tick (~50 ms over USB). Resent for
+#             announce_window_s to survive one dropped packet.
+#   Stage 2 (confirm) : when the confirm-streak completes,
+#             QR:<payload> goes out immediately (NOT after the approach
+#             descent) and is resent every interval_s for window_s.
+#   store_forward     : if BOTH routes are down, the result is buffered to
+#                       disk and flushed on recovery — nothing is lost.
+# ----------------------------------------------------------------------------
+relay:
+  announce: true           # Stage 1: instant QR_SEEN on first decode
+  announce_window_s: 6.0   # ...resent for this long (packet-loss cover)
+  announce_interval_s: 1.5
+  on_confirm: true         # Stage 2: official QR relay at confirm time
+  interval_s: 2.0          # QR:<payload> resend cadence to MP
+  window_s: 15.0           # ... for this long
+  store_forward: true
+  store_path: logs/pending_results.jsonl
+  flush_poll_s: 5.0

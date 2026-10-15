@@ -1,0 +1,15 @@
+The bench world is SHIPPED — no hand-editing needed:
+
+  sim/worlds/mission_world.sdf   (iris_dualcam + qr_target + safety ground)
+  sim/models/iris_dualcam/       (front + bottom cameras)
+  sim/models/qr_panel_big/       (2x-A3 target for first runs)
+  sim/models/qr_panel_a3/        (true-A3 target for later, with YOLO)
+
+  gz sim -v4 -r sim/worlds/mission_world.sdf   (from mission_pi/)
+
+Needs GZ_SIM_RESOURCE_PATH to include mission_pi/sim/models
+(plus ~/ardupilot_gazebo/models). Full runbook: SIM_GUIDE.md section 10.
+
+Manual alternative (drag-and-drop in the GUI): with any world open, the
+Insert tab lists qr_panel_big / qr_panel_a3 once the resource path is set.
+Drop one ~8 m from the iris home point.

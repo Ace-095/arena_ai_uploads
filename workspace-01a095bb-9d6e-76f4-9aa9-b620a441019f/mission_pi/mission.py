@@ -41,11 +41,32 @@ class Mission:
         self.hub = hub
         self.cfg = cfg
         m = cfg.get("mission", {})
-        self.sweep_alt = float(m.get("sweep_alt_m", 15.0))
-        self.approach_stair = [float(a) for a in m.get("approach_stair_m", [12.0, 9.0, 7.0])]
+        # --- arena/test1: configurable max height via config.yaml ---
+        # flight.max_alt_m or mission.max_alt_m controls the ceiling (5/10/15 m etc)
+        flight_cfg = cfg.get("flight", {})
+        raw_max = m.get("max_alt_m", flight_cfg.get("max_alt_m", 15.0))
+        try:
+            import geo as _geo_check
+            self.max_alt_m = _geo_check.validate_max_alt(raw_max, default=15.0)
+        except Exception:
+            self.max_alt_m = float(raw_max) if raw_max else 15.0
+        # sweep_alt is clamped to max_alt
+        raw_sweep = float(m.get("sweep_alt_m", self.max_alt_m))
+        self.sweep_alt = max(1.0, min(self.max_alt_m, raw_sweep))
+        # approach stair also clamped to max_alt
+        raw_stair = m.get("approach_stair_m", [12.0, 9.0, 7.0])
+        self.approach_stair = [max(1.0, min(self.max_alt_m, float(a))) for a in raw_stair]
+        # keep stair sorted descending for approach
+        self.approach_stair = sorted(self.approach_stair, reverse=True)
         self.grid_overlap = float(m.get("grid_overlap", 0.3))
         self.edge_margin_m = float(m.get("edge_margin_m", 2.0))
         self.resweep_alt_m = float(m.get("resweep_alt_m", 10.0))
+        # clamp resweep too
+        if self.resweep_alt_m > 0:
+            self.resweep_alt_m = max(1.0, min(self.max_alt_m, self.resweep_alt_m))
+        # coverage mode: fov_optimal uses camera FOV to divide area
+        self.coverage_mode = str(m.get("coverage_mode", "fov_optimal"))
+        self.min_overlap = float(m.get("min_overlap", 0.2))
         self.search_speed_ms = float(m.get("search_speed_ms", 2.5))
         self.yaw_steps = int(m.get("yaw_steps", 12))
         self.yaw_settle_s = float(m.get("yaw_settle_s", 1.0))
@@ -138,13 +159,28 @@ class Mission:
     def status(self):
         with self._lock:
             cs = self._consensus.status()
+            # arena/test1: expose max_alt and FOV coverage info
+            cam = self.rig.get("cam2") or self.rig.get("cam1")
+            fov_info = {}
+            if cam:
+                try:
+                    fw, fh = geo.footprint_m(self.sweep_alt, cam.hfov_deg, cam.size[0], cam.size[1])
+                    fov_info = {"cam": cam.name, "hfov_deg": cam.hfov_deg,
+                                "footprint_w_m": round(fw, 1), "footprint_h_m": round(fh, 1),
+                                "alt_m": self.sweep_alt, "max_alt_m": self.max_alt_m}
+                except Exception:
+                    fov_info = {"max_alt_m": getattr(self, "max_alt_m", 15.0)}
             return {"phase": self.phase, "detail": self.detail,
                     "payload": self.payload, "tracking": cs["tracking"],
                     "streak": "%d/%d" % (cs["streak"], cs["required"]),
                     "home": self.home, "fence_n": len(self.fence),
                     "sprayer_seqs": list(self.sprayer_seqs),
                     "cams": self.rig.status(), "link": self.fc.link_ok(),
-                    "stats": dict(self.stats), "ts": time.time()}
+                    "stats": dict(self.stats), "ts": time.time(),
+                    "max_alt_m": getattr(self, "max_alt_m", 15.0),
+                    "sweep_alt_m": getattr(self, "sweep_alt", 15.0),
+                    "fov": fov_info,
+                    "coverage_mode": getattr(self, "coverage_mode", "fov_optimal")}
 
     def request_takeover(self):
         self._takeover.set()
@@ -687,10 +723,37 @@ class Mission:
         if cam is None:
             self._set_phase("FAILSAFE", "no camera for grid sweep")
             return False
-        alt = float(alt) if alt else self.sweep_alt
-        from geo import footprint_m
-        fw, fh = footprint_m(alt, cam.hfov_deg, cam.size[0], cam.size[1])
-        spacing = max(2.0, min(fw, fh) * (1.0 - self.grid_overlap))
+        # arena/test1: alt clamped to max_alt_m from config.yaml
+        raw_alt = float(alt) if alt else self.sweep_alt
+        alt = geo.clamp_altitude(raw_alt, self.max_alt_m,
+                                 min_alt_m=float(self.cfg.get("flight", {}).get("min_alt_m", 1.0)))
+        # FOV-optimal coverage: use camera footprint at this alt
+        # cam.txt: front 66° HFOV, bottom 100° HFOV (113° diagonal)
+        # Divide area according to cam FOV to cover max possible
+        if self.coverage_mode == "fov_optimal":
+            # use geo.lawnmower_rows_fov_optimal for max coverage
+            try:
+                plan = geo.lawnmower_rows_fov_optimal(
+                    self.fence if len(self.fence) >= 3 else [],
+                    alt, cam.hfov_deg, cam.size[0], cam.size[1],
+                    origin=(self.home[0], self.home[1]) if self.home else None,
+                    edge_margin_m=self.edge_margin_m,
+                    overlap=self.grid_overlap,
+                    max_alt_m=self.max_alt_m)
+                # plan may be empty if no fence — fallback handled below
+                fw = plan.get("footprint_w_m", 0)
+                fh = plan.get("footprint_h_m", 0)
+                spacing = plan.get("spacing_m", max(2.0, min(fw, fh) * (1.0 - self.grid_overlap)))
+                self._log("INFO", "FOV-optimal: alt=%.1fm footprint %.1fx%.1fm spacing %.1fm cam %s %.0f°HFOV (max_alt %.1fm)" % (
+                    alt, fw, fh, spacing, cam.name, cam.hfov_deg, self.max_alt_m))
+            except Exception as e:
+                log.debug("fov_optimal failed: %r, falling back", e)
+                fw, fh = geo.footprint_m(alt, cam.hfov_deg, cam.size[0], cam.size[1])
+                spacing = max(2.0, min(fw, fh) * (1.0 - self.grid_overlap))
+        else:
+            fw, fh = geo.footprint_m(alt, cam.hfov_deg, cam.size[0], cam.size[1])
+            spacing = max(2.0, min(fw, fh) * (1.0 - self.grid_overlap))
+
         fence = self.fence
         if len(fence) < 3:
             # bench fallback (SITL has no fence): cover a home-centered box
@@ -701,10 +764,27 @@ class Mission:
             dlon = half / (111320.0 * max(0.2, _m.cos(_m.radians(lat0))))
             fence = [(lat0 - dlat, lon0 - dlon), (lat0 - dlat, lon0 + dlon),
                      (lat0 + dlat, lon0 + dlon), (lat0 + dlat, lon0 - dlon)]
-            self._log("WARN", "no fence — covering %.0f m home box" % (half * 2))
-        rows = geo.lawnmower_rows(fence, spacing,
-                                  origin=(self.home[0], self.home[1]),
-                                  edge_margin_m=self.edge_margin_m)
+            self._log("WARN", "no fence — covering %.0f m home box (max_alt %.1fm, footprint %.1fx%.1fm)" % (
+                half * 2, self.max_alt_m, fw, fh))
+
+        # Use FOV-optimal if available and fence exists
+        if self.coverage_mode == "fov_optimal" and len(fence) >= 3:
+            try:
+                opt = geo.lawnmower_rows_fov_optimal(
+                    fence, alt, cam.hfov_deg, cam.size[0], cam.size[1],
+                    origin=(self.home[0], self.home[1]),
+                    edge_margin_m=self.edge_margin_m,
+                    overlap=self.grid_overlap,
+                    max_alt_m=self.max_alt_m)
+                rows = opt["waypoints"]
+            except Exception:
+                rows = geo.lawnmower_rows(fence, spacing,
+                                          origin=(self.home[0], self.home[1]),
+                                          edge_margin_m=self.edge_margin_m)
+        else:
+            rows = geo.lawnmower_rows(fence, spacing,
+                                      origin=(self.home[0], self.home[1]),
+                                      edge_margin_m=self.edge_margin_m)
         self._set_phase("SWEEP_GRID", "%d legs, %.1fm spacing @ %.0fm, %.0fm edge" % (
             len(rows), spacing, alt, self.edge_margin_m))
         for i, (lat, lon) in enumerate(rows):

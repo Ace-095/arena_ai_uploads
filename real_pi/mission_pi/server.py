@@ -1,0 +1,1117 @@
+"""Pi HTTP + WebSocket server — the receive-only end the laptop UI reads.
+
+Contract (must match mission-ui js/links.js + js/camera.js):
+  GET /api/camera/frame/{cam}   JPEG snapshot (cam1=front, cam2=bottom).
+                                The UI polls this (its WebRTC attempt is
+                                optional and falls back here — v1 serves
+                                snapshots only, no WebRTC).
+  GET /api/camera/stream/{cam}  MJPEG multipart/x-mixed-replace (?fps=12).
+                                The UI points each tile's <img> here FIRST
+                                (smooth ~12 fps); snapshots stay as fallback.
+                                Needs the StreamManager (streamm1.py) passed
+                                to create_app, else 404 -> UI falls back.
+  WS  /ws/telemetry             envelopes {channel, t, data}; Pi channels:
+                                qr / fsm / event / log / system.
+  GET /health                   {ok, cams, link}
+  GET /api/cameras              rig status {cam1: {...}, cam2: {...}}
+  GET/POST /api/camera/status   {cam?} -> {cam, model, controls} (contract)
+  POST /api/camera/controls     UI slider tuning -> {ok, cam, controls}
+  GET/POST /api/camera/{cam}/controls  RAW driver props (bench/SSH only)
+  GET /api/mission/status       mission snapshot passthrough.
+  GET /api/fsm/status           contract alias -> {state, phase, detail, ...}
+  GET /api/qr/status            contract alias -> {payload, streak, required,
+                                confirmed} (curl-able from the laptop)
+  GET/POST /api/scan            manual QR scan button {"on": true|false} ->
+                                {running, payload, boxes, fps, tiles, error,
+                                drives_flight:false}. Works with NO mission
+                                and NO DO_SPRAYER in the plan; perception only.
+  POST /api/fsm/start|abort     contract aliases of takeover/abort (bench).
+  GET /                         human landing page: alive? bring-up? urls?
+  POST /api/mission/takeover    LOCAL USE ONLY (bench/SSH): force GUIDED
+  POST /api/mission/abort       takeover now / RTL + stop. The flight UI
+                                never calls these (Pi link is receive-only).
+
+Run behind the field router: Pi + laptop join the same LAN (router may
+carry LTE for remote viewing, but streaming itself is plain LAN HTTP).
+
+Liveness rule (2026-09-14 fix): this server starts BEFORE the FC link, the
+cameras and the detector, and it outlives all of them. A Pi that cannot
+answer http://<ip>:8000 is a Pi the operator cannot debug — so bring-up
+failures are recorded in bringup.Bringup and reported here (/health plus
+the WS `log` / `system` channels) instead of killing the process. The WS
+also replays recent envelopes to every new client and pushes `system` on a
+timer, so a browser that joins mid-mission sees state immediately and can
+tell a live Pi from a half-open socket.
+"""
+import asyncio
+import json
+import logging
+import threading
+import time
+
+try:
+    import bringup as _bringup
+except Exception:            # pragma: no cover - same package, always there
+    _bringup = None
+
+log = logging.getLogger("server")
+
+try:
+    from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+    from fastapi.responses import JSONResponse, Response, StreamingResponse
+    from fastapi.middleware.cors import CORSMiddleware
+    import uvicorn
+    _HAVE_API = True
+except Exception as e:
+    _HAVE_API = False
+    _API_ERR = e
+
+
+class Hub:
+    """Thread-safe WS broadcast hub. Mission threads call push(); the
+    FastAPI loop owns delivery.
+
+    Keeps a ring of recent envelopes so a browser that connects mid-mission
+    (the normal case — the operator opens the UI after the drone is already
+    searching) gets the current picture instead of a blank panel until the
+    next phase change. The contract calls this "replays a short history
+    burst on every WS connect"; the mock bridge does it, the Pi now does too.
+    """
+
+    REPLAY_CHANNELS = ("fsm", "system", "qr", "event")
+
+    def __init__(self, replay_cap=40):
+        self._clients = set()
+        self._lock = threading.Lock()
+        self._loop = None
+        self._replay_cap = max(4, int(replay_cap))
+        self._recent = {}          # channel -> deque-ish list of envelopes
+        self._sent = 0
+        self._dropped = 0
+
+    def attach(self, loop):
+        self._loop = loop
+
+    def remember(self, channel, env):
+        """Store one envelope for late-joining clients (last per channel for
+        state channels, a short tail for events)."""
+        with self._lock:
+            if channel not in self.REPLAY_CHANNELS:
+                return
+            cur = self._recent.setdefault(channel, [])
+            cur.append(env)
+            cap = 1 if channel in ("fsm", "system") else self._replay_cap
+            del cur[:-cap]
+
+    def recent(self, channels=None):
+        """Envelopes to replay on connect, oldest first."""
+        with self._lock:
+            out = []
+            for ch in (channels or ("system", "fsm", "qr", "event")):
+                out.extend(self._recent.get(ch, []))
+            return out
+
+    def push(self, channel, data):
+        """Broadcast to WS clients. Returns clients handed to (0 = nobody
+        listening — the store&forward UI-route proxy reads this)."""
+        env = json.dumps({"channel": channel, "t": time.time(), "data": data})
+        self.remember(channel, env)
+        with self._lock:
+            clients = list(self._clients)
+            self._sent += 1
+        if not clients or self._loop is None:
+            return 0
+        for ws in clients:
+            try:
+                asyncio.run_coroutine_threadsafe(ws.send_text(env), self._loop)
+            except Exception:
+                with self._lock:
+                    self._dropped += 1
+        return len(clients)
+
+    def add(self, ws):
+        with self._lock:
+            self._clients.add(ws)
+
+    def drop(self, ws):
+        with self._lock:
+            self._clients.discard(ws)
+
+    @property
+    def n_clients(self):
+        with self._lock:
+            return len(self._clients)
+
+    def stats(self):
+        with self._lock:
+            return {"clients": len(self._clients), "pushed": self._sent,
+                    "send_errors": self._dropped,
+                    "loop": self._loop is not None}
+
+
+def _require_api():
+    if not _HAVE_API:
+        raise RuntimeError("fastapi/uvicorn not installed (%r)" % (_API_ERR,))
+
+
+class ScanService(object):
+    """A standalone QR scan loop the UI can switch on - WITHOUT a mission.
+
+    The mission starts scanning when the flight plan reaches a sprayer/trigger
+    command (DO_SPRAYER 216 and friends). The operator asked for a button that
+    starts the scan IRRESPECTIVE of that - bench work, a hand-held check, a
+    camera aim test. This is perception only: it detects and decodes and
+    reports; it never sends anything to the flight controller, so it cannot
+    move the aircraft (the same contract as the perception tap:
+    perception_only=true, drives_flight=false).
+
+    Cases it must survive, because a bench button that throws is a bench nobody
+    trusts: no camera (error in status, not an exception); no detector (same);
+    start twice (idempotent); stop when not running (no-op); a mission camera
+    already running (REUSED, never double-opened, and never stopped by us);
+    a camera WE opened (we stop it on scan stop); a dead frame source (the
+    loop idles, status keeps saying running with stale fps).
+    """
+
+    def __init__(self, rig, mission=None):
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self.rig = rig
+        self.mission = mission
+        self.thread = None
+        self._cam = None
+        self._det = None
+        self.state = {"running": False, "error": None, "payload": None,
+                      "boxes": 0, "frames": 0, "fps": 0.0,
+                      "started_at": None, "opened_camera": False,
+                      "detector": None, "tiles": None,
+                      "perception_only": True, "drives_flight": False}
+
+    def status(self):
+        with self._lock:
+            return dict(self.state)
+
+    def _cfg(self):
+        cfg = getattr(self.mission, "cfg", None)
+        return cfg if isinstance(cfg, dict) else {}
+
+    def start(self):
+        with self._lock:
+            if self.state["running"]:
+                return dict(self.state)
+            self._stop.clear()
+            cam, opened = None, False
+            try:
+                cams = dict(getattr(self.rig, "cams", None) or {})
+                cam = next((c for c in cams.values()
+                            if getattr(c, "running", False)), None)
+                if cam is None:
+                    cams = self.rig.detect() or {}
+                    cam = (next((c for c in cams.values()
+                                 if getattr(c, "facing", "") == "bottom"), None)
+                           or next(iter(cams.values()), None))
+                    if cam is None:
+                        raise RuntimeError("no camera detected - run "
+                                           "tools/list_cams.py")
+                    cam.start()
+                    opened = True
+            except Exception as e:
+                self.state.update(running=False, opened_camera=False,
+                                  error="camera: %r" % (e,))
+                return dict(self.state)
+            det = None
+            try:
+                from detector import get_detector
+                det = get_detector(self._cfg().get("detector", {}) or {})
+                if det is None:
+                    raise RuntimeError("no detector available (get_detector "
+                                       "returned None)")
+            except Exception as e:
+                if opened:
+                    try:
+                        cam.stop()
+                    except Exception:
+                        pass
+                self.state.update(running=False, opened_camera=False,
+                                  error="detector: %r" % (e,))
+                return dict(self.state)
+            self._cam, self._det = cam, det
+            rows, cols = self._tiles()
+            self._tiles_rc = (rows, cols)
+            self.state.update(running=True, error=None, payload=None, boxes=0,
+                              frames=0, fps=0.0, started_at=time.time(),
+                              opened_camera=opened,
+                              tiles="%dx%d" % (rows, cols),
+                              detector=getattr(det, "name", type(det).__name__))
+            self.thread = threading.Thread(target=self._loop, name="qr-scan",
+                                           daemon=True)
+            self.thread.start()
+            return dict(self.state)
+
+    def stop(self):
+        with self._lock:
+            if not self.state["running"]:
+                return dict(self.state)
+            self._stop.set()
+            th = self.thread
+        if th is not None:
+            th.join(timeout=3.0)
+        with self._lock:
+            if self.state.get("opened_camera") and self._cam is not None:
+                try:
+                    self._cam.stop()
+                except Exception:
+                    pass
+            self._cam, self._det, self.thread = None, None, None
+            self.state.update(running=False, opened_camera=False)
+            return dict(self.state)
+
+    def _tiles(self):
+        """Tile grid of the mission's current QR preset - the SAME table the
+        bench tool and the mission use (config.yaml qr_presets). Default 3x3:
+        at 10-15 m an A3 QR is ~28-40 px in a 2028x1520 frame, which a single
+        640-px network pass cannot see (the pixel-budget math in
+        docs/arena_test1/00_DETECTION_AT_10_15M_A3_QR_HEF.md). Tiles are the
+        researched, mission-proven answer, so the manual scan uses them too."""
+        try:
+            from qr_filter import load_presets
+            name = getattr(self.mission, "preset_name", "day") or "day"
+            pres = load_presets(self._cfg()) or {}
+            grid = (pres.get(name) or {}).get("tile_grid", [3, 3])
+            return int(grid[0]), int(grid[1])
+        except Exception:
+            return 3, 3
+
+    def _detect(self, frame):
+        from detector import detect_tiles
+        rows, cols = getattr(self, "_tiles_rc", None) or self._tiles()
+        if rows > 1 or cols > 1:
+            return detect_tiles(self._det, frame, rows=rows, cols=cols) or []
+        return self._det.detect(frame) or []
+
+    def _grab(self):
+        cam = self._cam
+        try:
+            if hasattr(cam, "latest"):
+                # detect=True -> whichever frame the DETECTOR should see
+                # (config qr_boost.detect_raw decides raw vs boosted) - the
+                # same frame the mission feeds its own detector. The boosted
+                # frame is for the human eye; feeding it to YOLO invents
+                # boxes (31 false positives measured vs ~1 real).
+                got = cam.latest(detect=True)
+                return got[0] if isinstance(got, tuple) else got
+            ok, frame = cam.read()
+            return frame if ok else None
+        except Exception:
+            return None
+
+    def _loop(self):
+        from decoder import decode_frame
+        t0 = time.time()
+        while not self._stop.is_set():
+            # fps is the MEAN OBSERVATION rate: frames processed / seconds
+            # since start. An EMA of 1/dt was tried twice and lied both
+            # times (478 fps for a 0.3 fps scan - the first iteration's dt
+            # is microseconds and the decay never catches up). A mean cannot
+            # spike, cannot go stale-high, and matches what the operator
+            # sees in `frames` anyway.
+            frame = self._grab()
+            if frame is None:
+                time.sleep(0.1)
+                continue
+            boxes, payload = [], None
+            try:
+                boxes = self._detect(frame)
+            except Exception:
+                boxes = []
+            try:
+                qf = getattr(self.mission, "qf", None)
+                if qf is not None:
+                    boxes = qf.filter_boxes(boxes)
+                for b in sorted(boxes, key=lambda b: -b.conf)[:2]:
+                    payload = decode_frame(frame, (b.x, b.y, b.w, b.h),
+                                           budget_s=0.25)
+                    if payload:
+                        break
+            except Exception:
+                payload = None
+            with self._lock:
+                n = self.state["frames"] + 1
+                elapsed = max(1e-3, time.time() - t0)
+                self.state.update(boxes=len(boxes), payload=payload,
+                                  frames=n, fps=n / elapsed)
+            time.sleep(0.02)
+
+
+def create_app(rig, mission, fc, streams=None, bringup=None, pulse_s=2.0,
+               port=8000, scan=None):
+    """rig: CameraRig, mission: Mission (or None pre-start), fc: FCLink.
+    streams: streamm1.StreamManager (or None -> /stream/* answers 404 and
+    the UI falls back to snapshot polling).
+    bringup: bringup.Bringup ledger (or None) — published at /health so the
+    operator can see WHICH subsystem is missing without SSH.
+    pulse_s: `system` channel cadence (also the WS keepalive)."""
+    _require_api()
+    app = FastAPI(title="mission_pi")
+    # The UI is served from the BRIDGE origin, not the Pi — without CORS
+    # every UI fetch() to the Pi (camera probe, slider tuning) dies in the
+    # browser while <img> polling and WS sail through. Open LAN tool: allow all.
+    app.add_middleware(CORSMiddleware, allow_origins=["*"],
+                       allow_methods=["*"], allow_headers=["*"])
+    hub = Hub()
+    scan = scan if scan is not None else ScanService(rig, mission)
+    t0 = time.time()
+    pulse_s = max(0.5, float(pulse_s or 2.0))
+
+    def _mission_snapshot():
+        if mission is None:
+            return {"state": "NO_MISSION", "phase": "NO_MISSION",
+                    "detail": "mission object not created"}
+        try:
+            st = mission.status()
+        except Exception as e:
+            return {"state": "ERROR", "phase": "ERROR", "detail": repr(e)}
+        # contract `fsm`: {state, reason?} — the UI reads state ?? to ?? phase
+        st.setdefault("state", st.get("phase"))
+        st.setdefault("reason", st.get("detail"))
+        return st
+
+    def _qr_snapshot():
+        st = _mission_snapshot()
+        streak = str(st.get("streak") or "0/3")
+        try:
+            have, need = streak.split("/")
+            have, need = int(have), int(need)
+        except Exception:
+            have, need = 0, 3
+        return {"payload": st.get("payload"), "streak": have, "required": need,
+                "confirmed": bool(st.get("payload"))}
+
+    @app.on_event("startup")
+    async def _startup():
+        hub.attach(asyncio.get_running_loop())
+        asyncio.get_running_loop().create_task(_pulse())
+
+    async def _pulse():
+        """`system` on a timer (UI contract + WS keepalive) and an `fsm`
+        refresh every third tick, so a connected UI never looks dead and a
+        dead socket is noticed by the UI's last-message age."""
+        n = 0
+        last_errs = 0
+        while True:
+            await asyncio.sleep(pulse_s)
+            n += 1
+            try:
+                hub.push("system", _bringup.system_stats())
+            except Exception as e:
+                log.debug("system pulse failed: %r", e)
+            if n % 3 == 0:
+                try:
+                    hub.push("fsm", _mission_snapshot())
+                except Exception:
+                    pass
+            if bringup is not None:
+                try:
+                    errs = bringup.snapshot().get("errors") or []
+                    if len(errs) != last_errs:
+                        last_errs = len(errs)
+                        e = errs[-1]
+                        hub.push("log", {"level": "ERROR",
+                                         "msg": "bring-up %s — %s"
+                                                % (e.get("stage"), e.get("error"))})
+                except Exception:
+                    pass
+
+    @app.get("/")
+    async def index():
+        """Human landing page: paste the Pi URL in a browser tab and this
+        answers — the fastest possible 'is mission_pi even alive?' check."""
+        bu = bringup.snapshot() if bringup else {}
+        rows = "".join(
+            "<tr><td>%s</td><td><b>%s</b></td><td>%s</td></tr>" % (
+                k, v, (bu.get("detail") or {}).get(k, ""))
+            for k, v in sorted((bu.get("state") or {}).items()))
+        errs = "".join("<li>%s: %s</li>" % (e.get("stage"), e.get("error"))
+                       for e in (bu.get("errors") or []))
+        body = (
+            "<!doctype html><meta charset='utf-8'><title>mission_pi</title>"
+            "<body style='font:14px/1.5 system-ui,sans-serif;margin:2em'>"
+            "<h1>mission_pi is up</h1>"
+            "<p>uptime %.0f s &middot; ws clients %d &middot; FC link %s</p>"
+            "<h2>bring-up</h2><table border='1' cellpadding='4'>%s</table>"
+            "%s<h2>endpoints</h2><ul>"
+            "<li><a href='/health'>/health</a> (JSON: link, cams, bring-up, urls)</li>"
+            "<li><a href='/api/cameras'>/api/cameras</a></li>"
+            "<li>/api/camera/frame/cam1|cam2 &middot; /api/camera/stream/cam1|cam2</li>"
+            "<li><a href='/api/fsm/status'>/api/fsm/status</a> &middot; "
+            "<a href='/api/qr/status'>/api/qr/status</a> &middot; "
+            "<a href='/api/mission/status'>/api/mission/status</a></li>"
+            "<li>ws://this-host:%s/ws/telemetry (the UI's Pi link)</li>"
+            "</ul><p>Paste <b>http://this-host:%s</b> into the UI's Pi link box.</p>"
+            "</body>" % (time.time() - t0, hub.n_clients,
+                         "OK" if (fc and fc.link_ok()) else "down",
+                         rows,
+                         ("<h2>errors</h2><ul>%s</ul>" % errs) if errs else "",
+                         port, port))
+        return Response(body, media_type="text/html; charset=utf-8")
+
+    @app.get("/health")
+    async def health():
+        cams = {}
+        try:
+            cams = rig.status() if rig else {}
+        except Exception as e:
+            cams = {"error": repr(e)}
+        link = False
+        try:
+            link = bool(fc.link_ok()) if fc else False
+        except Exception:
+            link = False
+        out = {"ok": True, "status": "ok", "ts": time.time(),
+               # The UI has to decide whether the origin serving it IS this Pi
+               # (direct Pi -> Pixhawk fence writer) or the laptop bridge (a
+               # Mission Planner forwarder). Without this marker it guessed by
+               # URL and sent fence writes to the bridge, which 404s them.
+               "service": "mission_pi", "role": "fence-writer",
+               "uptime_s": round(time.time() - t0, 1),
+               "link": link, "cams": cams,
+               "ws_clients": hub.n_clients, "ws": hub.stats(),
+               "streams": streams.status() if streams else {}}
+        if mission is not None:
+            try:
+                out["mission"] = {"phase": mission.phase, "detail": mission.detail}
+            except Exception:
+                pass
+        if fc is not None:
+            try:
+                fn = getattr(fc, "link_state", None)
+                out["fc"] = fn() if callable(fn) else {
+                    "device": getattr(fc, "device", None),
+                    "mode": getattr(fc, "mode", None),
+                    "armed": getattr(fc, "armed", None)}
+            except Exception:
+                pass
+        if bringup is not None:
+            try:
+                out["bringup"] = bringup.snapshot()
+                out["urls"] = bringup.urls
+                out["ready"] = bringup.ok()
+            except Exception as e:
+                out["bringup"] = {"error": repr(e)}
+        else:
+            out["ready"] = link
+        return out
+
+    @app.get("/api/bringup")
+    async def api_bringup():
+        """Bring-up ledger on its own — the "why isn't my Pi link working"
+        endpoint. Same data as /health's `bringup` block, minus the rest, so
+        the UI diagnostics panel and tools/link_doctor.py can poll it cheaply
+        while the FC/cameras are still coming up (or never did)."""
+        if bringup is None:
+            return {"ok": True, "stage": "ready", "state": {}, "detail": {},
+                    "errors": [], "urls": [], "done": True,
+                    "note": "no bring-up ledger (server started standalone)"}
+        snap = bringup.snapshot()
+        snap["ok"] = bool(bringup.ok())
+        return snap
+
+    @app.get("/api/cameras")
+    async def cameras():
+        return rig.status() if rig else {}
+
+    @app.post("/api/cameras/rescan")
+    async def cameras_rescan():
+        """Hot-plug recovery: re-run camera auto-detect (CSI + V4L2/USB),
+        start newly found cameras, sync the MJPEG streams. Returns the
+        before/after assignment so the UI can refresh its tiles. The
+        auto-rescan timer in main.py does this on its own; this endpoint
+        is the manual trigger (UI button / SSH / link_doctor)."""
+        if rig is None:
+            return JSONResponse({"detail": "no camera rig"}, 404)
+        before = {n: (c.kind, c.model, c.facing)
+                  for n, c in (rig.cams or {}).items()}
+        try:
+            changed = await asyncio.to_thread(rig.rescan)
+        except Exception as e:
+            return JSONResponse({"detail": "rescan failed: %r" % e}, 500)
+        after = {n: (c.kind, c.model, c.facing)
+                 for n, c in (rig.cams or {}).items()}
+        n_streams = 0
+        if streams is not None:
+            try:
+                n_streams = streams.sync(rig)
+                streams.start_all()
+            except Exception as e:
+                log.warning("stream sync after rescan failed: %r", e)
+        hub.push("log", {"level": "INFO",
+                         "msg": "camera rescan: changed=%s cams=%s"
+                                % (sorted(changed or []), sorted(after))})
+        hub.push("event", {"type": "cameras", "rescan": True,
+                           "added": sorted(set(after) - set(before)),
+                           "removed": sorted(set(before) - set(after)),
+                           "cams": sorted(after)})
+        return {"ok": True, "changed": sorted(changed or []),
+                "before": before, "after": after, "streams": n_streams}
+
+    @app.get("/api/camera/frame/{cam}")
+    async def frame(cam: str):
+        c = rig.get(cam) if rig else None
+        if c is None:
+            return JSONResponse({"detail": "unknown camera (want cam1|cam2)"}, 404)
+        jpg = c.jpeg()
+        if jpg is None:
+            return JSONResponse({"detail": "no frame yet from %s" % cam}, 503)
+        return Response(jpg, media_type="image/jpeg",
+                        headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/camera/stream/{cam}")
+    async def stream(cam: str, request: Request, fps: int = 0):
+        """MJPEG multipart stream for the UI tiles (<img> points here).
+
+        ?fps= caps the serve rate (default: the broadcaster's fps; never
+        above it — stale ticks are skipped, never duplicated). 404/503
+        answers make the tile fall back to snapshot polling.
+        """
+        c = rig.get(cam) if rig else None
+        if c is None:
+            return JSONResponse({"detail": "unknown camera (want cam1|cam2)"}, 404)
+        st = streams.get(cam) if streams else None
+        if st is None:
+            return JSONResponse({"detail": "streaming disabled on this server"}, 404)
+
+        # ---- real_pi video-stuck fix ------------------------------------
+        # OLD BUG: the generator only emitted bytes when a NEW frame seq
+        # appeared. Before the first frame existed (CSI start-up, AE/AWB
+        # settle, YOLO load — seconds on a Pi 5) it yielded NOTHING, so the
+        # browser <img> sat on an open multipart connection with zero bytes:
+        # the tile "always stuck" on a black box.
+        #
+        # FIX A: wait a BOUNDED time for the first real frame. Still nothing
+        # -> 503, which makes the UI fall back to snapshot polling (which
+        # also fails, but loudly retries) instead of a silent dead socket.
+        if not await asyncio.to_thread(st.first_frame,
+                                       streams.first_frame_wait_s):
+            log.warning("%s: no frame within %.0fs — 503 (UI falls back to "
+                        "polling); stream watchdog will retry", cam,
+                        streams.first_frame_wait_s)
+            return JSONResponse(
+                {"detail": "no frame yet from %s (camera starting or dead; "
+                           "watchdog will restart it)" % cam}, 503)
+        # ------------------------------------------------------------------
+
+        # Serve rate: never above the broadcaster's current (possibly
+        # adaptive) fps — we can only re-send what was already encoded.
+        eff_fps = min(max(int(fps or st.fps), 1), max(1, st.fps), 30)
+        period = 1.0 / eff_fps
+
+        from streamm1 import SendGate
+        # Liveness: if no NEW frame arrives within this window (camera
+        # lag/stall on the Pi 5), re-send the latest frame so the browser
+        # always has fresh bytes + the freshest image and a dead camera
+        # cannot produce a frozen tile. Duplicates cost at most one
+        # JPEG/second — negligible on LAN, fine on LTE (the adaptive
+        # ladder already cut the rate there).
+        gate = SendGate(resend_after=max(3 * period, 1.0))
+
+        async def gen():
+            try:
+                while True:
+                    try:
+                        if await request.is_disconnected():
+                            break
+                    except Exception:
+                        pass
+                    jpg, seq = st.latest()
+                    if jpg is not None and gate.should_send(seq):
+                        yield (b"--frame\r\nContent-Type: image/jpeg\r\n"
+                               b"Content-Length: %d\r\n\r\n" % len(jpg)
+                               + jpg + b"\r\n")
+                    await asyncio.sleep(period)
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+
+        return StreamingResponse(gen(),
+                                 media_type="multipart/x-mixed-replace; boundary=frame",
+                                 headers={"Cache-Control": "no-store",
+                                          "X-Accel-Buffering": "no"})
+
+    @app.api_route("/api/camera/status", methods=["GET", "POST"])
+    async def camera_status(req: Request):
+        """Contract: {cam?} -> {cam, model, controls} (UI seeds sliders here)."""
+        cam = req.query_params.get("cam", "cam1")
+        if req.method == "POST":
+            try:
+                body = await req.json()
+            except Exception:
+                body = None
+            if isinstance(body, dict) and body.get("cam"):
+                cam = str(body["cam"])
+        c = rig.get(cam) if rig else None
+        if c is None:
+            return JSONResponse({"detail": "unknown camera (want cam1|cam2)"}, 404)
+        return {"cam": cam, "model": c.model, "controls": c.get_tuning()}
+
+    @app.post("/api/camera/controls")
+    async def camera_controls(req: Request):
+        """Contract: {cam, exposure_us, gain_db, af_mode, adaptive,
+        brightness, contrast, saturation, sharpness, qr_boost_mode, qr_enhance_mode} -> {ok, cam, controls}.
+        The UI sliders POST here (debounced). QR boost profiles also via this endpoint.
+        Supports: qr_boost_profile / qr_boost_mode / profile for ISP, qr_enhance_mode / qr_software_enhance for SW."""
+        try:
+            body = await req.json()
+        except Exception:
+            body = None
+        if not isinstance(body, dict):
+            return JSONResponse({"detail": "want a JSON tuning object {cam, ...}"}, 400)
+        cam = str(body.get("cam", "cam1"))
+        c = rig.get(cam) if rig else None
+        if c is None:
+            return JSONResponse({"detail": "unknown camera (want cam1|cam2)"}, 404)
+        # QR boost profile — if profile specified, apply ISP profile first (Kabaddi setting)
+        profile = body.get("qr_boost_profile") or body.get("qr_boost_mode") or body.get("profile") or body.get("qr_profile")
+        if profile:
+            try:
+                # apply_qr_profile handles ISP tuning for QR pop vs ground
+                await asyncio.to_thread(c.apply_qr_profile, profile)
+            except Exception as e:
+                log.warning("qr boost profile %r failed: %r", profile, e)
+        # Software enhance mode
+        if "qr_enhance_mode" in body or "qr_software_enhance" in body:
+            try:
+                sw = body.get("qr_enhance_mode")
+                if sw is None:
+                    # bool flag
+                    en = body.get("qr_software_enhance")
+                    if isinstance(en, bool):
+                        c.qr_boost["qr_software_enhance"] = en
+                    elif isinstance(en, str):
+                        c.qr_boost["qr_software_enhance"] = True
+                        c.qr_boost["qr_enhance_mode"] = en
+                else:
+                    if sw == "none":
+                        c.qr_boost["qr_software_enhance"] = False
+                    else:
+                        c.qr_boost["qr_software_enhance"] = True
+                        c.qr_boost["qr_enhance_mode"] = sw
+            except Exception as e:
+                log.debug("qr software enhance set failed: %r", e)
+        applied = await asyncio.to_thread(c.apply_tuning, body)
+        return {"ok": True, "status": "ok", "cam": cam, "controls": applied, "qr_boost": dict(c.qr_boost)}
+
+    @app.get("/api/camera/{cam}/controls")
+    async def get_controls(cam: str):
+        c = rig.get(cam) if rig else None
+        if c is None:
+            return JSONResponse({"detail": "unknown camera (want cam1|cam2)"}, 404)
+        fn = getattr(c, "get_controls", None)
+        if fn is None:
+            return JSONResponse({"detail": "%s has no tunable controls" % cam}, 400)
+        return {"cam": cam, "controls": fn()}
+
+    @app.post("/api/camera/{cam}/controls")
+    async def set_controls(cam: str, req: Request):
+        """BENCH/SSH-LOCAL tuning (like /takeover — the flight UI never
+        calls this): POST {"contrast": 40, "saturation": 60} and watch the
+        tile. Mirrors forward to their source device."""
+        c = rig.get(cam) if rig else None
+        if c is None:
+            return JSONResponse({"detail": "unknown camera (want cam1|cam2)"}, 404)
+        fn = getattr(c, "apply_controls", None)
+        if fn is None:
+            return JSONResponse({"detail": "%s has no tunable controls" % cam}, 400)
+        try:
+            body = await req.json()
+        except Exception:
+            body = None
+        if not isinstance(body, dict):
+            return JSONResponse({"detail": "want a JSON object {name: value}"}, 400)
+        return {"cam": cam, "applied": fn(body)}
+
+    @app.get("/api/mission/status")
+    async def mission_status():
+        if mission is None:
+            return {"phase": "BOOT", "detail": "mission not started"}
+        return mission.status()
+
+    # ---- contract aliases (docs/api-contract.md v2 Pi REST table) --------
+    # The UI drives itself from the WS; these exist so a human with curl (or
+    # the Windows laptop with no SSH) can read the same state, and so the Pi
+    # answers the paths the contract publishes instead of 404-ing them.
+    @app.get("/api/fsm/status")
+    async def fsm_status():
+        return _mission_snapshot()
+
+    @app.get("/api/qr/status")
+    async def qr_status():
+        return _qr_snapshot()
+
+    # ---- perception layer (read-only; see perception.py) ----------------
+    # ADDITIVE: a new endpoint, no change to any existing route or to the
+    # flight path. `drives_flight` is always false — this is a perception
+    # output, and NOT evidence that it is safe to descend near a target.
+    # ---- standalone QR scan (UI button; perception-only, never flight) ----
+    @app.get("/api/scan")
+    async def scan_status():
+        return scan.status()
+
+    @app.post("/api/scan")
+    async def scan_switch(req: Request):
+        """POST /api/scan {"on": true|false}. The state IS the answer: an
+        error (no camera, no detector) arrives as status.error with
+        running=false, never as a stack trace in the browser."""
+        try:
+            body = await req.json()
+        except Exception:
+            body = {}
+        on = body.get("on") if isinstance(body, dict) else None
+        if on is True:
+            return scan.start()
+        if on is False:
+            return scan.stop()
+        return JSONResponse({"detail": "body must be {\"on\": true|false}"},
+                            400)
+
+    @app.get("/api/perception")
+    async def perception_status():
+        try:
+            import perception_tap
+            snap = perception_tap.snapshot()
+        except Exception as e:
+            return {"state": "ERROR", "detail": repr(e),
+                    "perception_only": True, "drives_flight": False}
+        snap.setdefault("perception_only", True)
+        snap.setdefault("drives_flight", False)
+        return snap
+
+    # ---- real_pi QR environment presets (fake-QR / window-grill fix) ----
+    @app.get("/api/qr/presets")
+    async def qr_presets():
+        """List every preset the mission can switch to (same table the
+        webcam bench tool uses, from config.yaml `qr_presets:`)."""
+        try:
+            from qr_filter import load_presets, preset_names
+            cfg = mission.cfg if mission is not None and isinstance(
+                getattr(mission, "cfg", None), dict) else {}
+            return {"active": getattr(mission, "preset_name", "day"),
+                    "names": preset_names(cfg),
+                    "presets": load_presets(cfg),
+                    "filter": (mission.qf.as_dict()
+                               if hasattr(mission, "qf") else None)}
+        except Exception as e:
+            return JSONResponse({"detail": "presets: %r" % e}, 500)
+
+    @app.post("/api/qr/preset")
+    async def qr_preset_switch(req: Request):
+        """Switch the live environment preset:
+        POST /api/qr/preset {"preset": "dark"}
+        Applies detector conf, tile grid, decode cadence, cue strictness,
+        and the ISP boost profile to the bottom cam — no restart."""
+        try:
+            body = await req.json()
+        except Exception:
+            body = None
+        if not isinstance(body, dict) or not body.get("preset"):
+            return JSONResponse({"detail": 'want {"preset": "day|far|dark|..."}'}, 400)
+        name = str(body.get("preset"))
+        try:
+            from qr_filter import normalize_preset_name
+            name = normalize_preset_name(name)
+        except Exception:
+            pass
+        try:
+            applied = await asyncio.to_thread(mission.set_preset, name)
+        except Exception as e:
+            return JSONResponse({"detail": "preset switch failed: %r" % e}, 500)
+        if applied is None:
+            from qr_filter import preset_names as _pn
+            cfg = mission.cfg if mission is not None and isinstance(
+                getattr(mission, "cfg", None), dict) else {}
+            return JSONResponse(
+                {"detail": "unknown preset %r (have %s)" % (name, _pn(cfg))}, 404)
+        return {"ok": True, "preset": name, "applied": applied,
+                "filter": mission.qf.as_dict()}
+
+    # Fence is a verified FC transaction, not a local drawing. Slow serial
+    # work runs off the ASGI event loop so MJPEG/health/WS keep flowing.
+    from fence import normalize as normalize_fence, matches as fence_matches
+    from contextlib import nullcontext
+    fence_lock = asyncio.Lock()
+
+    # Firmware/MAVLink capability of the attached FC, memoised ON THE LINK:
+    # the answer is a property of the board, and on a silent board the request
+    # itself costs seconds. A REAL 2.4.8 that cannot take a mission fence must
+    # be visible in the UI BEFORE an upload is attempted, never only as a 502.
+    def read_fence_capability():
+        if not fc or not fc.link_ok():
+            return {"known": False, "mavlink2": None, "mission_fence": None,
+                    "text": "no FC link"}
+        now = time.monotonic()
+        cached = getattr(fc, "_cap_cache", None)
+        if cached and now - cached["t"] < (60.0 if cached["value"].get("known") else 10.0):
+            return cached["value"]
+        try:
+            if not getattr(fc, "ap_version", None):
+                fc.get_autopilot_version(timeout=2.0)
+            m2, fence_ok, text = fc.fence_capability()
+        except Exception as e:                    # never break the fence page
+            return {"known": False, "mavlink2": None, "mission_fence": None,
+                    "text": "capability read failed: %s" % e}
+        value = {"known": fence_ok is not None, "mavlink2": m2,
+                 "mission_fence": fence_ok, "text": text,
+                 "version": (getattr(fc, "ap_version", None) or {}).get("version")}
+        try:
+            fc._cap_cache = {"t": now, "value": value}
+        except Exception:                         # a link without the memo
+            pass
+        return value
+
+    def fence_state(vertices, confirmed=False, reason="", **extra):
+        verts = [tuple(v) for v in vertices]
+        return {"ok": confirmed, "source": "pi",
+                # Direct-Pi provenance, so the UI can badge the writer instead
+                # of guessing from a URL.
+                "writer": "pi", "direct": True,
+                "fc_device": getattr(fc, "device", None) if fc else None,
+                "loaded": bool(verts),
+                "confirmed": confirmed, "reason": reason,
+                "count": len(verts), "vertex_count": len(verts),
+                "fence": verts, "fc_fence": verts if confirmed else [],
+                "fc_count": len(verts) if confirmed else 0,
+                "vertices_latlon": [{"lat": a, "lon": b} for a, b in verts],
+                "fc_capability": read_fence_capability(),
+                **extra}
+
+    def read_fence_params():
+        """READ-ONLY FENCE_* parameters, so the UI can tell "vertices stored"
+        from "fence actually armed to act on a breach". Never written here:
+        enabling or re-arming a safety fence is an operator decision, and a
+        failed read must not break the fence request.
+        """
+        out = {}
+        if not fc or not fc.link_ok():
+            return out
+        for name in ("FENCE_ENABLE", "FENCE_TYPE", "FENCE_ACTION",
+                     "FENCE_ALT_MAX", "FENCE_MARGIN"):
+            try:
+                v = fc.get_param(name, timeout=0.6)
+            except Exception:
+                continue
+            if v is not None:
+                out[name] = float(v)
+        return out
+
+    def fence_transaction(vertices=None, clear=False):
+        if not fc or not fc.link_ok():
+            return 503, fence_state([], reason="No FC link; fence NOT changed",
+                                    detail="No FC link on the Pi")
+        # Do not edit the FC safety boundary during flight from this UI.
+        if (clear or vertices is not None) and getattr(fc, "armed", False):
+            return 409, fence_state([], reason="Disarm before editing fence", detail="FC is armed")
+        editing = clear or vertices is not None
+        wrote = False
+        try:
+            with getattr(fc, "_mission_lock", nullcontext()):
+                # Re-check under the lock: the FC can arm between the check
+                # above and the transfer starting, and a fence edit on an
+                # armed vehicle is exactly what must never happen.
+                if editing and getattr(fc, "armed", False):
+                    return 409, fence_state([], reason="Disarm before editing fence",
+                                            detail="FC armed mid-transaction")
+                if clear:
+                    if not fc.clear_fence():
+                        raise RuntimeError("FC did not acknowledge fence clear")
+                    wrote = True
+                elif vertices is not None:
+                    fc.upload_fence(vertices, timeout=10.0)
+                    wrote = True
+                actual = fc.read_fence(timeout=4.0)
+                wanted = [] if clear else vertices
+                if wanted is not None and not fence_matches(wanted, actual):
+                    raise RuntimeError(
+                        "FC did not store the fence we sent (readback differs) — "
+                        "nothing was confirmed")
+                if mission is not None:
+                    mission.fence = list(actual)
+            state = fence_state(actual, True, "FC readback verified (not an arming/enforcement check)",
+                                fc_uploaded=vertices is not None, cleared=clear,
+                                fc_params=read_fence_params())
+            hub.push("fence", state)
+            return 200, state
+        except Exception as e:
+            # Never replace mission.fence with an unconfirmed UI drawing.
+            hint = ""
+            if wrote:
+                hint = (" — the FC may now hold a fence that could NOT be verified; "
+                        "re-read the fence before relying on anything")
+            return 502, fence_state([], reason=str(e) + hint, detail=str(e),
+                                    fc_uploaded=False, cleared=False,
+                                    fc_params=read_fence_params())
+
+    async def run_fence(vertices=None, clear=False):
+        if fence_lock.locked():
+            return JSONResponse({"detail": "Fence transaction in progress; retry"}, 409)
+        async with fence_lock:
+            code, result = await asyncio.to_thread(fence_transaction, vertices, clear)
+        return JSONResponse(result, code)
+
+    @app.get("/api/fence")
+    async def get_fence():
+        return await run_fence()
+
+    @app.post("/api/fence")
+    async def post_fence(req: Request):
+        try:
+            body = await req.json()
+            if not isinstance(body, dict):
+                raise ValueError("want JSON object")
+            if body.get("clear") is True:
+                return await run_fence(clear=True)
+            verts = next((body[k] for k in ("vertices", "polygon", "fence") if k in body), None)
+            norm = normalize_fence(verts)
+        except (ValueError, TypeError) as e:
+            return JSONResponse({"detail": str(e)}, 400)
+        return await run_fence(vertices=norm)
+
+    @app.delete("/api/fence")
+    async def delete_fence():
+        return await run_fence(clear=True)
+
+    @app.get("/api/config")
+    async def get_config():
+        """Return current flight config — max_alt, sweep_alt, etc."""
+        try:
+            max_alt = getattr(mission, "max_alt_m", None) if mission else None
+            sweep_alt = getattr(mission, "sweep_alt", None) if mission else None
+            cfg = {}
+            if mission and hasattr(mission, "cfg"):
+                cfg = mission.cfg or {}
+            flight = cfg.get("flight", {}) if isinstance(cfg, dict) else {}
+            mission_cfg = cfg.get("mission", {}) if isinstance(cfg, dict) else {}
+            return {"ok": True, "max_alt_m": max_alt, "sweep_alt_m": sweep_alt,
+                    "flight": flight, "mission": mission_cfg,
+                    "fence_count": len(getattr(mission, "fence", []) or []) if mission else 0}
+        except Exception as e:
+            return {"ok": False, "error": repr(e)}
+
+    @app.post("/api/config")
+    async def post_config(req: Request):
+        """Runtime Pi settings + honest FC parameter acknowledgement, no disk save."""
+        import math
+        if mission is None:
+            return JSONResponse({"detail": "mission not started"}, 503)
+        try:
+            body = await req.json()
+            if not isinstance(body, dict):
+                raise ValueError("want a JSON object")
+            max_alt = body.get("max_alt_m", (body.get("flight") or {}).get("max_alt_m"))
+            sweep = body.get("sweep_alt_m", (body.get("mission") or {}).get("sweep_alt_m"))
+            if max_alt is None and sweep is None:
+                raise ValueError("supply max_alt_m or sweep_alt_m")
+            max_alt = float(max_alt if max_alt is not None else mission.max_alt_m)
+            sweep = float(sweep if sweep is not None else mission.sweep_alt)
+            if not (math.isfinite(max_alt) and math.isfinite(sweep) and
+                    1 <= max_alt <= 50 and sweep >= 1):
+                raise ValueError("finite max altitude 1..50m and sweep >=1m required")
+            sweep = min(max_alt, sweep)
+        except (ValueError, TypeError, AttributeError) as e:
+            return JSONResponse({"detail": str(e)}, 400)
+        mission.max_alt_m, mission.sweep_alt = max_alt, sweep
+        mission.cfg.setdefault("flight", {})["max_alt_m"] = max_alt
+        mission.cfg.setdefault("mission", {}).update(max_alt_m=max_alt, sweep_alt_m=sweep)
+        fc_updated, fc_error = False, "no FC link"
+        if fc and fc.link_ok():
+            try:
+                echo = await asyncio.to_thread(fc.set_param, "FENCE_ALT_MAX", max_alt, timeout=3.0)
+                fc_updated = echo is not None and math.isclose(float(echo), max_alt, abs_tol=0.01)
+                fc_error = None if fc_updated else "FENCE_ALT_MAX echo mismatch"
+            except Exception as e:
+                fc_error = str(e)
+        updated = {"max_alt_m": max_alt, "sweep_alt_m": sweep}
+        hub.push("event", {"type": "config", "updated": updated, "source": "ui"})
+        return {"ok": True, "updated": updated, "max_alt_m": max_alt,
+                "fc_updated": fc_updated, "fc_error": fc_error, "persisted": False}
+
+    @app.post("/api/fsm/start")
+    async def fsm_start():
+        """Contract's debug start. The Pi mission auto-starts with the
+        process, so this is the manual-takeover nudge (bench/SSH only)."""
+        if mission is None:
+            return JSONResponse({"detail": "mission not started"}, 503)
+        mission.request_takeover()
+        return {"status": "started", "detail": "manual takeover requested",
+                "fsm": _mission_snapshot()}
+
+    @app.post("/api/fsm/abort")
+    async def fsm_abort():
+        if mission is None:
+            return JSONResponse({"detail": "mission not started"}, 503)
+        mission.request_abort()
+        return {"status": "aborted", "detail": "RTL + stop requested",
+                "fsm": _mission_snapshot()}
+
+    @app.post("/api/mission/takeover")
+    async def takeover():
+        if mission is None:
+            return JSONResponse({"detail": "mission not started"}, 503)
+        mission.request_takeover()
+        return {"status": "takeover requested"}
+
+    @app.post("/api/mission/abort")
+    async def abort():
+        if mission is None:
+            return JSONResponse({"detail": "mission not started"}, 503)
+        mission.request_abort()
+        return {"status": "abort requested (RTL)"}
+
+    @app.websocket("/ws/telemetry")
+    async def ws_telemetry(ws: WebSocket):
+        await ws.accept()
+        hub.add(ws)
+        log.info("UI websocket connected (%d client(s)) from %s",
+                 hub.n_clients, getattr(getattr(ws, "client", None), "host", "?"))
+        # History burst: a browser joining mid-mission gets the current
+        # picture at once (system + fsm + last qr/events) instead of an
+        # empty panel until the next phase change.
+        try:
+            if _bringup is not None:
+                await ws.send_text(json.dumps(
+                    {"channel": "system", "t": time.time(),
+                     "data": _bringup.system_stats()}))
+            await ws.send_text(json.dumps(
+                {"channel": "fsm", "t": time.time(), "data": _mission_snapshot()}))
+            if bringup is not None:
+                await ws.send_text(json.dumps(
+                    {"channel": "log", "t": time.time(),
+                     "data": {"level": "INFO", "msg": bringup.one_line()}}))
+            for env in hub.recent(("qr", "event")):  # system/fsm sent fresh above
+                await ws.send_text(env)
+        except Exception as e:
+            log.debug("replay burst failed: %r", e)
+        try:
+            while True:
+                await ws.receive_text()  # ignore inbound; link is read-only
+        except WebSocketDisconnect:
+            pass
+        except Exception:
+            pass
+        finally:
+            hub.drop(ws)
+            log.info("UI websocket closed (%d client(s) left)", hub.n_clients)
+
+    app.state.hub = hub
+    return app
+
+
+def create_server(app, host="0.0.0.0", port=8000):
+    """A stoppable uvicorn Server (lets main shut the loop down cleanly —
+    killing the process with a live uvloop in a daemon thread segfaults)."""
+    _require_api()
+    return uvicorn.Server(uvicorn.Config(app, host=host, port=port,
+                                         log_level="warning"))
+
+
+def serve_forever(app, host="0.0.0.0", port=8000):
+    create_server(app, host, port).run()

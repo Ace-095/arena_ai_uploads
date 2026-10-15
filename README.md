@@ -5,6 +5,13 @@ pattern, a downward camera finds and decodes a QR panel, and the payload is
 delivered to the ground on **two** independent routes (MAVLink `STATUSTEXT` via
 Mission Planner, and WebSocket/HTTP to a browser UI).
 
+> **Flying real hardware (Pi 5 + Pixhawk)?** Everything for that is in
+> **[`real_pi/`](real_pi/README.md)** — the self-contained real-flight stack:
+> one `config.yaml`, auto-detect for the cameras (CSI + USB) and the Pixhawk
+> (USB), the video-stuck fix (watchdog + adaptive MJPEG), Hailo-first YOLO
+> with CPU fallback, and the no-delay two-stage QR → Mission Planner relay
+> (`QR_SEEN:` on first decode, `QR:` on confirm). Start at `real_pi/README.md`.
+
 ```
         LINUX LAPTOP (or Pi 5)                        WINDOWS 11
  ┌──────────────────────────────────┐      ┌────────────────────────────────┐

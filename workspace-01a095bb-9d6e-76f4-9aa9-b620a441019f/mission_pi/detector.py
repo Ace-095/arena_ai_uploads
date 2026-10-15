@@ -3,10 +3,15 @@
 Kinds (config `detector.kind`):
   auto       Hailo YOLO if a .hef exists and hailo_platform imports, else classical.
   hailo      YOLOv8n (fine-tuned for QR) on the AI HAT via HailoRT.
+  yolo       YOLOv8n .pt or .onnx on laptop / x86 — uses ultralytics or onnxruntime
+             (for SITL+Gazebo real test, replaces classical for 10m/15m A3)
+             Tries: models/qr_yolov8n.pt -> models/qr_yolov8n.onnx -> detectors/yolo_ultralytics -> detectors/yolo_onnx
   classical  No model: cv2 multi-detect + pyzbar boxes. Works day one at
              short range; weak past ~8 m (see README detection math).
   custom     YOUR future model: `detector.custom_module` must define a
              `Detector` subclass (see models/README.md contract).
+             Use custom_module: detectors.yolo_ultralytics (needs ultralytics)
+             or detectors.yolo_onnx (needs onnxruntime) for laptop YOLO
   none       Disable stage 1 (decode-only pipeline).
 
 The 15 m problem: with the 113-deg bottom lens an A3 QR is ~34 px in
@@ -14,6 +19,9 @@ the frame, ~5 px after a naive 640 resize — hopeless. The mission
 therefore runs the YOLO stage on 3x3 TILES of the bottom frame (see
 detect_tiles), where the QR is ~15 px on the network input: detectable
 for a fine-tuned 1-class YOLOv8n.
+
+YOLO on laptop: for SITL+Gazebo real test, use kind: yolo or custom yolo_ultralytics
+instead of classical — A3 at 10m/15m will actually be detected.
 """
 import importlib
 import logging
@@ -257,6 +265,52 @@ def load_custom(module_path):
     raise RuntimeError("custom module %r must define Detector or create_detector()" % module_path)
 
 
+def _try_yolo_laptop(cfg):
+    """Try to load YOLO for laptop/SITL — pt via ultralytics, then onnx, then custom modules"""
+    # 1) explicit model_path in cfg
+    mp = cfg.get("model_path") or cfg.get("hef_path") or ""
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = []
+    if mp:
+        candidates.append(mp)
+        candidates.append(os.path.join(base_dir, mp))
+    candidates.extend([
+        os.path.join(base_dir, "models/qr_yolov8n.pt"),
+        os.path.join(base_dir, "models/qr_yolov8n.onnx"),
+        "models/qr_yolov8n.pt",
+        "models/qr_yolov8n.onnx",
+        "/tmp/runs/qr_yolov8n_small/weights/best.pt",
+        "/tmp/runs/qr_yolov8n_small/weights/best.onnx",
+    ])
+    # Try ultralytics .pt
+    for p in candidates:
+        if p.endswith(".pt") and os.path.isfile(p):
+            try:
+                from detectors.yolo_ultralytics import YoloUltralyticsDetector
+                return YoloUltralyticsDetector(p, cfg.get("conf_thr", 0.25), cfg.get("iou_thr", 0.45), cfg.get("input_size", 640))
+            except Exception as e:
+                log.debug(f"yolo_ultralytics {p} failed: {e}")
+    # Try onnx
+    for p in candidates:
+        if p.endswith(".onnx") and os.path.isfile(p):
+            try:
+                from detectors.yolo_onnx import YoloOnnxDetector
+                return YoloOnnxDetector(p, cfg.get("conf_thr", 0.25), cfg.get("iou_thr", 0.45), cfg.get("input_size", 640))
+            except Exception as e:
+                log.debug(f"yolo_onnx {p} failed: {e}")
+    # Try importing detectors modules directly (they will search themselves)
+    try:
+        from detectors.yolo_ultralytics import YoloUltralyticsDetector
+        return YoloUltralyticsDetector(cfg.get("model_path", "models/qr_yolov8n.pt"), cfg.get("conf_thr", 0.25), cfg.get("iou_thr", 0.45), cfg.get("input_size", 640))
+    except Exception as e:
+        log.debug(f"yolo_ultralytics auto failed: {e}")
+    try:
+        from detectors.yolo_onnx import YoloOnnxDetector
+        return YoloOnnxDetector(cfg.get("model_path", "models/qr_yolov8n.onnx"), cfg.get("conf_thr", 0.25), cfg.get("iou_thr", 0.45), cfg.get("input_size", 640))
+    except Exception as e:
+        log.debug(f"yolo_onnx auto failed: {e}")
+    return None
+
 def get_detector(cfg):
     """cfg: dict with kind/hef_path/input_size/conf_thr/iou_thr/custom_module."""
     kind = str(cfg.get("kind", "auto")).lower()
@@ -268,17 +322,31 @@ def get_detector(cfg):
                                          cfg.get("conf_thr", 0.35),
                                          cfg.get("iou_thr", 0.5))
             except Exception as e:
-                log.warning("hailo unavailable (%r) — classical fallback", e)
+                log.warning("hailo unavailable (%r) — trying YOLO laptop fallback", e)
+                y = _try_yolo_laptop(cfg)
+                if y:
+                    return y
+                log.warning("YOLO laptop also unavailable — classical fallback")
         else:
-            log.warning("no HEF at %r — classical fallback", hef)
+            # No HEF, try YOLO laptop first (for SITL+Gazebo)
+            y = _try_yolo_laptop(cfg)
+            if y:
+                log.info(f"auto: using YOLO laptop detector {y.name} (no HEF, for SITL)")
+                return y
+            log.warning("no HEF at %r — classical fallback (for 10m/15m use kind: yolo)", hef)
         return ClassicalDetector()
     if kind == "hailo":
         return HailoYolo8Detector(cfg["hef_path"], cfg.get("input_size", 640),
                                   cfg.get("conf_thr", 0.35), cfg.get("iou_thr", 0.5))
+    if kind in ("yolo", "yolov8", "yolo_ultralytics", "yolo_onnx"):
+        y = _try_yolo_laptop(cfg)
+        if y:
+            return y
+        raise RuntimeError("yolo kind requested but no model found — put models/qr_yolov8n.pt or .onnx in place and pip install ultralytics or onnxruntime")
     if kind == "classical":
         return ClassicalDetector()
     if kind == "custom":
         return load_custom(cfg["custom_module"])
     if kind == "none":
         return ClassicalDetector()  # decode-only still tries classical boxes
-    raise RuntimeError("unknown detector.kind: %r" % kind)
+    raise RuntimeError("unknown detector.kind: %r (use auto/hailo/yolo/classical/custom/none)" % kind)

@@ -1,10 +1,12 @@
-"""QR decode stage: full frame -> ROI crop/upscale -> tiles.
+"""QR decode stage: full frame -> ROI crop/upscale -> tiles + QR boost.
 
 Strategy (in order, first payload wins):
   1. If a detector bbox exists: crop with margin, upscale so the QR is
-     >= ~300 px, try decode variants (plain / CLAHE / mild blur).
+     >= ~300 px, try decode variants (plain / CLAHE / mild blur / QR-boost).
   2. Full frame at native resolution (catches close/large QRs cheaply).
   3. 2x2 overlapping tiles upscaled (catches small/far QRs).
+  4. QR-boost enhanced variants — makes QR pop vs ground (grass/dirt) via
+     contrast + sharpness + ground color suppression (Kabaddi setting).
 
 Decoders: pyzbar first (most robust), cv2.QRCodeDetector second.
 Everything degrades gracefully if a backend is missing.
@@ -26,6 +28,14 @@ try:
 except Exception:
     pyzbar = None
     _HAVE_PYZBAR = False
+
+# QR boost — makes QR pop more than ground (Kabaddi setting)
+try:
+    from qr_camera_boost import enhance_roi_for_decode
+    _HAVE_QR_BOOST = True
+except Exception:
+    enhance_roi_for_decode = None
+    _HAVE_QR_BOOST = False
 
 _cv2det = None
 
@@ -68,7 +78,7 @@ def _try_backends(gray):
 
 
 def _variants(gray):
-    """Yield preprocessed variants of a grayscale ROI."""
+    """Yield preprocessed variants of a grayscale ROI — QR pops vs ground."""
     yield gray
     if _HAVE_CV2:
         try:
@@ -78,6 +88,31 @@ def _variants(gray):
             pass
         try:
             yield cv2.GaussianBlur(gray, (3, 3), 0)
+        except Exception:
+            pass
+        # QR boost enhanced variant — high contrast + unsharp for far QR at 10/15 m
+        if _HAVE_QR_BOOST and enhance_roi_for_decode is not None:
+            try:
+                yield enhance_roi_for_decode(gray)
+            except Exception:
+                pass
+        # High contrast variant — makes black QR modules blacker vs ground
+        try:
+            high_contrast = cv2.convertScaleAbs(gray, alpha=1.5, beta=-20)
+            yield high_contrast
+        except Exception:
+            pass
+        try:
+            # Adaptive threshold — suppresses ground texture, keeps QR B/W
+            thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                           cv2.THRESH_BINARY, 11, 2)
+            yield thresh
+        except Exception:
+            pass
+        # Extra: Otsu threshold for strong B/W separation
+        try:
+            _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            yield otsu
         except Exception:
             pass
 
@@ -102,7 +137,7 @@ def decode_frame(frame_bgr, bbox=None, margin=0.35):
         return None
     try:
         h_img, w_img = frame_bgr.shape[:2]
-        # 1) ROI path
+        # 1) ROI path — with QR boost
         if bbox is not None:
             x, y, w, h = [int(v) for v in bbox[:4]]
             if w > 8 and h > 8:
@@ -155,8 +190,8 @@ def classical_boxes(frame_bgr):
     """Day-one detector boxes without any trained model.
 
     Merges cv2 multi-detect + pyzbar rects, deduped by IoU.
-    Returns [(x, y, w, h, conf), ...]. Weak past ~8 m — the YOLO stage
-    is what carries 15 m detection (see detector.py / README).
+    Weak past ~8 m — the YOLO stage is what carries 15 m detection (see detector.py / README).
+    With QR boost, classical works a bit farther because contrast is higher.
     """
     boxes = []
     if not _HAVE_CV2 or frame_bgr is None:

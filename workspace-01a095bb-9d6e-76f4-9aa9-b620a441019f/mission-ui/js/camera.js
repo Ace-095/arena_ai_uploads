@@ -1,8 +1,13 @@
 /* camera.js — UI v2 dual-camera viewer (CAM1 pi-cam3 + CAM2 imx477).
+ * TRUE LIVE FEED: MJPEG first (12fps smooth), polling fallback only if stream 404.
+ * User fix 2026-09-17: live feed was showing as photos (1s snapshots) because
+ * MJPEG failed and never retried. Now MJPEG auto-retries every 3s and polling
+ * is 200ms for live feel, not 1s photos.
+ *
  * Each camera points <img> at the MJPEG stream (/api/camera/stream/<cam>,
  * smooth ~12 fps) and falls back to snapshot polling (/api/camera/frame/<cam>)
- * when the stream errors. WebRTC (/ws/webrtc/<cam>) is reserved for a future
- * server. One shared enlarge modal.
+ * when the stream errors. WebRTC (/ws/webrtc/<cam>) reserved for future.
+ * One shared enlarge modal — also live MJPEG.
  */
 (function () {
 'use strict';
@@ -30,6 +35,7 @@ function initCameras(o) {
     const c = cams[id];
     if (!c) return;
     if (c.pollTimer) { clearInterval(c.pollTimer); c.pollTimer = null; }
+    if (c.retryTimer) { clearTimeout(c.retryTimer); c.retryTimer = null; }
     if (c.ws) { try { c.ws.close(); } catch (e) { /* noop */ } c.ws = null; }
     if (c.pc) { try { c.pc.close(); } catch (e) { /* noop */ } c.pc = null; }
     if (c.stream) {
@@ -38,9 +44,9 @@ function initCameras(o) {
     }
     const e = els(id);
     if (e.video) { try { e.video.pause(); e.video.srcObject = null; } catch (err) { /* noop */ } }
-    if (e.img) { e.img.onerror = null; }  // don't trip the mjpeg->polling fallback on purpose
+    if (e.img) { e.img.onerror = null; e.img.onload = null; }
     if (c.mode === 'mjpeg' && e.img) {
-      try { e.img.removeAttribute('src'); } catch (err) { /* noop */ }  // kills the <img> stream
+      try { e.img.removeAttribute('src'); } catch (err) { /* noop */ }
     }
     if (!silent) { c.mode = 'off'; onMode(id, c.mode); }
   }
@@ -50,8 +56,9 @@ function initCameras(o) {
     const e = els(id);
     stopAll(id, true);
     c.mode = 'polling'; onMode(id, c.mode);
-    onHint(id, 'polling snapshots from Pi…');
+    onHint(id, 'live snapshots (MJPEG unavailable)…');
     const base = getPiUrl().replace(/\/$/, '');
+    let failCount = 0;
     const tick = () => {
       if (c.paused) return;
       const t0 = performance.now();
@@ -61,15 +68,35 @@ function initCameras(o) {
         e.img.src = img.src; e.img.style.display = 'block'; e.video.style.display = 'none';
         e.img.dataset.ts = String(Date.now());
         c.frames += 1;
+        failCount = 0;
         onLatency(id, Math.round(performance.now() - t0) + ' ms');
-        onStats(id, c.frames + ' frames');
+        onStats(id, c.frames + ' frames live');
         onHint(id, '');
       };
-      img.onerror = () => { onHint(id, 'frame fetch failed — is the Pi reachable?'); };
+      img.onerror = () => {
+        failCount += 1;
+        if (failCount > 5) onHint(id, 'frame fetch failed — is Pi reachable?');
+        // Auto-retry MJPEG every 3s even while polling — true live recovery
+        if (failCount % 15 === 0) {
+          onLog('INFO', id + ': polling retry → MJPEG');
+          startMjpeg(id);
+        }
+      };
       img.src = base + '/api/camera/frame/' + id + '?t=' + Date.now();
     };
     tick();
-    c.pollTimer = setInterval(tick, 1000);
+    c.pollTimer = setInterval(tick, 200); // 200ms = 5fps live, not 1s photos
+    // Also schedule MJPEG retry every 3s
+    const retryMjpeg = () => {
+      if (c.mode === 'polling' && !c.paused) {
+        onLog('INFO', id + ': polling → retry MJPEG live stream');
+        startMjpeg(id);
+      }
+    };
+    c.retryTimer = setTimeout(function retryLoop() {
+      retryMjpeg();
+      if (c.mode === 'polling') c.retryTimer = setTimeout(retryLoop, 3000);
+    }, 3000);
   }
 
   function startWebrtc(id) {
@@ -85,11 +112,11 @@ function initCameras(o) {
     c.mode = 'webrtc?'; onMode(id, c.mode);
     onHint(id, 'negotiating WebRTC…');
     const giveUp = setTimeout(() => {
-      if (c.mode === 'webrtc?') { onLog('WARN', id + ': WebRTC timeout → polling fallback'); startPolling(id); }
+      if (c.mode === 'webrtc?') { onLog('WARN', id + ': WebRTC timeout → MJPEG'); startMjpeg(id); }
     }, 6000);
     ws.onopen = () => {
       let pc;
-      try { pc = new RTCPeerConnection(); } catch (err) { clearTimeout(giveUp); startPolling(id); return; }
+      try { pc = new RTCPeerConnection(); } catch (err) { clearTimeout(giveUp); startMjpeg(id); return; }
       c.pc = pc;
       pc.onicecandidate = (ev) => {
         if (ev.candidate && ws.readyState === 1) ws.send(JSON.stringify({ candidate: ev.candidate }));
@@ -114,22 +141,21 @@ function initCameras(o) {
         pc.setLocalDescription(off).then(() => {
           if (ws.readyState === 1) ws.send(JSON.stringify({ sdp: off.sdp, type: off.type }));
         });
-      }).catch(() => { clearTimeout(giveUp); startPolling(id); });
+      }).catch(() => { clearTimeout(giveUp); startMjpeg(id); });
     };
     ws.onmessage = (ev) => {
       let m;
       try { m = JSON.parse(ev.data); } catch (err) { return; }
       if (m.sdp && c.pc) c.pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp: m.sdp })).catch(() => {});
       else if (m.candidate && c.pc) c.pc.addIceCandidate(new RTCIceCandidate(m.candidate)).catch(() => {});
-      else if (m.error) { clearTimeout(giveUp); startPolling(id); }
+      else if (m.error) { clearTimeout(giveUp); startMjpeg(id); }
     };
-    ws.onerror = () => { clearTimeout(giveUp); startPolling(id); };
+    ws.onerror = () => { clearTimeout(giveUp); startMjpeg(id); };
     ws.onclose = () => {
       if (c.ws !== ws) return;
       c.ws = null;
       clearTimeout(giveUp);
-      if (c.mode === 'webrtc?') startPolling(id);
-      else if (c.mode === 'webrtc' && !c.paused) startPolling(id);
+      if (c.mode === 'webrtc?' || c.mode === 'webrtc') startMjpeg(id);
     };
   }
 
@@ -138,26 +164,39 @@ function initCameras(o) {
     const e = els(id);
     stopAll(id, true);
     c.mode = 'mjpeg'; onMode(id, c.mode);
-    onHint(id, '');
-    onStats(id, 'live');
+    onHint(id, 'live MJPEG…');
+    onStats(id, 'live 12fps');
     onLatency(id, '');
     const base = getPiUrl().replace(/\/$/, '');
     e.img.style.display = 'block'; e.video.style.display = 'none';
+    let loaded = false;
+    e.img.onload = () => {
+      if (c.mode !== 'mjpeg') return;
+      if (!loaded) {
+        loaded = true;
+        onHint(id, '');
+        onLog('INFO', id + ': MJPEG live feed started');
+        onStats(id, 'live 12fps MJPEG');
+      }
+      // For MJPEG, onload fires once when stream starts, not per frame
+      // Keep hint clear
+      onHint(id, '');
+    };
     e.img.onerror = () => {
       if (c.mode !== 'mjpeg') return;
-      onLog('WARN', id + ': MJPEG stream failed → polling fallback');
+      onLog('WARN', id + ': MJPEG stream failed → polling fallback (retry in 3s)');
       startPolling(id);
     };
-    e.img.src = base + '/api/camera/stream/' + id;
+    // True live MJPEG stream — no cache bust, browser keeps multipart open
+    // Add fps param to match server's stream config
+    e.img.src = base + '/api/camera/stream/' + id + '?fps=12&t=' + Date.now();
   }
 
   function startCam(id) {
-    if (!cams[id]) cams[id] = { mode: 'off', pollTimer: null, pc: null, ws: null, stream: null, paused: false, frames: 0 };
+    if (!cams[id]) cams[id] = { mode: 'off', pollTimer: null, retryTimer: null, pc: null, ws: null, stream: null, paused: false, frames: 0 };
     cams[id].paused = false;
-    // MJPEG first (smooth, instant). startWebrtc is kept for a future
-    // server that implements /ws/webrtc — today it would only add a 6 s
-    // black tile before the fallback. startPolling stays as the fallback
-    // for servers without /api/camera/stream.
+    cams[id].frames = 0;
+    // MJPEG first (smooth 12fps live, instant). Polling is fallback with auto-retry.
     startMjpeg(id);
   }
 
@@ -170,16 +209,18 @@ function initCameras(o) {
     return c.paused;
   }
 
-  // ---- shared enlarge modal ----
+  // ---- shared enlarge modal — also true live MJPEG ----
   const modal = document.getElementById('modal');
   const modalLabel = document.getElementById('modalCamLabel');
   const videoModal = document.getElementById('videoModal');
   const imgModal = document.getElementById('imgModal');
-  let modalTimer = null, modalId = null;
+  let modalTimer = null, modalRetry = null, modalId = null;
 
   function openModal(id) {
     const c = cams[id] || {};
     modalId = id;
+    if (modalTimer) { clearInterval(modalTimer); modalTimer = null; }
+    if (modalRetry) { clearTimeout(modalRetry); modalRetry = null; }
     modalLabel.textContent = (id === 'cam1' ? 'CAM1 · pi-cam3' : 'CAM2 · imx477');
     videoModal.style.display = 'none'; imgModal.style.display = 'none';
     if (c.mode === 'webrtc' && c.stream) {
@@ -188,35 +229,49 @@ function initCameras(o) {
       videoModal.style.display = 'block';
     } else if (c.mode === 'mjpeg') {
       const base = getPiUrl().replace(/\/$/, '');
-      imgModal.src = base + '/api/camera/stream/' + id;
+      imgModal.src = base + '/api/camera/stream/' + id + '?fps=12&t=' + Date.now();
       imgModal.style.display = 'block';
+      imgModal.onerror = () => {
+        // Fallback to live polling 200ms in modal
+        const base2 = getPiUrl().replace(/\/$/, '');
+        const tick = () => { imgModal.src = base2 + '/api/camera/frame/' + id + '?t=' + Date.now(); };
+        tick();
+        modalTimer = setInterval(tick, 200);
+      };
     } else {
       const base = getPiUrl().replace(/\/$/, '');
       const tick = () => { imgModal.src = base + '/api/camera/frame/' + id + '?t=' + Date.now(); };
       tick();
       imgModal.style.display = 'block';
-      modalTimer = setInterval(tick, 1000);
+      modalTimer = setInterval(tick, 200);
+      // Try to upgrade to MJPEG in modal too
+      modalRetry = setTimeout(() => {
+        if (modalId === id) {
+          imgModal.src = base + '/api/camera/stream/' + id + '?fps=12&t=' + Date.now();
+          if (modalTimer) { clearInterval(modalTimer); modalTimer = null; }
+        }
+      }, 3000);
     }
     modal.classList.remove('hidden');
   }
 
   function closeModal() {
     if (modalTimer) { clearInterval(modalTimer); modalTimer = null; }
+    if (modalRetry) { clearTimeout(modalRetry); modalRetry = null; }
     try { videoModal.pause(); videoModal.srcObject = null; } catch (e) { /* noop */ }
-    imgModal.removeAttribute('src');
+    imgModal.removeAttribute('src'); imgModal.onerror = null;
     modalId = null;
     modal.classList.add('hidden');
   }
 
   function refreshModalFrame() {
-    // keep the enlarged polling view in sync with the grid view
     if (modalId == null || modal.classList.contains('hidden')) return;
     const c = cams[modalId] || {};
     if (c.mode !== 'polling') return;
     const e = els(modalId);
     if (e.img && e.img.src) imgModal.src = e.img.src;
   }
-  setInterval(refreshModalFrame, 1000);
+  setInterval(refreshModalFrame, 200);
 
   modal.addEventListener('click', (ev) => { if (ev.target === modal) closeModal(); });
 

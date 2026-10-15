@@ -4,7 +4,8 @@ config.yaml
 snaps/
 qr_dataset/
 runs/
-# generated Gazebo panel textures (regenerate via tools/make_qr_panel.py)
-sim/models/*/materials/textures/qr.png
+# QR panel textures — now committed for Gazebo (was git-ignored, caused "no QR present")
+# If you want to regenerate: python tools/make_qr_panel.py --text MISSION-QR-001 --out sim/models/qr_panel_a3/materials/textures/qr.png --full --dpi 300
+# and same for qr_panel_big
 demo_frames/
 logs/

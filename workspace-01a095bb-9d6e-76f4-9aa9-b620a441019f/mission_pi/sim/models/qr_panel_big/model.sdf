@@ -1,21 +1,18 @@
 <?xml version="1.0"?>
 <!--
-  Big QR panel (2x A3 linear: 594 x 840 mm, lying flat) for first
-  closed-loop Gazebo runs. The classical bench detector needs the code
-  ~80+ px in frame to decode; true A3 from 15 m is only ~26 px, so the
-  honest A3 panel (sim/gazebo_qr_panel) waits for the YOLO model while
-  this one proves the full loop today. Same texture ratio as A3 — reuse
-  the same PNG (make_qr_panel.py, text MISSION-QR-001, out
-  sim/models/qr_panel_big/materials/textures/qr.png).
+  Big QR panel TRIPLE SIZE (3.564 x 5.04 m, 12x A3 linear, 3x previous double 1.188x1.68, lying flat).
+  User fix 2026-09-17: "double triple the size btw it's small" — was 1.188x1.68 4x-A3, now 3.564x5.04 12x-A3.
+  Same texture ratio as A3 — reuse same PNG (make_qr_panel.py --full, QR covers entire panel 95% fill).
+  Triple size = ~408px @15m huge, easy detection, fallback for classical.
 -->
 <sdf version="1.9">
   <model name="qr_panel_big">
     <static>true</static>
     <link name="panel">
-      <pose>0 0 0.004 0 0 0</pose>
+      <pose>0 0 0.02 0 0 0</pose>
       <visual name="face">
         <geometry>
-          <box><size>0.594 0.84 0.008</size></box>
+          <box><size>3.564 5.04 0.03</size></box>
         </geometry>
         <material>
           <diffuse>1 1 1 1</diffuse>
@@ -29,7 +26,7 @@
       </visual>
       <collision name="surface">
         <geometry>
-          <box><size>0.594 0.84 0.008</size></box>
+          <box><size>3.564 5.04 0.03</size></box>
         </geometry>
       </collision>
     </link>
