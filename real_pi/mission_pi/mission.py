@@ -300,7 +300,12 @@ class Mission:
                         payload_box = b
                         break
             if payload is None and n % self.full_decode_every == 0:
-                payload = decode_frame(frame)
+                # the long-range rescue: a full-frame + tile cascade for QRs
+                # whose detector box was too weak to carry a decode. It is up
+                # to ~42 decode attempts on a 2028x1520 frame - seconds - so it
+                # runs on a cadence AND under a wall-clock budget: a rescue
+                # that stalls the loop is how a 3 Hz mission thread dies.
+                payload = decode_frame(frame, budget_s=0.4)
             if payload:
                 self.stats["decodes"] += 1
             # overlay: green-ish labels for survivors, and the decoded box
